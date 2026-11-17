@@ -17,7 +17,7 @@ RULE = re.compile(r"(@@)?\|\|([a-zA-Z0-9.-]+)\^", re.ASCII)
 
 # A native unconditional hostname block can overrule an ABP exception.
 # Recognize host-scoped @@ rules with or without options.
-EXCEPTION_HOST = re.compile(r"^@@\\|\\|([a-zA-Z0-9.-]+)\\^", re.ASCII)
+EXCEPTION_HOST = re.compile(r"^@@\|\|([a-zA-Z0-9.-]+)\^", re.ASCII)
 
 def related_hosts(block, exception):
     return block == exception or block.endswith("." + exception) or exception.endswith("." + block)
@@ -98,7 +98,7 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(stats["excluded_by_exception"], 1)
     def test_subdomain_exception_suppresses_parent_block(self):
         rules, audit = compile_rules([
-            "||example.net^\\n||independent.org^",
+            "||example.net^\n||independent.org^",
             "@@||login.example.net^$script"
         ])
         self.assertEqual(len(rules), 1)
@@ -108,7 +108,7 @@ class ConverterTests(unittest.TestCase):
 
     def test_parent_exception_suppresses_child_block(self):
         rules, audit = compile_rules([
-            "||ads.example.net^\\n||independent.org^",
+            "||ads.example.net^\n||independent.org^",
             "@@||example.net^$document"
         ])
         self.assertEqual(len(rules), 1)
