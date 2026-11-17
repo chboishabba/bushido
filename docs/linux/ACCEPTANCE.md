@@ -90,3 +90,12 @@ On a Linux desktop with `secret-tool`, confirm behavior for missing item, presen
 ## P2.2 observable local HTTP fixture
 
 Run `python3 scripts/linux/network_fixture.py test` to validate the **harness** (not the browser). Run `python3 scripts/linux/network_fixture.py serve`, then open `http://127.0.0.1:8765/` from a disposable Linux WebKitGTK profile with HTTPS-only disabled for localhost. Configure equivalent network-block rules for `/blocked.js`, `/blocked-pixel`, `/blocked-fetch`, `/blocked-frame`, `/blocked-worker.js` and `/blocked-redirect`. Inspect `http://127.0.0.1:8765/__assert`; status 200 requires the document, allowed script and allowed image all arrive **and** no prohibited request reaches the server. HTTP 409 lists either missing allowed controls or blocked requests that leaked. `/__events` dumps actual server-side requests. Local-fixture success alone does not cover HTTPS, DNS, real-world filter semantics or service workers; those have separate gates.
+
+## P2.2 debug-native filter probe
+
+1. On Linux install the pinned WebKitGTK build dependencies, start `python3 scripts/linux/network_fixture.py serve`.
+2. In a separate shell and desktop session run `scripts/linux/run-filter-probe.sh`. This enables the developer-only WebKit content-extension JSON for every WebView before it loads a page.
+3. Disable HTTPS-only for localhost testing and open `http://127.0.0.1:8765/`. Inspect `/__events` and `/__assert`.
+4. Test with no filter, invalid JSON, and a rule set allowing everything. These are negative controls: missing allowed resources must not pass, invalid JSON must fail WebView creation, and disabled rules must permit prohibited requests to reach the server.
+5. Verify filter installation before navigation in child tabs, Glance and popup views. Check first-load races, GTK nested-event-loop responsiveness and filter cache permissions.
+6. Re-run with actual third-party hosts, redirects and worker requests; do not treat the fixture as full blocker parity or P2.2 completion.

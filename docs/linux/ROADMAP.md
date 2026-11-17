@@ -23,7 +23,7 @@ Produce a native Linux application that browses reliably, enforces its advertise
 | P1.2 | Runtime | Tab lifecycle, split panes, resizing, history, session restoration | Deterministic UI/integration scenario | OPEN |
 | P1.3 | Runtime | Webview popup/new-window, error handling, URL scheme safety | Adversarial local navigation fixture | OPEN |
 | P2.1 | Network | Shared Rust adblock decision for document and subresource requests; header rules still inline | Policy unit tests + Windows parity vectors | PARTIAL — policy source and tests added; runtime parity unverified |
-| P2.2 | Network | WebKitGTK adapter attached at a *pre-network* enforcement point | Local HTTP fixture verifies blocked requests never reach server | OPEN |
+| P2.2 | Network | Debug-only native WebKitGTK filter adapter with fixture JSON attached before navigation | Local HTTP fixture verifies blocked requests never reach server | PARTIAL — adapter source added; browser/network acceptance unverified |
 | P2.3 | Network | HTTPS-only, redirects, third-party matching, scriptlets/cosmetic filters | Positive and negative network fixtures including iframes/workers | OPEN |
 | P2.4 | Network | DoH reaches WebKit network stack, no fallback/leak at maximum privacy | Packet/DNS capture and failure-injection tests | OPEN |
 | P3.1 | Security | Linux per-workspace data_directory plus acknowledged WebKitGTK clear | Two-workspace fixture; no cross-workspace leakage; clear actually erases | PARTIAL — completion propagation source added, Linux runtime unverified |
@@ -55,6 +55,13 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M1:** Browser shell: opens local and remote URLs; tab/split/session tests. Still experimental.
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
+
+## P2.2 native content-filter probe (partial)
+
+- Vendored Wry now reads `BUSHIDO_LINUX_FILTER_JSON` **only in Linux debug builds**, compiles the WebKit content-extension JSON using `UserContentFilterStore::save`, and adds the compiled filter to the webview's `UserContentManager` before the first load. Compilation errors, missing manager and 15-second timeout fail view creation, rather than continuing unfiltered when the explicit test is enabled.
+- `scripts/linux/fixture-filter-webkit.json` blocks the six `/blocked*` paths of the existing local HTTP fixture and leaves the allowed controls reachable. `scripts/linux/run-filter-probe.sh` selects it for `tauri dev`; server-side `/__assert` is the acceptance signal.
+- This is a **dev-only native enforcement test**. It does not compile EasyList/uBlock rules into WebKit JSON; production adblock parity, per-site whitelist, redirect processing, header rules, HTTPS-only and DNS remain OPEN.
+- The compile helper runs a bounded GTK nested event loop before page load; compile/runtime and GUI reentrancy testing are required before promotion. **No Linux test receipt available yet.**
 
 ## P2.2 server-observed network acceptance fixture
 

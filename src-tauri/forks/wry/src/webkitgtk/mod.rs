@@ -39,7 +39,8 @@ use webkit2gtk::{
   NavigationPolicyDecisionExt, NetworkProxyMode, NetworkProxySettings, PermissionRequestExt,
   PolicyDecisionType,
   PrintOperationExt, SettingsExt, URIRequest, URIRequestExt, UserContentInjectedFrames,
-  UserContentManager, UserContentManagerExt, UserScript, UserScriptInjectionTime,
+  UserContentManager, UserContentManagerExt, UserContentFilterStore, UserContentFilterStoreExt,
+  UserScript, UserScriptInjectionTime,
   WebContextExt as Webkit2gtkWeContextExt, WebView, WebViewExt, WebsiteDataManagerExt,
   WebsiteDataManagerExtManual, WebsitePolicies,
 };
@@ -60,6 +61,59 @@ use crate::{
 use self::web_context::WebContextExt;
 
 const WEBVIEW_ID: &str = "webview_id";
+
+// Developer-only native WebKitGTK network enforcement probe.
+// Compiles WebKit's content extension JSON and installs the resulting filter
+// BEFORE the first page load. This deliberately does not claim equivalence
+// with Bushido's Rust adblock engine / EasyList semantics.
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn install_linux_fixture_filter(webview: &WebView) -> Result<()> {
+  use std::io;
+  let Some(source_path) = std::env::var_os("BUSHIDO_LINUX_FILTER_JSON") else {
+    return Ok(());
+  };
+  let content = std::fs::read(std::path::PathBuf::from(source_path))?;
+  if content.is_empty() {
+    return Err(Error::Io(io::Error::new(io::ErrorKind::InvalidData, "Empty WebKitGTK filter JSON")));
+  }
+  let manager = webview.user_content_manager().ok_or_else(|| {
+    Error::Io(io::Error::other("WebKitGTK UserContentManager unavailable"))
+  })?;
+  let cache = dirs::cache_dir().ok_or_else(|| {
+    Error::Io(io::Error::other("No Linux user cache directory for content filter store"))
+  })?.join("bushido-browser").join("webkit-content-filter-probe");
+  std::fs::create_dir_all(&cache)?;
+  let store = UserContentFilterStore::new(&cache.to_string_lossy());
+  let bytes = gtk::glib::Bytes::from_owned(content);
+  let (sender, receiver) = std::sync::mpsc::channel();
+  store.save("bushido-development-probe", &bytes, None::<&Cancellable>, move |result| {
+    let _ = sender.send(result);
+  });
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+  loop {
+    match receiver.try_recv() {
+      Ok(Ok(filter)) => {
+        manager.add_filter(&filter);
+        return Ok(());
+      }
+      Ok(Err(err)) => return Err(Error::GlibError(err)),
+      Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+        return Err(Error::Io(io::Error::other("WebKitGTK filter compilation callback lost")));
+      }
+      Err(std::sync::mpsc::TryRecvError::Empty) => {}
+    }
+    if std::time::Instant::now() >= deadline {
+      return Err(Error::Io(io::Error::new(io::ErrorKind::TimedOut,
+        "WebKitGTK content filter compilation timed out")));
+    }
+    if gtk::events_pending() {
+      gtk::main_iteration();
+    } else {
+      std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+  }
+}
+
 
 mod drag_drop;
 mod synthetic_mouse_events;
@@ -300,6 +354,11 @@ impl InnerWebView {
 
     // Webview Settings
     Self::set_webview_settings(&webview, &attributes);
+
+    // In debug Linux builds, install the native filter BEFORE navigation.
+    // Fail the WebView creation if its requested rule set cannot compile.
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    install_linux_fixture_filter(&webview)?;
 
     // Webview handlers
     Self::attach_handlers(&webview, web_context, &mut attributes);
