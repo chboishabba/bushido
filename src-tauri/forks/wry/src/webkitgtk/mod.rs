@@ -106,7 +106,9 @@ fn install_linux_fixture_filter(webview: &WebView) -> Result<()> {
   })?.join("bushido-browser").join("webkit-content-filter-probe");
   std::fs::create_dir_all(&cache)?;
   let store = UserContentFilterStore::new(&cache.to_string_lossy());
-  let bytes = gtk::glib::Bytes::from_owned(content);
+  // Keep the source bytes for the exact-content cache key after GBytes
+  // takes ownership of its allocation.
+  let bytes = gtk::glib::Bytes::from_owned(content.clone());
   let (sender, receiver) = std::sync::mpsc::channel();
   store.save("bushido-development-probe", &bytes, None::<&Cancellable>, move |result| {
     let _ = sender.send(result);
