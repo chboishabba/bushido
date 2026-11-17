@@ -20,6 +20,8 @@ node --version
 npm --version
 pkg-config --modversion gtk+-3.0 webkit2gtk-4.1 libsoup-3.0
 
+python3 scripts/linux/network_fixture.py test
+python3 scripts/linux/compile_webkit_subset.py --test
 npm ci
 npm run build
 npm test

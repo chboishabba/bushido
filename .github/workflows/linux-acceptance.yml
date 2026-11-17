@@ -23,6 +23,10 @@ jobs:
         with:
           node-version: '22'
           cache: npm
+      - name: Validate network acceptance fixtures and ABP subset producer
+        run: |
+          python3 scripts/linux/network_fixture.py test
+          python3 scripts/linux/compile_webkit_subset.py --test
       - name: Install locked dependencies
         run: npm ci
       - name: Compile frontend

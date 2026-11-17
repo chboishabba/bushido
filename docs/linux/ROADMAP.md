@@ -56,6 +56,11 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P0 CI coverage extension
+
+- The frontend CI job and local Linux preflight now run both stdlib Python harness self-tests: network request fixture and ABP subset translator. CI remains **not accepted** until a completed green run is attached to a head SHA.
+- These checks validate local producers; they do **not** replace a Linux WebKitGTK compile, native fixture run or network security receipt.
+
 ## P2.2 audited ABP hostname subset (partial; dev only)
 
 - `scripts/linux/compile_webkit_subset.py` converts only unconditional `||hostname^` blocks into WebKit content-extension JSON. Exact matching `@@||hostname^` exceptions across lists suppress that hostname. All other ABP rules are skipped and counted.
