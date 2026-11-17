@@ -56,6 +56,12 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 Glance navigation policy weld
+
+- Glance's `on_navigation` now evaluates destination-specific whitelist state and the original Rust document adblock decision. Under an enabled Linux debug native filter source, it uses the shared per-tab navigation sequence and applied-filter state to deny mismatched navigation, compile/apply the correct native rule set, and retry only if still current.
+- Successful Glance navigation emits `tab-url-changed` for the existing frontend Glance URL bookkeeping.
+- The callback handles top-level navigation attempts and reuses the existing experimental rule source. Redirect chains, frame/resource semantics, live global adblock changes in Glance, and native GTK acceptance remain OPEN.
+
 ## P2.2 Glance native filter initial-state weld
 
 - `open_glance` now takes the frontend's live global adblock preference, computes the Glance **destination** host's whitelist (not the source tab's), and supplies that decision to the same per-WebView native filter builder.

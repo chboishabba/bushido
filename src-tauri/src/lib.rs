@@ -2205,6 +2205,74 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
             linux_workspace_data_directory(profile_name.as_deref())
         );
     }
+    // Glance can navigate independently after creation. Keep its native
+    // filter aligned with each destination BEFORE approving the request.
+    // The same per-tab generation/attempt guards prevent stale retries.
+    let glance_app_nav = app.clone();
+    let glance_id_nav = glance_id.clone();
+    let glance_engine = bs.engine.clone();
+    builder = builder.on_navigation(move |destination| {
+        let destination_url = destination.to_string();
+        if is_blocked_scheme(&destination_url) {
+            return false;
+        }
+
+        let whitelisted = destination.host_str().is_some_and(|host|
+            glance_app_nav.state::<WhitelistState>()
+                .sites.lock().contains(&host.to_lowercase()));
+
+        #[cfg(all(target_os = "linux", debug_assertions))]
+        if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+            let state = glance_app_nav.state::<Arc<NativeFilterUpdateState>>().inner().clone();
+            let attempt = state.begin_navigation(&glance_id_nav);
+            let desired = state.desired_for(&glance_id_nav, whitelisted);
+            if desired != state.applied_for(&glance_id_nav) {
+                state.reserve_navigation(&glance_id_nav, attempt, &destination_url);
+                let app_retry = glance_app_nav.clone();
+                let id_retry = glance_id_nav.clone();
+                let url_retry = destination.clone();
+                let text_retry = destination_url.clone();
+                let retry_state = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    match change_linux_webview_filter(&app_retry, &id_retry, desired).await {
+                        Ok(_) => {
+                            let current_whitelisted = url_retry.host_str().is_some_and(|host|
+                                app_retry.state::<WhitelistState>()
+                                    .sites.lock().contains(&host.to_lowercase()));
+                            if retry_state.desired_for(&id_retry, current_whitelisted) == desired
+                                && retry_state.take_latest_navigation(&id_retry, attempt, &text_retry)
+                            {
+                                if let Some(view) = app_retry.get_webview(&id_retry) {
+                                    if let Err(e) = view.navigate(url_retry) {
+                                        crash_log::log_error("glance-filter-retry", &e.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => crash_log::log_error("glance-filter-retry", &e),
+                    }
+                });
+                return false;
+            }
+            state.cancel_navigation(&glance_id_nav);
+        }
+
+        // Match the ordinary tab's document-blocking decision, independent
+        // of WebKitGTK's limited hostname subset.
+        if ad_blocker && !whitelisted {
+            let engine = glance_engine.read();
+            if blocker::evaluate_request(&engine, &destination_url, &destination_url, "document")
+                .is_some_and(|decision| decision.blocked)
+            {
+                return false;
+            }
+        }
+        let _ = glance_app_nav.emit_to("main", "tab-url-changed", serde_json::json!({
+            "id": glance_id_nav, "url": destination_url
+        }));
+        true
+    });
+
     builder = builder.initialization_script(&shortcut_s);
     builder = builder.initialization_script(&media_s);
     builder = builder.initialization_script(&fingerprint_s);

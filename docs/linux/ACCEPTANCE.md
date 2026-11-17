@@ -151,3 +151,7 @@ Exercise two rapid identical URL navigations requiring a filter switch, and asse
 ## Glance native filtering
 
 Open a Glance view from a whitelisted source tab into an unwhitelisted destination; the Glance filter must follow the destination rather than the source. Repeat with global adblock disabled and an explicitly whitelisted Glance destination. Observe blocked and allowed subresource requests at the fixture server from the **first** page load. Close and recreate Glance with the same ID and ensure no prior native-filter generation is reused. Test failed creation cleanup. Glance cross-site navigation/promotion and dynamic settings remain open pending a dedicated policy callback weld.
+
+## Glance cross-origin navigation
+
+Create Glance on an unwhitelisted origin, follow a link to a whitelisted destination and back, and observe the original requests at the server. The navigation attempt must not pass with the old applied native filter. The second navigation must not revive a superseded first attempt. Confirm `tab-url-changed` updates the Glance URL without adding an ordinary tab history entry unexpectedly. Inspect actual HTTP redirects and frames separately; source-level callbacks are not proof of a network-wide barrier.
