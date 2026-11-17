@@ -2101,16 +2101,13 @@ async fn toggle_fullscreen(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn zoom_tab(app: tauri::AppHandle, id: String, factor: f64) -> Result<(), String> {
-    if let Some(wv) = app.get_webview(&id) {
-        let _ = wv.with_webview(move |wv| {
-            #[cfg(windows)]
-            unsafe { let _ = wv.controller().SetZoomFactor(factor); }
-        });
+    if !factor.is_finite() || factor <= 0.0 {
+        return Err("Zoom factor must be finite and positive".into());
     }
-    #[cfg(not(windows))]
-    return Err("Per-tab native zoom is not implemented on Linux".into());
-    #[cfg(windows)]
-    Ok(())
+    let wv = app.get_webview(&id).ok_or("webview not found")?;
+    // The vendored Tauri API dispatches zoom to the platform backend.
+    // Avoid a Windows-specific controller call or a false-success Linux stub.
+    wv.set_zoom(factor).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2123,10 +2120,12 @@ async fn print_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn toggle_devtools(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    if let Some(wv) = app.get_webview(&id) {
+    let wv = app.get_webview(&id).ok_or("webview not found")?;
+    #[cfg(windows)]
+    {
+        // Preserve upstream PR #4's guarded WebView2 path.
         wv.with_webview(|webview| {
             let _ = catch_unwind(AssertUnwindSafe(|| {
-                #[cfg(windows)]
                 unsafe {
                     if let Ok(core) = webview.controller().CoreWebView2() {
                         let _ = core.OpenDevToolsWindow();
@@ -2134,8 +2133,20 @@ async fn toggle_devtools(app: tauri::AppHandle, id: String) -> Result<(), String
                 }
             }));
         }).map_err(|e| e.to_string())?;
+        Ok(())
     }
-    Ok(())
+    #[cfg(all(not(windows), debug_assertions))]
+    {
+        // Available in Tauri debug builds; native WebKit inspector on Linux.
+        wv.open_devtools();
+        Ok(())
+    }
+    #[cfg(all(not(windows), not(debug_assertions)))]
+    {
+        // Tauri does not expose open_devtools without its devtools feature.
+        let _ = wv;
+        Err("Developer tools are disabled in this release build".into())
+    }
 }
 
 #[tauri::command]

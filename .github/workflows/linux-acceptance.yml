@@ -1,0 +1,61 @@
+name: Linux build acceptance
+
+on:
+  push:
+    branches: [linux-port-pr4-source]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-acceptance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend build and tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Compile frontend
+        run: npm run build
+      - name: Frontend regression tests
+        run: npm test
+
+  rust-linux:
+    name: Linux Rust and vendored Wry/Tauri
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri v2 WebKitGTK toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Capture Linux build environment
+        run: |
+          uname -a
+          cat /etc/os-release
+          rustc --version
+          cargo --version
+          pkg-config --modversion gtk+-3.0 webkit2gtk-4.1 libsoup-3.0
+      - name: Check application and patched dependency crates
+        run: cargo check --manifest-path src-tauri/Cargo.toml --locked
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
