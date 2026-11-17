@@ -19,7 +19,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::fs;
 use std::path::PathBuf;
-use adblock::request::Request;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -570,11 +569,10 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
             // adblock-rust engine check for document-level navigations
             if nav_ad_blocker && !whitelisted_for_nav {
                 let guard = engine_for_nav.read();
-                if let Ok(req) = Request::new(&url_str, &url_str, "document") {
-                    let result = guard.check_network_request(&req);
-                    if result.matched {
-                        return false;
-                    }
+                if blocker::evaluate_request(&guard, &url_str, &url_str, "document")
+                    .is_some_and(|decision| decision.blocked)
+                {
+                    return false;
                 }
                 // compute cosmetic resources for this URL (injected in on_page_load)
                 let cosmetic = blocker::get_cosmetic_resources(&guard, &url_str);
@@ -956,56 +954,50 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                                         let _ = args.ResourceContext(&mut ctx);
                                         let rtype = blocker::resource_type_str(ctx.0 as u32);
 
-                                        // strip tracking params from ALL requests (research/18 B.2)
-                                        // not just documents — sub-resources (images, scripts, XHR) also carry
-                                        // tracking params like ?fbclid=, ?_ga=, etc.
-                                        if let Some(clean) = blocker::strip_tracking_params(&url) {
-                                            let new_url: Vec<u16> = format!("{}\0", clean).encode_utf16().collect();
-                                            let _ = request.SetUri(windows::core::PCWSTR::from_raw(new_url.as_ptr()));
-                                        }
-
-                                        let current_source = source_ref.lock().clone();
-                                        if let Ok(req) = Request::new(&url, &current_source, rtype) {
-                                            let result = engine_ref.read().check_network_request(&req);
-
-                                            // network log — only when enabled
-                                            {
-                                                let nl = app_ref.state::<NetworkLog>();
-                                                if nl.enabled.load(Ordering::Relaxed) {
-                                                    let entry = NetworkLogEntry {
+                                        let source_url = source_ref.lock().clone();
+                                        if let Some(decision) = blocker::evaluate_request(
+                                            &engine_ref.read(), &url, &source_url, rtype,
+                                        ) {
+                                            // Log the exact same policy result that the
+                                            // browser callback enforces on this platform.
+                                            let nl = app_ref.state::<NetworkLog>();
+                                            if nl.enabled.load(Ordering::Relaxed) {
+                                                nl.pending.lock()
+                                                    .entry(tab_ref.clone())
+                                                    .or_insert_with(Vec::new)
+                                                    .push(NetworkLogEntry {
                                                         url: url.clone(),
                                                         resource_type: rtype.to_string(),
-                                                        blocked: result.matched,
-                                                        filter_rule: if result.matched { result.filter.clone() } else { None },
+                                                        blocked: decision.blocked,
+                                                        filter_rule: if decision.blocked {
+                                                            decision.filter_rule.clone()
+                                                        } else {
+                                                            None
+                                                        },
                                                         timestamp_ms: std::time::SystemTime::now()
                                                             .duration_since(std::time::UNIX_EPOCH)
                                                             .unwrap_or_default()
                                                             .as_millis() as u64,
-                                                    };
-                                                    nl.pending.lock()
-                                                        .entry(tab_ref.clone())
-                                                        .or_insert_with(Vec::new)
-                                                        .push(entry);
-                                                }
+                                                    });
                                             }
 
-                                            if !result.matched {
-                                                // handle $removeparam (rewritten URL)
-                                                if let Some(ref rewritten) = result.rewritten_url {
-                                                    let new_url: Vec<u16> = format!("{}\0", rewritten).encode_utf16().collect();
-                                                    let _ = request.SetUri(windows::core::PCWSTR::from_raw(new_url.as_ptr()));
-                                                }
-                                            } else {
-                                                // request is blocked — use redirect surrogate or about:blank
-                                                if let Some(ref data_uri) = result.redirect {
-                                                    let redir_url: Vec<u16> = format!("{}\0", data_uri).encode_utf16().collect();
-                                                    let _ = request.SetUri(windows::core::PCWSTR::from_raw(redir_url.as_ptr()));
-                                                } else {
-                                                    let blank: Vec<u16> = "about:blank\0".encode_utf16().collect();
-                                                    let _ = request.SetUri(windows::core::PCWSTR::from_raw(blank.as_ptr()));
-                                                }
+                                            // No network request may be made for a
+                                            // blocked URI. WebView2's about:blank and
+                                            // filter-provided redirects are preserved.
+                                            if let Some(ref new_uri) = decision.redirect_url
+                                                .as_ref().or(decision.rewrite_url.as_ref())
+                                            {
+                                                let wide: Vec<u16> = new_uri.encode_utf16()
+                                                    .chain(std::iter::once(0)).collect();
+                                                let _ = request.SetUri(
+                                                    windows::core::PCWSTR::from_raw(wide.as_ptr())
+                                                );
+                                            }
 
-                                                let count = count_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                            if decision.blocked {
+                                                let count = count_ref.fetch_add(
+                                                    1, std::sync::atomic::Ordering::Relaxed
+                                                ) + 1;
                                                 if count <= 3 || count % 5 == 0 {
                                                     let _ = app_ref.emit_to("main", "tab-blocked-count", serde_json::json!({
                                                         "id": *tab_ref,

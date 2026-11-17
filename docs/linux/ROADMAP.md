@@ -22,7 +22,7 @@ Produce a native Linux application that browses reliably, enforces its advertise
 | P1.1 | Runtime | Tauri window, GTK/WebKit child webviews, basic navigation | Screenshot, runtime logs and local HTTP fixture | OPEN |
 | P1.2 | Runtime | Tab lifecycle, split panes, resizing, history, session restoration | Deterministic UI/integration scenario | OPEN |
 | P1.3 | Runtime | Webview popup/new-window, error handling, URL scheme safety | Adversarial local navigation fixture | OPEN |
-| P2.1 | Network | Shared Rust policy for document and subresource requests, redirects, headers | Policy unit tests + Windows parity vectors | OPEN |
+| P2.1 | Network | Shared Rust adblock decision for document and subresource requests; header rules still inline | Policy unit tests + Windows parity vectors | PARTIAL — policy source and tests added; runtime parity unverified |
 | P2.2 | Network | WebKitGTK adapter attached at a *pre-network* enforcement point | Local HTTP fixture verifies blocked requests never reach server | OPEN |
 | P2.3 | Network | HTTPS-only, redirects, third-party matching, scriptlets/cosmetic filters | Positive and negative network fixtures including iframes/workers | OPEN |
 | P2.4 | Network | DoH reaches WebKit network stack, no fallback/leak at maximum privacy | Packet/DNS capture and failure-injection tests | OPEN |
@@ -55,6 +55,12 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M1:** Browser shell: opens local and remote URLs; tab/split/session tests. Still experimental.
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
+
+## P2 policy extraction in this branch
+
+- `blocker::evaluate_request` computes a pure policy decision from the existing adblock engine (block, filter rule, URL rewrite or redirect). Both Tauri document navigation and the Windows WebView2 resource callback use the same function.
+- Rust tests cover blocking, allowed resources, tracking URL rewriting and malformed input. **Tests have not executed yet: P0 green compilation and Windows parity are still open.**
+- Crucially, this does **not** intercept WebKitGTK subresource requests or implement Linux browser DNS enforcement. P2.2/P2.4 remain OPEN.
 
 ## P0 implementation in this branch
 

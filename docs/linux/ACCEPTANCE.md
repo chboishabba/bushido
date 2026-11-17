@@ -52,3 +52,7 @@ Classify actual failures as `dependency`, `source compile`, `link`, `startup`, `
 - PR #4 commit `f83d133` is retained as an ancestor and attributed to AdithyaaSivamal.
 - Implementation PR in `chboishabba/bushido` remains draft until an auditable milestone is accepted.
 - Upstream handoff should normally be an invitation to the original contributor to pull/cherry-pick reviewed changes, or a clearly linked dependent PR.
+
+## Shared policy versus enforcement (P2.1/P2.2)
+
+The pure `blocker::evaluate_request` consumer should produce the same block/rewrite/filter decision for document and subresource requests on both backends. This is **not** equivalent to actual Linux interception. Acceptance for P2.2 requires proof that WebKitGTK never transmits a blocked resource to the local test server and that it honors redirects in subframes/workers.

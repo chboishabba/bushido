@@ -313,6 +313,44 @@ pub fn get_hidden_selectors(
     engine.hidden_class_id_selectors(classes, ids, exceptions)
 }
 
+// Pure network decision shared by the document-navigation hook and the
+// Windows WebView2 request handler. This does NOT intercept Linux subresources;
+// a WebKitGTK network adapter is still required to enforce this decision.
+pub struct RequestPolicyDecision {
+    pub blocked: bool,
+    pub filter_rule: Option<String>,
+    pub rewrite_url: Option<String>,
+    pub redirect_url: Option<String>,
+}
+
+pub fn evaluate_request(
+    engine: &Engine,
+    url: &str,
+    source_url: &str,
+    resource_type: &str,
+) -> Option<RequestPolicyDecision> {
+    let req = adblock::request::Request::new(url, source_url, resource_type).ok()?;
+    let response = engine.check_network_request(&req);
+    // WebView2 originally stripped tracking params and then applied
+    // adblock's $removeparam rewrite. Preserve that precedence for allowed
+    // requests, but do not rewrite a blocked request to a clean network URL.
+    let rewrite_url = if response.matched {
+        None
+    } else {
+        response.rewritten_url.or_else(|| strip_tracking_params(url))
+    };
+    Some(RequestPolicyDecision {
+        blocked: response.matched,
+        filter_rule: response.filter,
+        rewrite_url,
+        redirect_url: if response.matched {
+            Some(response.redirect.unwrap_or_else(|| "about:blank".to_owned()))
+        } else {
+            None
+        },
+    })
+}
+
 // ── map webview2 resource context enum to adblock resource type string ──────
 pub fn resource_type_str(ctx: u32) -> &'static str {
     match ctx {
@@ -464,6 +502,46 @@ pub fn strip_tracking_params(url_str: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_policy_blocks_matching_subresources() {
+        let mut filters = FilterSet::new(false);
+        filters.add_filters(&["||tracker.example^"], ParseOptions::default());
+        let engine = Engine::from_filter_set(filters, true);
+
+        let decision = evaluate_request(
+            &engine, "https://tracker.example/pixel.png",
+            "https://publisher.example/article", "image"
+        ).expect("valid resource");
+        assert!(decision.blocked);
+        assert_eq!(decision.redirect_url.as_deref(), Some("about:blank"));
+        assert!(decision.rewrite_url.is_none());
+
+        let allowed = evaluate_request(
+            &engine, "https://publisher.example/logo.png",
+            "https://publisher.example/article", "image"
+        ).expect("valid resource");
+        assert!(!allowed.blocked);
+        assert!(allowed.redirect_url.is_none());
+    }
+
+    #[test]
+    fn shared_policy_strips_tracking_params_only_on_allowed_requests() {
+        let engine = Engine::default();
+        let clean = evaluate_request(
+            &engine, "https://cdn.example/a.js?utm_source=x&keep=ok",
+            "https://publisher.example", "script"
+        ).expect("valid resource");
+        assert!(!clean.blocked);
+        assert_eq!(clean.rewrite_url.as_deref(), Some("https://cdn.example/a.js?keep=ok"));
+        assert!(clean.redirect_url.is_none());
+    }
+
+    #[test]
+    fn shared_policy_invalid_request_cannot_be_mistaken_for_blocked() {
+        let engine = Engine::default();
+        assert!(evaluate_request(&engine, "not a URL", "https://publisher.example", "script").is_none());
+    }
 
     #[test]
     fn resource_type_known_codes() {
