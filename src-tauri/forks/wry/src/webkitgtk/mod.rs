@@ -66,6 +66,17 @@ const WEBVIEW_ID: &str = "webview_id";
 // Compiles WebKit's content extension JSON and installs the resulting filter
 // BEFORE the first page load. This deliberately does not claim equivalence
 // with Bushido's Rust adblock engine / EasyList semantics.
+// Compiled WebKit filters are GObject handles; keep one on the GTK thread and
+// reuse it across tab/Glance WebViews instead of recompiling thousands of
+// hostname rules for every new tab. Exact byte comparison prevents stale
+// cache reuse after regenerating source rules.
+#[cfg(all(target_os = "linux", debug_assertions))]
+thread_local! {
+  static LINUX_PROBE_FILTER_CACHE:
+    std::cell::RefCell<Option<(Vec<u8>, webkit2gtk::UserContentFilter)>> =
+    std::cell::RefCell::new(None);
+}
+
 #[cfg(all(target_os = "linux", debug_assertions))]
 fn install_linux_fixture_filter(webview: &WebView) -> Result<()> {
   use std::io;
@@ -79,6 +90,17 @@ fn install_linux_fixture_filter(webview: &WebView) -> Result<()> {
   let manager = webview.user_content_manager().ok_or_else(|| {
     Error::Io(io::Error::other("WebKitGTK UserContentManager unavailable"))
   })?;
+  // Avoid a second asynchronous compile for every tab, and do not trust a
+  // filename or modification timestamp as the cache identity.
+  if let Some(cached) = LINUX_PROBE_FILTER_CACHE.with(|cache| {
+    let borrow = cache.borrow();
+    borrow.as_ref().and_then(|(previous, filter)| {
+      if previous == &content { Some(filter.clone()) } else { None }
+    })
+  }) {
+    manager.add_filter(&cached);
+    return Ok(());
+  }
   let cache = dirs::cache_dir().ok_or_else(|| {
     Error::Io(io::Error::other("No Linux user cache directory for content filter store"))
   })?.join("bushido-browser").join("webkit-content-filter-probe");
@@ -94,6 +116,9 @@ fn install_linux_fixture_filter(webview: &WebView) -> Result<()> {
     match receiver.try_recv() {
       Ok(Ok(filter)) => {
         manager.add_filter(&filter);
+        LINUX_PROBE_FILTER_CACHE.with(|cache| {
+          *cache.borrow_mut() = Some((content.clone(), filter));
+        });
         return Ok(());
       }
       Ok(Err(err)) => return Err(Error::GlibError(err)),

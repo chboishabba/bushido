@@ -56,6 +56,12 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 compiled-filter reuse across WebViews
+
+- Vendored Wry now caches the compiled `UserContentFilter` on the GTK thread keyed by **exact JSON bytes**, and attaches that filter to each new view's `UserContentManager` before navigation.
+- Changing the rule file contents forces recompilation; identical files reuse the compiled WebKit object across tabs and Glance views. This avoids recompiling several thousand hostname patterns for every new tab.
+- The cache is debug-Linux-only, matches the current dev-probe boundary and remains **unverified at runtime**. Production settings updates and per-view opt-out are not yet supported.
+
 ## P2.2 Rust source-to-WebKit bootstrap (implemented; unverified)
 
 - New `blocker::native_subset_from_peter_lowe` and `write_native_webkit_subset` construct deterministic native WebKit JSON directly from Bushido's current Peter Lowe filter source (downloaded list preferred, bundled fallback), rather than requiring the separate Python converter as the only producer.
