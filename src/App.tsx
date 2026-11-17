@@ -608,16 +608,19 @@ export default function App() {
     lastNativeAdblockRef.current = settings.adBlocker;
     if (previous === null || previous === settings.adBlocker) return;
 
-    const openTabs = tabs.filter(t =>
+    const openIds = tabs.filter(t =>
       !t.url.startsWith("bushido://") && !t.suspended && t.memoryState !== "destroyed"
-    );
-    for (const tab of openTabs) {
+    ).map(t => t.id);
+    // Glance is a separate WebView, not a member of the tabs array.
+    // It must not retain the old global preference while visible.
+    if (glanceRef.current) openIds.push(glanceRef.current.id);
+    for (const id of new Set(openIds)) {
       invoke<boolean>("set_tab_native_filter", {
-        id: tab.id, adBlocker: settings.adBlocker,
+        id, adBlocker: settings.adBlocker,
       }).then(applied => {
-        if (applied) return invoke("reload_tab", { id: tab.id });
+        if (applied) return invoke("reload_tab", { id });
       }).catch(error => {
-        console.warn("[bushido] global native filter change failed", tab.id, error);
+        console.warn("[bushido] global native filter change failed", id, error);
         useUiStore.getState().showError("Unable to update native content filter");
       });
     }

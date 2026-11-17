@@ -85,6 +85,13 @@ impl NativeFilterUpdateState {
         self.adblock.lock().insert(id.to_owned(), adblock);
     }
 
+    // The document navigation callback must use the same live preference as
+    // the native WebKit content-filter manager. Never use the capture from
+    // when a Glance/tab WebView was created if native mode is configured.
+    fn preference_for(&self, id: &str) -> bool {
+        self.adblock.lock().get(id).copied().unwrap_or(false)
+    }
+
     fn desired_for(&self, id: &str, whitelisted: bool) -> bool {
         self.adblock.lock().get(id).copied().unwrap_or(false) && !whitelisted
     }
@@ -877,6 +884,12 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 }
             }
 
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            let nav_ad_blocker = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+                app_nav.state::<Arc<NativeFilterUpdateState>>().preference_for(&tab_id_nav)
+            } else {
+                nav_ad_blocker
+            };
             // adblock-rust engine check for document-level navigations
             if nav_ad_blocker && !destination_whitelisted {
                 let guard = engine_for_nav.read();
@@ -2257,8 +2270,15 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
             state.cancel_navigation(&glance_id_nav);
         }
 
-        // Match the ordinary tab's document-blocking decision, independent
-        // of WebKitGTK's limited hostname subset.
+        // Match the ordinary tab's live document-blocking decision, not the
+        // preference captured when Glance was constructed.
+        #[cfg(all(target_os = "linux", debug_assertions))]
+        let ad_blocker = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+            glance_app_nav.state::<Arc<NativeFilterUpdateState>>()
+                .preference_for(&glance_id_nav)
+        } else {
+            ad_blocker
+        };
         if ad_blocker && !whitelisted {
             let engine = glance_engine.read();
             if blocker::evaluate_request(&engine, &destination_url, &destination_url, "document")

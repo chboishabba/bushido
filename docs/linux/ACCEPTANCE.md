@@ -159,3 +159,7 @@ Create Glance on an unwhitelisted origin, follow a link to a whitelisted destina
 ## Redirect, iframe and worker network acceptance
 
 With `fixture-filter-webkit.json` installed before first navigation, load the fixture. An *allowed* `/allowed-redirect-to-blocked` must reach the HTTP server, but its `/blocked-redirect-destination` target must not. An allowed `/allowed-nested-frame` must reach the server but `/blocked-nested-script.js` must not. An allowed `/allowed-worker.js` must arrive but `/blocked-worker-import.js` must not. Check `/__assert` and negative-control runs without filtering; a green Python self-test alone is not proof of WebKitGTK enforcement.
+
+## Glance global preference and document-policy consistency
+
+With Glance open, change global adblock on→off→on and verify both the native WebKit filter and original Rust document policy follow the changed value. Compare ordinary tabs and Glance on the same destination; neither should retain creation-time document policy. Confirm the fallback without experimental rules does not pretend that native filtering was updated. On-page-load cosmetic/scriptlet capture is a separate OPEN parity gate.

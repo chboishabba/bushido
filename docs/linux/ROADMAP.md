@@ -56,6 +56,12 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 global preference consistency for Glance and tab navigation
+
+- The frontend's live `adBlocker` transition now updates the visible Glance WebView in addition to ordinary tabs; it awaits a native update acknowledgement before reloading each view.
+- The native Linux debug document-navigation callbacks for ordinary tabs and Glance now consult `NativeFilterUpdateState.preference_for` rather than a preference captured at WebView creation. This aligns Rust document decisions with native filter updates for explicitly opted-in sessions.
+- Remaining limitations: cosmetic/on-page-load injection still captures the original adblock toggle; global preference changes in non-debug/Linux production and Windows are not covered. Navigation/GTK runtime acceptance and full ABP parity remain open.
+
 ## P2.2 redirect/frame/worker acceptance fixture expansion
 
 - The local HTTP request recorder now has an allowed `302` redirect whose **destination** is blocked, an allowed iframe that loads a blocked script, and an allowed worker that imports a blocked script. It requires the allowed controls to arrive and rejects server-observed blocked destinations/child resources.
