@@ -30,6 +30,77 @@ struct PanelState {
     ids: Mutex<HashSet<String>>,
 }
 
+// Each asynchronous WebKitGTK filter compilation carries a monotonically
+// increasing ticket. Only the most recently requested ticket for a tab may
+// mutate that tab's content manager. Tickets never reset when tab IDs reuse.
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[derive(Default)]
+struct NativeFilterUpdateState {
+    counter: std::sync::atomic::AtomicU64,
+    latest: Mutex<HashMap<String, u64>>,
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+impl NativeFilterUpdateState {
+    fn issue(&self, id: &str) -> u64 {
+        let ticket = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
+        self.latest.lock().insert(id.to_owned(), ticket);
+        ticket
+    }
+
+    fn current(&self, id: &str, ticket: u64) -> bool {
+        self.latest.lock().get(id).copied() == Some(ticket)
+    }
+
+    fn invalidate(&self, id: &str, ticket: u64) {
+        let mut latest = self.latest.lock();
+        if latest.get(id).copied() == Some(ticket) {
+            latest.remove(id);
+        }
+    }
+
+    fn forget(&self, id: &str) {
+        self.latest.lock().remove(id);
+    }
+}
+
+#[cfg(all(test, target_os = "linux", debug_assertions))]
+mod native_filter_generation_tests {
+    use super::*;
+
+    #[test]
+    fn older_completion_cannot_restore_filter() {
+        let updates = NativeFilterUpdateState::default();
+        let old = updates.issue("tab-a");
+        let new = updates.issue("tab-a");
+        assert!(!updates.current("tab-a", old));
+        assert!(updates.current("tab-a", new));
+        updates.invalidate("tab-a", old);
+        assert!(updates.current("tab-a", new));
+    }
+
+    #[test]
+    fn closing_tab_invalidates_inflight_update_even_after_id_reuse() {
+        let updates = NativeFilterUpdateState::default();
+        let old = updates.issue("tab-a");
+        updates.forget("tab-a");
+        let new = updates.issue("tab-a");
+        assert_ne!(old, new);
+        assert!(!updates.current("tab-a", old));
+        assert!(updates.current("tab-a", new));
+    }
+
+    #[test]
+    fn updates_to_distinct_tabs_are_independent() {
+        let updates = NativeFilterUpdateState::default();
+        let a = updates.issue("a");
+        let b = updates.issue("b");
+        updates.invalidate("a", a);
+        assert!(!updates.current("a", a));
+        assert!(updates.current("b", b));
+    }
+}
+
 
 struct BlockerState {
     engine: Arc<RwLock<adblock::engine::Engine>>,
@@ -1875,6 +1946,8 @@ async fn close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
     // remove from state FIRST so layout_webviews won't try to position a dying webview
     let state = app.state::<WebviewState>();
     state.tabs.lock().remove(&id);
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    app.state::<Arc<NativeFilterUpdateState>>().forget(&id);
     if let Some(wv) = app.get_webview(&id) {
         if let Err(e) = wv.close() {
             crash_log::log_error("close_tab", &format!("wv.close() failed for {}: {}", id, e));
@@ -2439,6 +2512,9 @@ async fn change_linux_webview_filter(
 ) -> Result<bool, String> {
     use webkit2gtk::{UserContentFilterStore, UserContentFilterStoreExt, UserContentManagerExt, WebViewExt};
     let view = app.get_webview(id).ok_or_else(|| format!("Unknown WebView: {id}"))?;
+    let updates = app.state::<Arc<NativeFilterUpdateState>>().inner().clone();
+    let ticket = updates.issue(id);
+    let tab_id = id.to_owned();
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<bool, String>>();
     let rule_bytes = if enabled {
         let rule_path = std::env::var_os("BUSHIDO_LINUX_FILTER_JSON")
@@ -2452,14 +2528,20 @@ async fn change_linux_webview_filter(
     } else {
         None
     };
-    view.with_webview(move |view| {
+    let updates_for_callback = updates.clone();
+    let id_for_callback = tab_id.clone();
+    let dispatched = view.with_webview(move |view| {
         let Some(manager) = view.inner().user_content_manager() else {
             let _ = tx.send(Err("Missing native WebKitGTK content manager".into()));
             return;
         };
+        if !updates_for_callback.current(&id_for_callback, ticket) {
+            let _ = tx.send(Err("Native filter update was superseded".into()));
+            return;
+        }
         if !enabled {
             manager.remove_all_filters();
-            let _ = tx.send(Ok(false));
+            let _ = tx.send(Ok(true)); // successful removal is an applied change
             return;
         }
         let cache = dirs::cache_dir().map(|p|
@@ -2476,6 +2558,12 @@ async fn change_linux_webview_filter(
         store.save("bushido-development-probe", &bytes,
                    None::<&webkit2gtk::gio::Cancellable>,
                    move |result| {
+            // A subsequent toggle may have completed while this compilation
+            // was still in flight. Never apply stale compiled rule sets.
+            if !updates_for_callback.current(&id_for_callback, ticket) {
+                let _ = tx.send(Err("Native filter update was superseded".into()));
+                return;
+            }
             match result {
                 Ok(filter) => {
                     manager.remove_all_filters();
@@ -2487,11 +2575,20 @@ async fn change_linux_webview_filter(
                 }
             }
         });
-    }).map_err(|e| format!("Failed to dispatch native filter change: {e}"))?;
-    tokio::time::timeout(std::time::Duration::from_secs(15), rx)
-        .await
-        .map_err(|_| "Timed out applying native WebKitGTK filter".to_string())?
-        .map_err(|_| "Native WebKitGTK filter callback was lost".to_string())?
+    });
+    let outcome = match dispatched {
+        Err(e) => Err(format!("Failed to dispatch native filter change: {e}")),
+        Ok(()) => match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
+            Err(_) => Err("Timed out applying native WebKitGTK filter".to_string()),
+            Ok(Err(_)) => Err("Native WebKitGTK filter callback was lost".to_string()),
+            Ok(Ok(outcome)) => outcome,
+        },
+    };
+    // A timed-out or failed update must not later mutate the live WebView.
+    if outcome.is_err() {
+        updates.invalidate(&tab_id, ticket);
+    }
+    outcome
 }
 
 #[tauri::command]
@@ -3064,6 +3161,9 @@ pub fn run() {
         .manage(WebviewState {
             tabs: Mutex::new(HashMap::new()),
         })
+        // Source-level ordering guard for async WebKitGTK native rule updates.
+        #[cfg(all(target_os = "linux", debug_assertions))]
+        .manage(Arc::new(NativeFilterUpdateState::default()))
         .manage(PanelState {
             ids: Mutex::new(HashSet::new()),
         })

@@ -56,6 +56,14 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 asynchronous native-filter update ordering (source implementation)
+
+- New `NativeFilterUpdateState` issues globally monotone, per-tab latest tickets. The WebKitGTK save callback checks the ticket **before modifying** native filters; superseded callbacks return explicit errors and cannot re-enable a stale rule set.
+- Disabling native filtering now acknowledges removal as an applied change, so the frontend's global-toggle path reloads after both directions of a successful toggle.
+- Timeout/dispatch errors invalidate the ticket. Closing a tab invalidates its outstanding callbacks, and a newly created tab reusing the same ID cannot accept an older ticket.
+- Pure Rust tests cover out-of-order completion, tab close/ID reuse and independent tab updates. **Not yet run**; GLib main-thread and rapid-toggle runtime acceptance remain OPEN.
+- This addresses update ordering, **not** the distinct pre-navigation first-request race or the original Rust ABP completeness.
+
 ## P2.2 global adblock preference updates (source implementation)
 
 - React now notices actual `settings.adBlocker` transitions after saved settings are loaded and requests `set_tab_native_filter` for existing live non-internal tabs. It reloads only after the backend confirms a native filter was applied, and surfaces errors.

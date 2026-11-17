@@ -131,3 +131,7 @@ Create a fresh Linux profile with no compiled content-filter store and with adbl
 ## Global adblock toggles on existing WebViews
 
 After loading persisted settings, change `adBlocker` from on to off and back with multiple live Linux WebViews and different site whitelists. Each view should acknowledge the changed native filter state before a reload; verify server-observed requests and absence of rule-source errors when the probe is deliberately disabled. Repeat rapid toggles to detect out-of-order saves. The implementation remains debug-only and does not establish Windows or original Rust adblock parity.
+
+## P2.2 stale asynchronous completion rejection
+
+With a real Linux debug WebKitGTK instance, induce two native filter updates for the same tab and force the first compilation callback to finish last; it must not alter the newer state. Closing a tab must invalidate pending callbacks, even when the same ID is reused. Test enable→disable and disable→enable, including a 15-second failure path. A successful disabled update must be acknowledged and trigger the existing reload. The generation-state unit tests exercise ordering logic but **do not** prove a GTK runtime race has been eliminated.
