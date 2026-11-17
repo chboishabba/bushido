@@ -617,8 +617,11 @@ export default function App() {
     for (const id of new Set(openIds)) {
       invoke<boolean>("set_tab_native_filter", {
         id, adBlocker: settings.adBlocker,
-      }).then(applied => {
-        if (applied) return invoke("reload_tab", { id });
+      }).then(() => {
+        // Even when no experimental native rule source is configured, the
+        // adblock preference change must rebuild this page's conditional
+        // cosmetic scripts. Only reject the reload on a real backend error.
+        return invoke("reload_tab", { id });
       }).catch(error => {
         console.warn("[bushido] global native filter change failed", id, error);
         useUiStore.getState().showError("Unable to update native content filter");

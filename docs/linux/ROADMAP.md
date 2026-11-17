@@ -56,6 +56,13 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 document-start privacy/cosmetic separation
+
+- `content_blocker.js` implements WebRTC ICE/STUN/TURN hardening, not cosmetic ad blocking. It is now registered as an always-on WebView initialization script, independent of cosmetic whitelist and adblock setting.
+- Removed permanent document-start registration of `cosmetic_observer.js`. The existing page-load path installs the observer only when adblocking is enabled, the current origin is not whitelisted, and the engine permits generic hiding.
+- Cleared previous-origin pending cosmetic payload on **every** candidate navigation, including transitions with adblock turned off. The frontend now reloads open tabs on global preference changes even if the experimental native filter is unconfigured, rather than leaving obsolete cosmetic DOM state.
+- Source-level correction only. Document-start vs post-commit timing, cosmetic observer IPC on Linux, cookie blocker persistence and full original Rust/WebKit parity remain OPEN.
+
 ## P2.2 normal-tab WebView construction rollback
 
 - `create_tab` now cleans up its pre-registered Linux native filter state when Tauri's `window.add_child` fails, matching the earlier Glance cleanup path.

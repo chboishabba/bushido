@@ -856,14 +856,7 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
             let destination_whitelisted = url.host_str()
                 .is_some_and(|host|
                     app_nav.state::<WhitelistState>().sites.lock().contains(&host.to_lowercase()));
-            if destination_whitelisted {
-                let mut pending = pending_for_nav.lock();
-                pending.css.clear();
-                pending.script.clear();
-                pending.exceptions.clear();
-                pending.generichide = false;
-            }
-            // Native Linux policy must be in place BEFORE WebKitGTK is
+             // Native Linux policy must be in place BEFORE WebKitGTK is
             // allowed to start the destination request. A filter update is
             // asynchronous: deny this attempt, update, then retry.
             #[cfg(all(target_os = "linux", debug_assertions))]
@@ -920,6 +913,16 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
             } else {
                 nav_ad_blocker
             };
+            // Pending cosmetic resources belong to the previous origin.
+            // Clear them for *every* navigation, including transitions
+            // where adblocking has been disabled without a whitelist.
+            {
+                let mut pending = pending_for_nav.lock();
+                pending.css.clear();
+                pending.script.clear();
+                pending.exceptions.clear();
+                pending.generichide = false;
+            }
             // adblock-rust engine check for document-level navigations
             if nav_ad_blocker && !destination_whitelisted {
                 let guard = engine_for_nav.read();
@@ -1013,8 +1016,8 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 };
                 // blockers only if enabled and not whitelisted
                 if load_ad_blocker && !active_host_whitelisted {
-                    let _ = wv.eval(&inject_cosmetic);
-
+                    // WebRTC privacy is installed at document start for every
+                    // tab; only cosmetic data/observers are adblock-scoped.
                     // inject dynamic cosmetic resources (computed in on_navigation)
                     let (css, script, generichide) = {
                         let guard = pending_for_load.lock();
@@ -1058,11 +1061,13 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     builder = builder.initialization_script(&glance_script);
     builder = builder.initialization_script(&bs.preload_script);
 
-    // only inject cosmetic scripts if enabled and not whitelisted
-    if ad_blocker && !site_whitelisted {
-        builder = builder.initialization_script(&cosmetic_script);
-        builder = builder.initialization_script(&cosmetic_observer_script);
-    }
+    // WebRTC ICE/STUN restriction in content_blocker.js is transport-level
+    // privacy hardening, NOT cosmetic ad blocking. Register it independently
+    // of the adblock toggle and per-site cosmetic whitelist.
+    builder = builder.initialization_script(&cosmetic_script);
+    // Never install the DOM cosmetic observer permanently at document start:
+    // the live page-load path below injects it only when enabled, the origin
+    // is not whitelisted, and the engine has not requested $generichide.
     if cookie_auto_reject && !site_whitelisted {
         builder = builder.initialization_script(&cookie_script);
     }
