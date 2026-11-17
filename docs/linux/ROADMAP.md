@@ -56,6 +56,13 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 Rust source-to-WebKit bootstrap (implemented; unverified)
+
+- New `blocker::native_subset_from_peter_lowe` and `write_native_webkit_subset` construct deterministic native WebKit JSON directly from Bushido's current Peter Lowe filter source (downloaded list preferred, bundled fallback), rather than requiring the separate Python converter as the only producer.
+- Opt in with `BUSHIDO_LINUX_NATIVE_SOURCE_SUBSET=peter-lowe` in a **Linux debug build**, and the app writes a private JSON rule file and receipt to its data directory, then configures the existing Wry pre-navigation native content-filter loader. Python's fixture JSON remains a separate manual probe.
+- The subset parser deliberately accepts only bare `||domain^` host rules, rejects regex/options/cosmetic syntax, reports discarded lines and duplicates and refuses an empty output. Linux Rust tests cover source selection and parser boundaries; the live WebKitGTK execution is **not yet verified**.
+- This **does not integrate full Rust adblock engine decisions**, cross-list exceptions, per-tab enable/disable/whitelists, redirect handling or DNS. Opt-in rule generation is for implementation/evaluation only and cannot constitute release privacy parity.
+
 ## P2.2 exception-overlap safety correction
 
 - An original `||host^` native rule matches host descendants, so an exact-only `@@||host^` exception matcher could overblock a narrower exempted hostname. The producer now suppresses overlapping parent/child blocks for host-scoped exceptions, including option-bearing exceptions.

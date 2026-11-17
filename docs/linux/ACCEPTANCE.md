@@ -107,3 +107,7 @@ Run `python3 scripts/linux/compile_webkit_subset.py --test` and inspect the subs
 ## P2.2 exception-overlap safety regression
 
 Test `||example.net^` with `@@||login.example.net^$script`: the unconditional native parent block must be omitted because it cannot represent the exception. Test the opposite parent/child direction and unrelated host exceptions. An unscoped `@@/regex/` must refuse the entire conversion. This safety restriction may prevent generation on existing full lists; treat it as an explicit OPEN coverage gate, not a parity solution.
+
+## P2.2 Rust native-source bootstrap
+
+In a Linux debug session, `BUSHIDO_LINUX_NATIVE_SOURCE_SUBSET=peter-lowe npm run tauri -- dev` generates `<app-data>/native-webkit/rules.json` and `receipt.json`, then uses the same vendored Wry WebKit content-filter store before navigation. Verify the receipt, native compile success, and denied traffic against a host from the source list with an independent server-side observer. The bare-host parser intentionally rejects conditional rules; the external Python subset producer and fixture filter remain separate developer probes. Prove parity to the Rust engine and per-tab toggles before considering production promotion.

@@ -2869,6 +2869,21 @@ pub fn run() {
     // init adblock-rust engine (cached binary or cold compile)
     let engine = blocker::init_engine(&data_dir);
 
+    // Native Linux filter integration reuses the original downloaded/bundled
+    // source material. It is debug-only and explicitly opt-in because the
+    // strict single-list subset is not equivalent to adblock-rust's global
+    // exceptions, per-tab toggle, cosmetic or redirect semantics.
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    if std::env::var("BUSHIDO_LINUX_NATIVE_SOURCE_SUBSET").as_deref() == Ok("peter-lowe")
+        && std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_none()
+    {
+        let path = blocker::write_native_webkit_subset(&data_dir)
+            .unwrap_or_else(|e| panic!("Opted-in native WebKit subset failed: {e}"));
+        std::env::set_var("BUSHIDO_LINUX_FILTER_JSON", &path);
+        crash_log::log_warn("native-filter",
+            "Experimental Peter Lowe-only WebKit content filter enabled; not ABP parity");
+    }
+
     let scriptlet_preamble = include_str!("scriptlet_preamble.js").to_string();
     let cosmetic_script = include_str!("content_blocker.js").to_string();
     let cosmetic_observer_script = include_str!("cosmetic_observer.js").to_string();

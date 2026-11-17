@@ -284,6 +284,106 @@ pub fn load_metadata(data_dir: &PathBuf) -> FilterListMetadata {
         .unwrap_or_default()
 }
 
+// Native WebKitGTK bootstrap from Bushido's existing bundled/downloaded
+// Peter Lowe list. This is deliberately an OPT-IN, debug-only subset:
+// the full Rust ABP engine also has cross-list exceptions, resource-scoped
+// conditions and rewrites not represented by these unconditional rules.
+// The purpose is exercising real source -> WebKit JSON -> pre-load filter.
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[derive(Debug, Default, serde::Serialize)]
+pub struct NativeSubsetReceipt {
+    pub source: String,
+    pub total_lines: usize,
+    pub emitted: usize,
+    pub unsupported: usize,
+    pub duplicates: usize,
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn native_host_rule(raw: &str) -> Option<String> {
+    let text = raw.trim();
+    let host = text.strip_prefix("||")?.strip_suffix('^')?;
+    if host.len() > 253 || !host.is_ascii() || !host.contains('.') {
+        return None;
+    }
+    let host = host.to_ascii_lowercase();
+    if host.ends_with(".local") || host.ends_with(".localhost")
+        || host.ends_with(".test") || host.ends_with(".invalid")
+        || host.ends_with(".example") {
+        return None;
+    }
+    if !host.split('.').all(|label| {
+        !label.is_empty() && label.len() <= 63
+            && !label.starts_with('-') && !label.ends_with('-')
+            && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    }) {
+        return None;
+    }
+    Some(host)
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+pub fn native_subset_from_peter_lowe(text: &str) -> (Vec<serde_json::Value>, NativeSubsetReceipt) {
+    let mut names = std::collections::BTreeSet::new();
+    let mut receipt = NativeSubsetReceipt {
+        source: "peter-lowe".to_owned(),
+        ..Default::default()
+    };
+    for line in text.lines() {
+        receipt.total_lines += 1;
+        if let Some(host) = native_host_rule(line) {
+            if !names.insert(host) { receipt.duplicates += 1; }
+        } else {
+            receipt.unsupported += 1;
+        }
+    }
+    // WebKit regexes only need to escape the fixed dot separators because
+    // the parser excludes every other regex metacharacter.
+    let json = names.into_iter().map(|host| {
+        let escaped = host.replace('.', "[.]");
+        serde_json::json!({
+            "trigger": {"url-filter":
+                format!("^https?://([a-z0-9-]+[.])*{}([:/?#]|$)", escaped)},
+            "action": {"type": "block"}
+        })
+    }).collect::<Vec<_>>();
+    receipt.emitted = json.len();
+    (json, receipt)
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+pub fn write_native_webkit_subset(data_dir: &PathBuf) -> Result<PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let text = read_downloaded_list(&data_dir.join(LISTS_DIR), "peter-lowe")
+        .unwrap_or_else(|| PETER_LOWE.to_owned());
+    let (rules, receipt) = native_subset_from_peter_lowe(&text);
+    if rules.is_empty() { return Err("No eligible native WebKit host rules".into()); }
+    let output_dir = data_dir.join("native-webkit");
+    std::fs::create_dir_all(&output_dir)
+        .map_err(|e| format!("Cannot create native WebKit filter directory: {e}"))?;
+    let serialized = serde_json::to_vec(&rules).map_err(|e| e.to_string())?;
+    let mut entropy = [0u8; 8];
+    use rand::RngCore;
+    rand::rngs::OsRng.fill_bytes(&mut entropy);
+    let temp = output_dir.join(format!("rules-{:016x}.tmp", u64::from_ne_bytes(entropy)));
+    let write_result = (|| -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+            .mode(0o600).open(&temp).map_err(|e| e.to_string())?;
+        file.write_all(&serialized).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        std::fs::rename(&temp, output_dir.join("rules.json"))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if write_result.is_err() { let _ = std::fs::remove_file(&temp); }
+    write_result?;
+    let manifest = serde_json::to_vec_pretty(&receipt).map_err(|e| e.to_string())?;
+    std::fs::write(output_dir.join("receipt.json"), manifest).map_err(|e| e.to_string())?;
+    Ok(output_dir.join("rules.json"))
+}
+
 // ── get cosmetic resources for a URL ────────────────────────────────────────
 pub fn get_cosmetic_resources(engine: &Engine, url: &str) -> CosmeticResult {
     let resources = engine.url_cosmetic_resources(url);
@@ -502,6 +602,31 @@ pub fn strip_tracking_params(url_str: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    #[test]
+    fn native_source_producer_emits_only_literal_host_blocks() {
+        let (rules, receipt) = native_subset_from_peter_lowe(
+            "||ads.example.net^\n||tracker.other.org^\n||ADS.EXAMPLE.NET^\n@@||ads.example.net^\n||ads.example.net^$script\n||a..net^\n"
+        );
+        assert_eq!(receipt.emitted, 2);
+        assert_eq!(receipt.duplicates, 1);
+        assert_eq!(receipt.unsupported, 3);
+        assert_eq!(rules[0]["action"]["type"], "block");
+        let first = rules[0]["trigger"]["url-filter"].as_str().unwrap();
+        assert!(first.starts_with("^https?://"));
+        assert!(first.contains("ads[.]example[.]net"));
+    }
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    #[test]
+    fn native_source_producer_rejects_regex_and_traversal_syntax() {
+        for host in ["||a..net^", "||-foo.example.org^", "||foo-.example.org^",
+                     "||foo[.]example.org^", "||../../tmp^", "||localhost^"] {
+            assert!(native_host_rule(host).is_none(), "{host}");
+        }
+        assert_eq!(native_host_rule("||CDN.Example.ORG^").as_deref(), Some("cdn.example.org"));
+    }
 
     #[test]
     fn shared_policy_blocks_matching_subresources() {
