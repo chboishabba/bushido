@@ -56,6 +56,12 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 audited ABP hostname subset (partial; dev only)
+
+- `scripts/linux/compile_webkit_subset.py` converts only unconditional `||hostname^` blocks into WebKit content-extension JSON. Exact matching `@@||hostname^` exceptions across lists suppress that hostname. All other ABP rules are skipped and counted.
+- The translator is deterministic, bounded to a documented rule cap, checks malformed hostname syntax, and prints omitted/exception/truncated counts. `run-filter-subset.sh` runs translator self-tests and supplies the generated JSON to the existing native Wry probe before first navigation.
+- **No complete EasyList parity**: advanced exceptions, per-resource options, redirects, cosmetic filters, and all other original adblock-rust semantics remain unsupported. Native WebKit execution and CI acceptance still OPEN.
+
 ## P2.2 native content-filter probe (partial)
 
 - Vendored Wry now reads `BUSHIDO_LINUX_FILTER_JSON` **only in Linux debug builds**, compiles the WebKit content-extension JSON using `UserContentFilterStore::save`, and adds the compiled filter to the webview's `UserContentManager` before the first load. Compilation errors, missing manager and 15-second timeout fail view creation, rather than continuing unfiltered when the explicit test is enabled.

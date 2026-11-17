@@ -99,3 +99,7 @@ Run `python3 scripts/linux/network_fixture.py test` to validate the **harness** 
 4. Test with no filter, invalid JSON, and a rule set allowing everything. These are negative controls: missing allowed resources must not pass, invalid JSON must fail WebView creation, and disabled rules must permit prohibited requests to reach the server.
 5. Verify filter installation before navigation in child tabs, Glance and popup views. Check first-load races, GTK nested-event-loop responsiveness and filter cache permissions.
 6. Re-run with actual third-party hosts, redirects and worker requests; do not treat the fixture as full blocker parity or P2.2 completion.
+
+## P2.2 restricted ABP subset compiler
+
+Run `python3 scripts/linux/compile_webkit_subset.py --test` and inspect the subset counts. Then execute `scripts/linux/run-filter-subset.sh` in an X11/XWayland Linux debug session and observe actual requests from the local server. Ensure exception hosts, unsupported ABP patterns, and truncated rules never receive an unearned "fully protected" status. This dev-only compiler does **not** close network privacy parity.
