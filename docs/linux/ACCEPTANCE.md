@@ -143,3 +143,7 @@ In a Linux debug build with native rule source configured, navigate from an unwh
 ## Pending navigation supersession
 
 Start a navigation from site A to B that requires a filter transition; before compilation finishes navigate to C. Verify B cannot be retried after the newer navigation. Repeat where C already matches the applied filter, and after closing/recreating the tab. Identical URL retries and redirect chains remain separately open.
+
+## P2.2 same-URL and denied navigation ordering
+
+Exercise two rapid identical URL navigations requiring a filter switch, and assert only the second sequence can resume. Attempt a denied scheme or cancelled destination between a pending filter update and its callback: the old request must not reappear. Toggle the site whitelist during compilation and ensure a stale desired mode cannot be retried. Separate network-level tests remain necessary for HTTP redirects and frames.

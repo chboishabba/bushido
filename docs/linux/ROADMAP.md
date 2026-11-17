@@ -56,6 +56,12 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 same-URL and failed-navigation retry hardening
+
+- Every candidate top-level navigation now receives its own monotonically increasing sequence, including repeated clicks on the same URL and URLs subsequently rejected by URL-scheme or policy checks. Only the latest matching **sequence and URL** can retry after filter compilation.
+- A pending retry is also rechecked against the live destination whitelist and adblock preference before navigation. This prevents an asynchronous result from retrying under an obsolete desired mode after a preference change.
+- Added source-level unit regression cases for same-URL repeats, rejected navigation invalidation and tab close/ID reuse. **These tests have not been executed.** Redirect and subframe request boundaries and native GTK acceptance remain open.
+
 ## P2.2 latest-destination retry cancellation
 
 - Track a per-tab pending navigation URL when the initial attempt is denied for native filter transition. On completion, only the current matching destination can be retried; a subsequent user navigation supersedes the old URL, including a navigation requiring no filter change.

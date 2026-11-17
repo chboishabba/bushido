@@ -44,7 +44,10 @@ struct NativeFilterUpdateState {
     adblock: Mutex<HashMap<String, bool>>,
     // Only the most recent destination may be retried after an async
     // filter update; replacing the URL cancels an older pending retry.
-    pending_navigation: Mutex<HashMap<String, String>>,
+    pending_navigation: Mutex<HashMap<String, (u64, String)>>,
+    // Independent sequence: two requests for the same URL must not share
+    // retry authority, even when both need the same filter transition.
+    navigation_counter: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(all(target_os = "linux", debug_assertions))]
@@ -90,17 +93,27 @@ impl NativeFilterUpdateState {
         self.applied.lock().get(id).copied().unwrap_or(false)
     }
 
-    fn reserve_navigation(&self, id: &str, url: &str) {
-        self.pending_navigation.lock().insert(id.to_owned(), url.to_owned());
+    fn begin_navigation(&self, id: &str) -> u64 {
+        // Every candidate navigation invalidates any previously pending
+        // retry, including denied schemes and same-URL requests.
+        let sequence = self.navigation_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        self.pending_navigation.lock().remove(id);
+        sequence
+    }
+
+    fn reserve_navigation(&self, id: &str, sequence: u64, url: &str) {
+        self.pending_navigation.lock().insert(id.to_owned(), (sequence, url.to_owned()));
     }
 
     fn cancel_navigation(&self, id: &str) {
         self.pending_navigation.lock().remove(id);
     }
 
-    fn take_latest_navigation(&self, id: &str, url: &str) -> bool {
+    fn take_latest_navigation(&self, id: &str, sequence: u64, url: &str) -> bool {
         let mut pending = self.pending_navigation.lock();
-        if pending.get(id).is_some_and(|current| current == url) {
+        if pending.get(id).is_some_and(|current|
+            current.0 == sequence && current.1 == url
+        ) {
             pending.remove(id);
             true
         } else {
@@ -139,6 +152,39 @@ mod native_filter_generation_tests {
         assert_ne!(old, new);
         assert!(!updates.current("tab-a", old));
         assert!(updates.current("tab-a", new));
+    }
+
+    #[test]
+    fn repeated_same_url_navigation_only_latest_may_retry() {
+        let state = NativeFilterUpdateState::default();
+        let old = state.begin_navigation("tab-a");
+        state.reserve_navigation("tab-a", old, "https://site.test/");
+        let next = state.begin_navigation("tab-a");
+        state.reserve_navigation("tab-a", next, "https://site.test/");
+        assert!(!state.take_latest_navigation("tab-a", old, "https://site.test/"));
+        assert!(state.take_latest_navigation("tab-a", next, "https://site.test/"));
+        assert!(!state.take_latest_navigation("tab-a", next, "https://site.test/"));
+    }
+
+    #[test]
+    fn denied_navigation_also_cancels_prior_pending_retry() {
+        let state = NativeFilterUpdateState::default();
+        let previous = state.begin_navigation("tab-a");
+        state.reserve_navigation("tab-a", previous, "https://old.test/");
+        state.begin_navigation("tab-a"); // hypothetical rejected scheme
+        assert!(!state.take_latest_navigation("tab-a", previous, "https://old.test/"));
+    }
+
+    #[test]
+    fn closing_tab_revokes_retry_even_if_id_is_reused() {
+        let state = NativeFilterUpdateState::default();
+        let previous = state.begin_navigation("tab-a");
+        state.reserve_navigation("tab-a", previous, "https://old.test/");
+        state.forget("tab-a");
+        let next = state.begin_navigation("tab-a");
+        state.reserve_navigation("tab-a", next, "https://old.test/");
+        assert!(!state.take_latest_navigation("tab-a", previous, "https://old.test/"));
+        assert!(state.take_latest_navigation("tab-a", next, "https://old.test/"));
     }
 
     #[test]
@@ -751,6 +797,14 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
 
     builder = builder.on_navigation(move |url| {
             let url_str = url.to_string();
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            let native_navigation_sequence =
+                if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+                    Some(app_nav.state::<Arc<NativeFilterUpdateState>>()
+                        .begin_navigation(&tab_id_nav))
+                } else {
+                    None
+                };
 
             // block dangerous URL schemes (javascript:, data:, file:, etc.)
             if is_blocked_scheme(&url_str) {
@@ -780,12 +834,14 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 let updates = app_nav.state::<Arc<NativeFilterUpdateState>>().inner().clone();
                 let desired = updates.desired_for(&tab_id_nav, destination_whitelisted);
                 if desired != updates.applied_for(&tab_id_nav) {
-                    updates.reserve_navigation(&tab_id_nav, &url_str);
+                    let sequence = native_navigation_sequence.expect("native sequence enabled");
+                    updates.reserve_navigation(&tab_id_nav, sequence, &url_str);
                     let retry_app = app_nav.clone();
                     let retry_id = tab_id_nav.clone();
                     let retry_url = url.clone();
                     let retry_string = url_str.clone();
                     let retry_state = updates.clone();
+                    let retry_sequence = sequence;
                     // Reject immediately; never approve a request with an
                     // outdated native filter. A failed compile stays denied.
                     tauri::async_runtime::spawn(async move {
@@ -794,7 +850,13 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                                 // A more recent user navigation (including
                                 // one needing no filter switch) supersedes
                                 // this retry. Never restore an old URL.
-                                if retry_state.take_latest_navigation(&retry_id, &retry_string) {
+                                if retry_state.take_latest_navigation(
+                                    &retry_id, retry_sequence, &retry_string
+                                ) && retry_state.desired_for(
+                                    &retry_id,
+                                    retry_app.state::<WhitelistState>().sites.lock()
+                                        .contains(&retry_url.host_str().unwrap_or_default().to_lowercase()),
+                                ) == desired {
                                     if let Some(view) = retry_app.get_webview(&retry_id) {
                                         if let Err(err) = view.navigate(retry_url) {
                                             crash_log::log_error("native-filter-retry",
