@@ -56,6 +56,12 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 Glance native filter initial-state weld
+
+- `open_glance` now takes the frontend's live global adblock preference, computes the Glance **destination** host's whitelist (not the source tab's), and supplies that decision to the same per-WebView native filter builder.
+- Linux debug Glance registers applied-filter and adblock state before its first load, with cleanup on both failed construction and explicit close. The frontend now handles creation failures instead of silently leaving an orphaned overlay.
+- This closes the previous unconditional native-filter bypass in the Glance **initial** creation path at source level. Subsequent Glance navigation, redirects, promotion and global preference changes still require dynamic coordination and native verification. Only experimental source rules are filtered; production ABP parity remains OPEN.
+
 ## P2.2 same-URL and failed-navigation retry hardening
 
 - Every candidate top-level navigation now receives its own monotonically increasing sequence, including repeated clicks on the same URL and URLs subsequently rejected by URL-scheme or policy checks. Only the latest matching **sequence and URL** can retry after filter compilation.

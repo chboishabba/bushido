@@ -896,7 +896,16 @@ export default function App() {
         setGlance(g);
         setTabs(prev => {
           const src = prev.find(t => t.id === e.payload.sourceTabId);
-          invoke("open_glance", { url: e.payload.url, glanceId, sidebarW: layoutOffsetRef.current, topOffset, profileName: src?.workspaceId });
+          invoke("open_glance", {
+            url: e.payload.url, glanceId, sidebarW: layoutOffsetRef.current,
+            topOffset, profileName: src?.workspaceId,
+            adBlocker: settingsRef.current.adBlocker,
+          }).catch(error => {
+            console.warn("[bushido] Glance creation failed", error);
+            useUiStore.getState().showError("Unable to open Glance");
+            glanceRef.current = null;
+            setGlance(null);
+          });
           return prev;
         });
         // hide tab webviews so overlay is visible

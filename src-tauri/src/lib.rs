@@ -2145,7 +2145,7 @@ async fn clear_network_log(app: tauri::AppHandle, tab_id: String) -> Result<(), 
 }
 
 #[tauri::command]
-async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, sidebar_w: f64, top_offset: f64, profile_name: Option<String>) -> Result<(), String> {
+async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, sidebar_w: f64, top_offset: f64, profile_name: Option<String>, ad_blocker: bool) -> Result<(), String> {
     let window = app.get_window("main").ok_or("no main window")?;
     let size = window.inner_size().map_err(|e| e.to_string())?;
     let scale = window.scale_factor().map_err(|e| e.to_string())?;
@@ -2180,11 +2180,23 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
 
     let mut builder = tauri::WebviewBuilder::new(&glance_id, webview_url)
         .with_profile_name(profile_name.clone());
-    // Glance currently lacks a reliable adblock/whitelist setting handoff.
-    // Do not attach the experimental global native filter to this view.
+    // The Glance view inherits the real global adblock preference, but
+    // computes its own destination whitelist instead of inheriting the
+    // source tab's whitelist (which may be a different origin).
     #[cfg(target_os = "linux")]
     {
-        builder = builder.native_content_filter_enabled(false);
+        let destination_host = url::Url::parse(&url).ok()
+            .and_then(|u| u.host_str().map(|host| host.to_lowercase()))
+            .unwrap_or_default();
+        let whitelisted = app.state::<WhitelistState>()
+            .sites.lock().contains(&destination_host);
+        let enabled = ad_blocker && !whitelisted;
+        builder = builder.native_content_filter_enabled(enabled);
+        #[cfg(debug_assertions)]
+        if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+            app.state::<Arc<NativeFilterUpdateState>>()
+                .register(&glance_id, enabled, ad_blocker);
+        }
     }
     // Glance must share only its originating workspace's storage.
     #[cfg(target_os = "linux")]
@@ -2199,11 +2211,18 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
     builder = builder.initialization_script(&vault_s);
     builder = builder.initialization_script(&glance_s);
 
-    let _webview = window.add_child(
+    let _webview = match window.add_child(
         builder,
         tauri::LogicalPosition::new(wv_x, wv_y),
         tauri::LogicalSize::new(wv_w, wv_h),
-    ).map_err(|e| e.to_string())?;
+    ) {
+        Ok(view) => view,
+        Err(e) => {
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            app.state::<Arc<NativeFilterUpdateState>>().forget(&glance_id);
+            return Err(e.to_string());
+        }
+    };
 
     // register as panel so layout_webviews skips it
     let ps = app.state::<PanelState>();
@@ -2214,6 +2233,8 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
 
 #[tauri::command]
 async fn close_glance(app: tauri::AppHandle, glance_id: String) -> Result<(), String> {
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    app.state::<Arc<NativeFilterUpdateState>>().forget(&glance_id);
     // unregister from panels
     let ps = app.state::<PanelState>();
     ps.ids.lock().remove(&glance_id);

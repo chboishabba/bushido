@@ -147,3 +147,7 @@ Start a navigation from site A to B that requires a filter transition; before co
 ## P2.2 same-URL and denied navigation ordering
 
 Exercise two rapid identical URL navigations requiring a filter switch, and assert only the second sequence can resume. Attempt a denied scheme or cancelled destination between a pending filter update and its callback: the old request must not reappear. Toggle the site whitelist during compilation and ensure a stale desired mode cannot be retried. Separate network-level tests remain necessary for HTTP redirects and frames.
+
+## Glance native filtering
+
+Open a Glance view from a whitelisted source tab into an unwhitelisted destination; the Glance filter must follow the destination rather than the source. Repeat with global adblock disabled and an explicitly whitelisted Glance destination. Observe blocked and allowed subresource requests at the fixture server from the **first** page load. Close and recreate Glance with the same ID and ensure no prior native-filter generation is reused. Test failed creation cleanup. Glance cross-site navigation/promotion and dynamic settings remain open pending a dedicated policy callback weld.
