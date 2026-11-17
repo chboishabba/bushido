@@ -665,6 +665,11 @@ export default function App() {
         if (domain) {
           invoke<boolean>("is_whitelisted", { domain }).then(wl => {
             setTabs(prev => prev.map(t => t.id === e.payload.id ? { ...t, whitelisted: wl } : t));
+            // This is post-navigation and cannot protect the initial request;
+            // a pre-network WebKit policy hook is still required.
+            invoke<boolean>("set_tab_native_filter", {
+              id: e.payload.id, adBlocker: settingsRef.current.adBlocker,
+            }).catch(error => console.warn("[bushido] navigation filter update", error));
           });
           const savedZoom = settingsRef.current.zoomHistory?.[domain];
           if (savedZoom && savedZoom !== 1) {

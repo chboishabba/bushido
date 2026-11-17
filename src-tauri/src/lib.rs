@@ -585,8 +585,8 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     // shared state for dynamic AddScriptToExecuteOnDocumentCreated script ID
     let dynamic_script_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    let whitelisted_for_nav = site_whitelisted;
-    let whitelisted_for_load = site_whitelisted;
+    // Consult live whitelist state on each destination and page load.
+    // Creation-time captures become stale after an explicit toggle.
     let nav_https_only = https_only;
     let nav_ad_blocker = ad_blocker;
     let load_ad_blocker = ad_blocker;
@@ -632,8 +632,18 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 return false;
             }
 
+            let destination_whitelisted = url.host_str()
+                .is_some_and(|host|
+                    app_nav.state::<WhitelistState>().sites.lock().contains(&host.to_lowercase()));
+            if destination_whitelisted {
+                let mut pending = pending_for_nav.lock();
+                pending.css.clear();
+                pending.script.clear();
+                pending.exceptions.clear();
+                pending.generichide = false;
+            }
             // adblock-rust engine check for document-level navigations
-            if nav_ad_blocker && !whitelisted_for_nav {
+            if nav_ad_blocker && !destination_whitelisted {
                 let guard = engine_for_nav.read();
                 if blocker::evaluate_request(&guard, &url_str, &url_str, "document")
                     .is_some_and(|decision| decision.blocked)
@@ -709,8 +719,12 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 let _ = wv.eval(&inject_vault);
                 let _ = wv.eval(&inject_glance);
                 let _ = wv.eval(&inject_preload);
+                let active_host_whitelisted = wv.url().ok()
+                    .and_then(|url| url.host_str().map(|host| host.to_lowercase()))
+                    .is_some_and(|host|
+                        app_load.state::<WhitelistState>().sites.lock().contains(&host));
                 // blockers only if enabled and not whitelisted
-                if load_ad_blocker && !whitelisted_for_load {
+                if load_ad_blocker && !active_host_whitelisted {
                     let _ = wv.eval(&inject_cosmetic);
 
                     // inject dynamic cosmetic resources (computed in on_navigation)
@@ -737,7 +751,7 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                         let _ = wv.eval(&inject_cosmetic_observer);
                     }
                 }
-                if load_cookie_reject && !whitelisted_for_load {
+                if load_cookie_reject && !active_host_whitelisted {
                     let _ = wv.eval(&inject_cookie);
                 }
                 if !inject_security.is_empty() {

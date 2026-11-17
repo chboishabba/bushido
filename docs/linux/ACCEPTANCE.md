@@ -119,3 +119,7 @@ Start a Linux debug session with the original-source native filter enabled. Crea
 ## Dynamic native filter update (P2.2)
 
 With a Linux debug WebKitGTK session and explicit native rule source, load a known blocked resource and observe it at the test server. Toggle the current site's whitelist; await the Rust `set_tab_native_filter` acknowledgement before reload and verify the allowed/blocked paths change correspondingly. Force missing filter-store ID and missing content manager; the operation must return `Err` rather than `Ok`. Cover repeated toggles, two tabs with conflicting whitelists, navigation between hosts, and preference changes. The current source implementation only handles explicit whitelist toggles, and other transitions remain OPEN until wired.
+
+## Live whitelist-state and dependency lock acceptance
+
+With live Linux navigation, test whitelist toggles, cross-domain changes, cosmetic scriptlet suppression, and correct native filter decisions before first subresource. The new URL-event handler is post-navigation and is **not** a pre-network privacy guarantee. Check the locked Rust dependency graph for direct WebKitGTK compatibility. None of these acceptance gates is closed by source inspection alone.

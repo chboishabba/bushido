@@ -56,6 +56,13 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 live whitelist state and locked WebKit dependency
+
+- Included the Linux direct `webkit2gtk` dependency in the root application's Cargo.lock package entry.
+- Rust navigation checks current destination whitelist rather than the creation-time boolean, and clears pending cosmetic data when navigating to an exempt site; page-load injection also consults the live hostname.
+- React now requests a best-effort native filter change on each tab URL event. This event can occur **after network requests begin**, so the first-request leakage race is OPEN.
+- Existing Windows COM subresource interceptors and initial tab-wide adblock configuration still capture creation-time decisions; full parity is OPEN.
+
 ## P2.2 native filter updates on existing tabs (source implemented)
 
 - Added `set_tab_native_filter(id, ad_blocker)` to compute the actual site whitelist from Bushido's Rust state and dispatch an update into the live WebKitGTK `UserContentManager`.
