@@ -56,6 +56,11 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 server-observed network acceptance fixture
+
+- `scripts/linux/network_fixture.py` provides a stdlib-only local HTTP server with allowed and prohibited resource paths (script, image, fetch, iframe, worker, redirect). It records **what reached the server**, and `/__assert` rejects both observed forbidden resources and missing allowed controls.
+- A Python harness self-test was added. **Neither a live WebKitGTK run nor network interception is demonstrated**; P2.2 remains OPEN. The fixture is an observable acceptance boundary for the upcoming native content-filter adapter.
+
 ## P3.2 persistence and keyring failure hardening
 
 - Encrypted Linux identity writes now use a randomly named, owner-only (0600) temporary file, `sync_all`, then atomic rename. Existing keys.dat is not truncated if the write fails.
