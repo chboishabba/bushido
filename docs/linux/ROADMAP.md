@@ -56,6 +56,12 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 exception-overlap safety correction
+
+- An original `||host^` native rule matches host descendants, so an exact-only `@@||host^` exception matcher could overblock a narrower exempted hostname. The producer now suppresses overlapping parent/child blocks for host-scoped exceptions, including option-bearing exceptions.
+- Unknown/unscoped `@@` expressions force complete conversion refusal rather than potentially overriding allow rules. This can make the development subset unusable with some real lists; source-level safety is prioritised over inflated coverage.
+- Added tests for parent/child overlaps, option-bearing exceptions and unscoped refusal. **No Python test execution or WebKitGTK native proof yet.**
+
 ## P0 CI coverage extension
 
 - The frontend CI job and local Linux preflight now run both stdlib Python harness self-tests: network request fixture and ABP subset translator. CI remains **not accepted** until a completed green run is attached to a head SHA.

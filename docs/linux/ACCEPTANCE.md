@@ -103,3 +103,7 @@ Run `python3 scripts/linux/network_fixture.py test` to validate the **harness** 
 ## P2.2 restricted ABP subset compiler
 
 Run `python3 scripts/linux/compile_webkit_subset.py --test` and inspect the subset counts. Then execute `scripts/linux/run-filter-subset.sh` in an X11/XWayland Linux debug session and observe actual requests from the local server. Ensure exception hosts, unsupported ABP patterns, and truncated rules never receive an unearned "fully protected" status. This dev-only compiler does **not** close network privacy parity.
+
+## P2.2 exception-overlap safety regression
+
+Test `||example.net^` with `@@||login.example.net^$script`: the unconditional native parent block must be omitted because it cannot represent the exception. Test the opposite parent/child direction and unrelated host exceptions. An unscoped `@@/regex/` must refuse the entire conversion. This safety restriction may prevent generation on existing full lists; treat it as an explicit OPEN coverage gate, not a parity solution.
