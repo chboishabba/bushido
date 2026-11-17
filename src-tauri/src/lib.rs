@@ -2508,6 +2508,12 @@ async fn set_tab_native_filter(
 
     #[cfg(all(target_os = "linux", debug_assertions))]
     {
+        // This capability is a developer opt-in, not enabled in ordinary
+        // Linux sessions. Returning false is truthful and avoids spurious
+        // "filter update failed" messages on normal page navigation.
+        if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_none() {
+            return Ok(false);
+        }
         return change_linux_webview_filter(&app, &id, enabled).await;
     }
     #[cfg(not(all(target_os = "linux", debug_assertions)))]

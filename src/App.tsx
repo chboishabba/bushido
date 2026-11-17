@@ -204,6 +204,9 @@ export default function App() {
   const bookmarksLoaded = useRef(false);
   const bookmarkBulkRef = useRef(false);
   const prevSettingsRef = useRef<BushidoSettings | null>(null);
+  // Separate from CRDT settings sync: only track the previous native-filter
+  // preference after persisted settings have been loaded.
+  const lastNativeAdblockRef = useRef<boolean | null>(null);
   const closedTabsRef = useRef<{url: string; title: string; workspaceId: string}[]>([]);
   const tabThumbnails = useRef<Map<string, string>>(new Map());
   const zoomRef = useRef<Record<string, number>>({});
@@ -595,6 +598,30 @@ export default function App() {
     }
     prevSettingsRef.current = { ...settings };
   }, [settings]);
+
+  // Apply global adblock preference changes to already-open WebKitGTK tabs.
+  // The backend returns true only when native filters were actually applied;
+  // other platforms / non-opted-in debug sessions return false, not success.
+  useEffect(() => {
+    if (!settingsLoaded.current) return;
+    const previous = lastNativeAdblockRef.current;
+    lastNativeAdblockRef.current = settings.adBlocker;
+    if (previous === null || previous === settings.adBlocker) return;
+
+    const openTabs = tabs.filter(t =>
+      !t.url.startsWith("bushido://") && !t.suspended && t.memoryState !== "destroyed"
+    );
+    for (const tab of openTabs) {
+      invoke<boolean>("set_tab_native_filter", {
+        id: tab.id, adBlocker: settings.adBlocker,
+      }).then(applied => {
+        if (applied) return invoke("reload_tab", { id: tab.id });
+      }).catch(error => {
+        console.warn("[bushido] global native filter change failed", tab.id, error);
+        useUiStore.getState().showError("Unable to update native content filter");
+      });
+    }
+  }, [settings.adBlocker]);
 
   // fetch paired devices for sidebar send-tab feature
   useEffect(() => {

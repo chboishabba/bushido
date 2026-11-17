@@ -127,3 +127,7 @@ With live Linux navigation, test whitelist toggles, cross-domain changes, cosmet
 ## First-enable filter test
 
 Create a fresh Linux profile with no compiled content-filter store and with adblocking disabled. Turn filtering on after first page load, verify source compilation, acknowledgement, and a blocked request never reaching the server on subsequent reload. Invalid source must fail without removing previously installed filters. Repeat rapid toggles to detect out-of-order async completion; ordering is not yet guaranteed.
+
+## Global adblock toggles on existing WebViews
+
+After loading persisted settings, change `adBlocker` from on to off and back with multiple live Linux WebViews and different site whitelists. Each view should acknowledge the changed native filter state before a reload; verify server-observed requests and absence of rule-source errors when the probe is deliberately disabled. Repeat rapid toggles to detect out-of-order saves. The implementation remains debug-only and does not establish Windows or original Rust adblock parity.

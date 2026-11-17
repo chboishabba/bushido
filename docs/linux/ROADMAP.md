@@ -56,6 +56,13 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 global adblock preference updates (source implementation)
+
+- React now notices actual `settings.adBlocker` transitions after saved settings are loaded and requests `set_tab_native_filter` for existing live non-internal tabs. It reloads only after the backend confirms a native filter was applied, and surfaces errors.
+- In ordinary Linux sessions without developer rule source, the backend returns `false` (not a claimed successful native operation); this avoids routine navigation errors when the experimental probe is disabled.
+- The Windows WebView2 interception policy and existing Rust creation-time adblock capture still need a separate shared live-preference model; this change is specifically for the Linux native subset.
+- Multiple rapid preference changes can race; no native acceptance evidence yet.
+
 ## P2.2 first-enable native filter compilation fix
 
 - Existing tabs that started with adblocking disabled might never have written WebKit's compiled filter store entry. The live command now reads the configured rule JSON and compiles/saves it before applying, preserving the currently installed filter if compilation fails.
