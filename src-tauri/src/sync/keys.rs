@@ -299,8 +299,8 @@ fn linux_keyring_key(create: bool) -> Result<zeroize::Zeroizing<[u8; 32]>, Strin
         return Err("Linux Secret Service wrapping key is missing; refusing decryption".into());
     }
     let mut candidate = zeroize::Zeroizing::new([0_u8; 32]);
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, candidate.as_mut());
-    let value = zeroize::Zeroizing::new(hex_encode(candidate.as_ref()));
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut candidate[..]);
+    let value = zeroize::Zeroizing::new(hex_encode(&candidate[..]));
     let mut child = Command::new("secret-tool")
         .args(["store", "--label=Bushido local encryption key",
                "application", "bushido-browser", "purpose", "linux-wrap-v1"])
