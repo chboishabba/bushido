@@ -20,10 +20,10 @@ node --version
 npm --version
 pkg-config --modversion gtk+-3.0 webkit2gtk-4.1 libsoup-3.0
 
-cargo check --manifest-path src-tauri/Cargo.toml --locked
-cargo test --manifest-path src-tauri/Cargo.toml --locked
 npm ci
 npm run build
 npm test
+cargo check --manifest-path src-tauri/Cargo.toml --locked
+cargo test --manifest-path src-tauri/Cargo.toml --locked
 
 echo "P0 compile/tests passed (does not prove native GUI or privacy parity)."

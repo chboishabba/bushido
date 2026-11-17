@@ -48,6 +48,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      # Tauri's compile-time context can embed frontendDist; do not
+      # assume that the separately-running frontend job creates it.
+      - name: Prepare frontend assets for Tauri macros
+        run: |
+          npm ci
+          npm run build
       - name: Capture Linux build environment
         run: |
           uname -a
