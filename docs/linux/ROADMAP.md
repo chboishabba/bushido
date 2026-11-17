@@ -56,6 +56,11 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 live cosmetic page-load preference
+
+- The ordinary tab's `on_page_load` path now checks the same current Linux native-debug adblock preference before applying cosmetic resources. Previously, a tab created with adblock on would inject cosmetic hiding after native filtering was turned off, and vice versa.
+- The static initialization scripts attached at WebView creation, in-page observers and Windows-specific content injection are not all removable dynamically; full preference equivalence remains OPEN. The change only affects this Rust page-load decision.
+
 ## P2.2 global preference consistency for Glance and tab navigation
 
 - The frontend's live `adBlocker` transition now updates the visible Glance WebView in addition to ordinary tabs; it awaits a native update acknowledgement before reloading each view.

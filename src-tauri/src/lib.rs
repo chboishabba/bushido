@@ -971,6 +971,16 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                     .and_then(|url| url.host_str().map(|host| host.to_lowercase()))
                     .is_some_and(|host|
                         app_load.state::<WhitelistState>().sites.lock().contains(&host));
+                // The native Linux debug policy and the content-filter
+                // toggle share the same current adblock state. Avoid the
+                // stale creation-time flag for subsequent page loads.
+                #[cfg(all(target_os = "linux", debug_assertions))]
+                let load_ad_blocker = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+                    app_load.state::<Arc<NativeFilterUpdateState>>()
+                        .preference_for(&tab_id_load)
+                } else {
+                    load_ad_blocker
+                };
                 // blockers only if enabled and not whitelisted
                 if load_ad_blocker && !active_host_whitelisted {
                     let _ = wv.eval(&inject_cosmetic);

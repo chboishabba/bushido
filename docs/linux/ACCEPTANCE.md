@@ -163,3 +163,7 @@ With `fixture-filter-webkit.json` installed before first navigation, load the fi
 ## Glance global preference and document-policy consistency
 
 With Glance open, change global adblock on→off→on and verify both the native WebKit filter and original Rust document policy follow the changed value. Compare ordinary tabs and Glance on the same destination; neither should retain creation-time document policy. Confirm the fallback without experimental rules does not pretend that native filtering was updated. On-page-load cosmetic/scriptlet capture is a separate OPEN parity gate.
+
+## Cosmetic load policy toggle
+
+Create a tab with adblock initially on, change it off, reload, then toggle on again; the page-load cosmetic injection should consult the current native debug preference rather than a captured initial boolean. Repeat with initial adblock off. Inspect pre-registered document-start initialization scripts separately; this source change does not remove those scripts and cannot be marked complete cosmetic parity.
