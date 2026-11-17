@@ -546,7 +546,6 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     let source_for_nav = current_source_url.clone();
 
     let mut builder = WebviewBuilder::new(&id, webview_url)
-        .auto_resize()
         .with_profile_name(profile_name);
 
     if is_panel {
@@ -1945,6 +1944,12 @@ async fn clear_workspace_data(app: tauri::AppHandle, tab_id: String) -> Result<(
             }
         });
     }
+    #[cfg(not(windows))]
+    {
+        let _ = wv;
+        return Err("Workspace data clearing is not implemented on Linux; data was not erased".into());
+    }
+    #[cfg(windows)]
     Ok(())
 }
 
@@ -2102,6 +2107,9 @@ async fn zoom_tab(app: tauri::AppHandle, id: String, factor: f64) -> Result<(), 
             unsafe { let _ = wv.controller().SetZoomFactor(factor); }
         });
     }
+    #[cfg(not(windows))]
+    return Err("Per-tab native zoom is not implemented on Linux".into());
+    #[cfg(windows)]
     Ok(())
 }
 
@@ -2396,6 +2404,12 @@ async fn respond_permission(app: tauri::AppHandle, request_id: String, allow: bo
         }
     }
 
+    #[cfg(not(windows))]
+    {
+        let _ = (app, request_id, allow, remember);
+        return Err("Permission-response backend is not implemented on Linux".into());
+    }
+    #[cfg(windows)]
     Ok(())
 }
 

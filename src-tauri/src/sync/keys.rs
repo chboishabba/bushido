@@ -221,11 +221,22 @@ pub(crate) fn dpapi_decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn dpapi_encrypt(plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    Ok(plaintext.to_vec())
+pub(crate) fn dpapi_encrypt(_plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    Err("Secure identity storage is unavailable: a Linux keyring backend is required".into())
 }
 
 #[cfg(not(windows))]
-pub(crate) fn dpapi_decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
-    Ok(encrypted.to_vec())
+pub(crate) fn dpapi_decrypt(_encrypted: &[u8]) -> Result<Vec<u8>, String> {
+    Err("Secure identity storage is unavailable: a Linux keyring backend is required".into())
+}
+
+#[cfg(all(test, not(windows)))]
+mod platform_key_storage_tests {
+    use super::*;
+
+    #[test]
+    fn nonwindows_key_storage_must_never_store_plaintext() {
+        assert!(dpapi_encrypt(b"secret").is_err());
+        assert!(dpapi_decrypt(b"secret").is_err());
+    }
 }

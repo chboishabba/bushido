@@ -6,6 +6,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::crash_log;
 
 /// Capture visible viewport as base64 PNG via CapturePreview → IStream
+#[cfg(windows)]
 #[tauri::command]
 pub async fn capture_visible(app: tauri::AppHandle, id: String) -> Result<String, String> {
     use tauri::Manager;
@@ -186,6 +187,7 @@ fn cdp_call(
 }
 
 /// Capture a specific area using CDP Page.captureScreenshot with clip
+#[cfg(windows)]
 #[tauri::command]
 pub async fn capture_area(app: tauri::AppHandle, id: String, x: f64, y: f64, w: f64, h: f64, scale: f64) -> Result<String, String> {
     use tauri::Manager;
@@ -222,6 +224,7 @@ pub async fn capture_area(app: tauri::AppHandle, id: String, x: f64, y: f64, w: 
 }
 
 /// Capture full page (beyond viewport) using CDP
+#[cfg(windows)]
 #[tauri::command]
 pub async fn capture_fullpage(app: tauri::AppHandle, id: String) -> Result<String, String> {
     use tauri::Manager;
@@ -427,4 +430,22 @@ pub async fn generate_qr_code(url: String) -> Result<String, String> {
     ).map_err(|e| format!("PNG encode: {}", e))?;
 
     Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn capture_visible(_app: tauri::AppHandle, _id: String) -> Result<String, String> {
+    Err("Screenshot capture is not yet implemented on Linux".into())
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn capture_area(_app: tauri::AppHandle, _id: String, _x: f64, _y: f64, _w: f64, _h: f64, _scale: f64) -> Result<String, String> {
+    Err("Area screenshot capture is not yet implemented on Linux".into())
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn capture_fullpage(_app: tauri::AppHandle, _id: String) -> Result<String, String> {
+    Err("Full-page screenshot capture is not yet implemented on Linux".into())
 }
