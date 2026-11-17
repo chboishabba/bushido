@@ -56,6 +56,11 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 document-start source cleanup
+
+- Removed the obsolete page-load `inject_cosmetic` clone after moving WebRTC hardening to the unconditional document-start registration; kept the original privacy script source as the single installed producer.
+- The cosmetic observer remains deliberately conditional at page load. This source cleanup does not prove first-frame timing or Linux IPC.
+
 ## P2.2 document-start privacy/cosmetic separation
 
 - `content_blocker.js` implements WebRTC ICE/STUN/TURN hardening, not cosmetic ad blocking. It is now registered as an always-on WebView initialization script, independent of cosmetic whitelist and adblock setting.

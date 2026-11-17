@@ -726,7 +726,6 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     let app_title = app.clone();
     let app_load = app.clone();
     let engine_for_nav = engine.clone();
-    let inject_cosmetic = cosmetic_script.clone();
     let inject_cosmetic_observer = cosmetic_observer_script.clone();
     let inject_cookie = cookie_script.clone();
     let inject_shortcut = shortcut_script.clone();
@@ -856,7 +855,7 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
             let destination_whitelisted = url.host_str()
                 .is_some_and(|host|
                     app_nav.state::<WhitelistState>().sites.lock().contains(&host.to_lowercase()));
-             // Native Linux policy must be in place BEFORE WebKitGTK is
+            // Native Linux policy must be in place BEFORE WebKitGTK is
             // allowed to start the destination request. A filter update is
             // asynchronous: deny this attempt, update, then retry.
             #[cfg(all(target_os = "linux", debug_assertions))]
