@@ -3161,9 +3161,6 @@ pub fn run() {
         .manage(WebviewState {
             tabs: Mutex::new(HashMap::new()),
         })
-        // Source-level ordering guard for async WebKitGTK native rule updates.
-        #[cfg(all(target_os = "linux", debug_assertions))]
-        .manage(Arc::new(NativeFilterUpdateState::default()))
         .manage(PanelState {
             ids: Mutex::new(HashSet::new()),
         })
@@ -3216,6 +3213,10 @@ pub fn run() {
             .build()
         )
         .setup(move |app| {
+            // Register the per-tab ordering guard before any browser views
+            // are created. Avoid cfg attributes inside a builder method chain.
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            app.manage(Arc::new(NativeFilterUpdateState::default()));
             app.manage(DnsPort(dns_port));
 
             #[cfg(windows)]
