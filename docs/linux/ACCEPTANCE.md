@@ -123,3 +123,7 @@ With a Linux debug WebKitGTK session and explicit native rule source, load a kno
 ## Live whitelist-state and dependency lock acceptance
 
 With live Linux navigation, test whitelist toggles, cross-domain changes, cosmetic scriptlet suppression, and correct native filter decisions before first subresource. The new URL-event handler is post-navigation and is **not** a pre-network privacy guarantee. Check the locked Rust dependency graph for direct WebKitGTK compatibility. None of these acceptance gates is closed by source inspection alone.
+
+## First-enable filter test
+
+Create a fresh Linux profile with no compiled content-filter store and with adblocking disabled. Turn filtering on after first page load, verify source compilation, acknowledgement, and a blocked request never reaching the server on subsequent reload. Invalid source must fail without removing previously installed filters. Repeat rapid toggles to detect out-of-order async completion; ordering is not yet guaranteed.

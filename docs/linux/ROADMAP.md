@@ -56,6 +56,11 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 first-enable native filter compilation fix
+
+- Existing tabs that started with adblocking disabled might never have written WebKit's compiled filter store entry. The live command now reads the configured rule JSON and compiles/saves it before applying, preserving the currently installed filter if compilation fails.
+- This reuses WebKitGTK's content-filter store; redundant saves on repeated toggles and concurrent completion ordering remain open performance/correctness issues. No native run yet.
+
 ## P2.2 live whitelist state and locked WebKit dependency
 
 - Included the Linux direct `webkit2gtk` dependency in the root application's Cargo.lock package entry.

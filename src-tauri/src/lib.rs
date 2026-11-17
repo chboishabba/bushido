@@ -2440,11 +2440,18 @@ async fn change_linux_webview_filter(
     use webkit2gtk::{UserContentFilterStore, UserContentFilterStoreExt, UserContentManagerExt, WebViewExt};
     let view = app.get_webview(id).ok_or_else(|| format!("Unknown WebView: {id}"))?;
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<bool, String>>();
-    let rule_path = std::env::var_os("BUSHIDO_LINUX_FILTER_JSON");
-    // Check required source before touching an already-installed filter.
-    if enabled && rule_path.is_none() {
-        return Err("No experimental native content-filter rules configured".into());
-    }
+    let rule_bytes = if enabled {
+        let rule_path = std::env::var_os("BUSHIDO_LINUX_FILTER_JSON")
+            .ok_or("No experimental native content-filter rules configured")?;
+        let bytes = std::fs::read(rule_path)
+            .map_err(|e| format!("Cannot read configured native filter: {e}"))?;
+        if bytes.is_empty() {
+            return Err("Empty native filter rule set".into());
+        }
+        Some(bytes)
+    } else {
+        None
+    };
     view.with_webview(move |view| {
         let Some(manager) = view.inner().user_content_manager() else {
             let _ = tx.send(Err("Missing native WebKitGTK content manager".into()));
@@ -2462,9 +2469,11 @@ async fn change_linux_webview_filter(
             return;
         };
         let store = UserContentFilterStore::new(&cache.to_string_lossy());
-        // The initial native Wry path has already compiled/saved this ID.
-        // A failure to load MUST leave the old filter unchanged.
-        store.load("bushido-development-probe",
+        // Compile on first enable as well: an initially unfiltered tab may
+        // be the first WebView to require this rule set. Never assume that
+        // the Wry initial-create hook has already saved it.
+        let bytes = webkit2gtk::glib::Bytes::from_owned(rule_bytes.unwrap_or_default());
+        store.save("bushido-development-probe", &bytes,
                    None::<&webkit2gtk::gio::Cancellable>,
                    move |result| {
             match result {
@@ -2474,7 +2483,7 @@ async fn change_linux_webview_filter(
                     let _ = tx.send(Ok(true));
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(format!("Native filter load failed: {e}")));
+                    let _ = tx.send(Err(format!("Native filter compilation failed: {e}")));
                 }
             }
         });
