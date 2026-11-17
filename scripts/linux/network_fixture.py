@@ -21,18 +21,26 @@ BLOCKED = frozenset({
     "/blocked-frame",
     "/blocked-worker.js",
     "/blocked-redirect",
+    "/blocked-redirect-destination",
+    "/blocked-nested-script.js",
+    "/blocked-worker-import.js",
 })
-REQUIRED_ALLOWED = frozenset({"/", "/allowed.js", "/allowed-pixel"})
+REQUIRED_ALLOWED = frozenset({"/", "/allowed.js", "/allowed-pixel",
+                              "/allowed-nested-frame", "/allowed-worker.js",
+                              "/allowed-redirect-to-blocked"})
 PAGE = """<!doctype html><meta charset="utf-8">
 <title>Bushido WebKitGTK network gate fixture</title>
 <script src="/allowed.js"></script>
 <script src="/blocked.js"></script>
 <img src="/allowed-pixel"><img src="/blocked-pixel">
 <iframe src="/blocked-frame"></iframe>
+<iframe src="/allowed-nested-frame"></iframe>
 <script>
 fetch('/blocked-fetch').catch(() => {});
 try { new Worker('/blocked-worker.js'); } catch (_) {}
+try { new Worker('/allowed-worker.js'); } catch (_) {}
 fetch('/blocked-redirect').catch(() => {});
+fetch('/allowed-redirect-to-blocked').catch(() => {});
 </script>
 <p>Check /__assert on the fixture server; UI counters do not establish blocking.</p>
 """
@@ -86,17 +94,24 @@ class Handler(BaseHTTPRequestHandler):
         self.server.record(path)
         if path == "/":
             return self.reply(200, PAGE, "text/html; charset=utf-8")
-        if path == "/blocked-redirect":
+        if path in ("/blocked-redirect", "/allowed-redirect-to-blocked"):
             self.send_response(302)
             self.send_header("Location", "/blocked-redirect-destination")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
+        if path == "/allowed-worker.js":
+            return self.reply(200, "importScripts('/blocked-worker-import.js');\n",
+                              "text/javascript")
         if path.endswith(".js"):
             return self.reply(200, "window.__bushido_fixture = true;\n",
                               "text/javascript")
         if path == "/blocked-frame":
             return self.reply(200, "<html><body>blocked iframe</body></html>",
+                              "text/html")
+        if path == "/allowed-nested-frame":
+            return self.reply(200,
+                              "<html><body>allowed frame<script src='/blocked-nested-script.js'></script></body></html>",
                               "text/html")
         if path.endswith("pixel"):
             return self.reply(200, b"\x89PNG\r\n\x1a\n", "image/png")
@@ -137,6 +152,32 @@ class FixtureTests(unittest.TestCase):
         data = json.loads(err.exception.read())
         self.assertIn("/blocked.js", data["blocked_reached_server"])
         self.assertFalse(data["missing_allowed"])
+    def test_redirect_destination_is_observable(self):
+        from urllib.error import HTTPError
+        self.read("/__reset")
+        for path in REQUIRED_ALLOWED - {"/allowed-redirect-to-blocked"}:
+            self.read(path)
+        self.read("/allowed-redirect-to-blocked")
+        with self.assertRaises(HTTPError) as err:
+            self.read("/__assert")
+        details = json.loads(err.exception.read())
+        self.assertIn("/blocked-redirect-destination", details["blocked_reached_server"])
+
+    def test_nested_worker_and_frame_leaks_are_observable(self):
+        from urllib.error import HTTPError
+        self.read("/__reset")
+        for path in REQUIRED_ALLOWED - {"/allowed-redirect-to-blocked"}:
+            self.read(path)
+        # Stub the allowed redirect as recorded without following it.
+        self.server.record("/allowed-redirect-to-blocked")
+        self.read("/blocked-nested-script.js")
+        self.read("/blocked-worker-import.js")
+        with self.assertRaises(HTTPError) as err:
+            self.read("/__assert")
+        data = json.loads(err.exception.read())
+        self.assertIn("/blocked-nested-script.js", data["blocked_reached_server"])
+        self.assertIn("/blocked-worker-import.js", data["blocked_reached_server"])
+
     def test_fixture_accepts_allowed_only(self):
         self.read("/__reset")
         for path in sorted(REQUIRED_ALLOWED):

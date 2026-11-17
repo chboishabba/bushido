@@ -155,3 +155,7 @@ Open a Glance view from a whitelisted source tab into an unwhitelisted destinati
 ## Glance cross-origin navigation
 
 Create Glance on an unwhitelisted origin, follow a link to a whitelisted destination and back, and observe the original requests at the server. The navigation attempt must not pass with the old applied native filter. The second navigation must not revive a superseded first attempt. Confirm `tab-url-changed` updates the Glance URL without adding an ordinary tab history entry unexpectedly. Inspect actual HTTP redirects and frames separately; source-level callbacks are not proof of a network-wide barrier.
+
+## Redirect, iframe and worker network acceptance
+
+With `fixture-filter-webkit.json` installed before first navigation, load the fixture. An *allowed* `/allowed-redirect-to-blocked` must reach the HTTP server, but its `/blocked-redirect-destination` target must not. An allowed `/allowed-nested-frame` must reach the server but `/blocked-nested-script.js` must not. An allowed `/allowed-worker.js` must arrive but `/blocked-worker-import.js` must not. Check `/__assert` and negative-control runs without filtering; a green Python self-test alone is not proof of WebKitGTK enforcement.
