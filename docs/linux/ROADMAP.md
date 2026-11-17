@@ -56,6 +56,12 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 normal-tab WebView construction rollback
+
+- `create_tab` now cleans up its pre-registered Linux native filter state when Tauri's `window.add_child` fails, matching the earlier Glance cleanup path.
+- Added pure Rust tests for live-preference vs applied-state separation and failed constructor rollback/tab-ID reuse. This prevents a later creation from inheriting a failed WebView's native filter intent.
+- Only source inspected; native compilation and real WebKitGTK error paths are not yet verified.
+
 ## P2.2 live cosmetic page-load preference
 
 - The ordinary tab's `on_page_load` path now checks the same current Linux native-debug adblock preference before applying cosmetic resources. Previously, a tab created with adblock on would inject cosmetic hiding after native filtering was turned off, and vice versa.

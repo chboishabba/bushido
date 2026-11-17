@@ -140,6 +140,36 @@ mod native_filter_generation_tests {
     use super::*;
 
     #[test]
+    fn preference_and_applied_state_are_separate() {
+        let state = NativeFilterUpdateState::default();
+        state.register("tab", true, true);
+        assert!(state.preference_for("tab"));
+        assert!(state.applied_for("tab"));
+        assert!(!state.desired_for("tab", true)); // whitelisted host
+        state.set_preference("tab", false);
+        assert!(!state.preference_for("tab"));
+        assert!(!state.desired_for("tab", false));
+        assert!(state.applied_for("tab")); // asynchronous removal pending
+        let ticket = state.issue("tab");
+        state.mark_applied("tab", ticket, false);
+        assert!(!state.applied_for("tab"));
+    }
+
+    #[test]
+    fn failed_constructor_cleanup_prevents_reusing_stale_state() {
+        let state = NativeFilterUpdateState::default();
+        state.register("tab", true, true);
+        let ticket = state.issue("tab");
+        state.forget("tab"); // failed WebView creation
+        assert!(!state.current("tab", ticket));
+        assert!(!state.preference_for("tab"));
+        assert!(!state.applied_for("tab"));
+        state.register("tab", false, false);
+        assert!(!state.preference_for("tab"));
+        assert!(!state.desired_for("tab", false));
+    }
+
+    #[test]
     fn older_completion_cannot_restore_filter() {
         let updates = NativeFilterUpdateState::default();
         let old = updates.issue("tab-a");
@@ -1040,11 +1070,20 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
         builder = builder.initialization_script(&security_js);
     }
 
-    let webview = window.add_child(
+    let webview = match window.add_child(
         builder,
         tauri::LogicalPosition::new(sidebar_w, top_offset),
         tauri::LogicalSize::new(content_w, content_h),
-    ).map_err(|e| e.to_string())?;
+    ) {
+        Ok(webview) => webview,
+        Err(e) => {
+            // Filter state was registered before first navigation. Remove it
+            // on a failed constructor, just as the Glance path already does.
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            app.state::<Arc<NativeFilterUpdateState>>().forget(&id);
+            return Err(e.to_string());
+        }
+    };
 
     let state = app.state::<WebviewState>();
     state.tabs.lock().insert(tab_id_track, true);

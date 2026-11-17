@@ -167,3 +167,7 @@ With Glance open, change global adblock on→off→on and verify both the native
 ## Cosmetic load policy toggle
 
 Create a tab with adblock initially on, change it off, reload, then toggle on again; the page-load cosmetic injection should consult the current native debug preference rather than a captured initial boolean. Repeat with initial adblock off. Inspect pre-registered document-start initialization scripts separately; this source change does not remove those scripts and cannot be marked complete cosmetic parity.
+
+## Native filter registration rollback
+
+Force a Linux `add_child` failure after native state registration and confirm the per-tab preference, applied mode and generation ticket are cleared. Reuse the same ID to create an unfiltered tab and check that no stale state or callback takes effect. Run the associated pure Rust tests and exercise both normal tab and Glance constructor errors before considering this accepted.
