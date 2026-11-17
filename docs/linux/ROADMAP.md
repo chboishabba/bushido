@@ -56,6 +56,13 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 pre-navigation deny/update/retry (source implementation)
+
+- Linux debug tabs with a configured native filter source now keep an **applied filter state** separate from both outstanding compilation tickets and the latest adblock preference.
+- In the existing Rust document-navigation callback, destination whitelist state is inspected **before approval**. If it requires a different native filter, the callback denies that navigation, schedules the acknowledged native filter change and retries only on success. Compilation failure leaves the original request denied.
+- Native update callbacks record applied state only for their current ticket. Tab close clears preference and applied state.
+- This is a bounded **top-level navigation** interception strategy, not a fully verified WebKitGTK pre-network barrier: callback ordering, racing redirects, concurrent pending retries, frame navigations and first-created filter-store state remain unverified. Actual Linux server-observed testing is required before P2.2 acceptance.
+
 ## P2.2 asynchronous native-filter update ordering (source implementation)
 
 - New `NativeFilterUpdateState` issues globally monotone, per-tab latest tickets. The WebKitGTK save callback checks the ticket **before modifying** native filters; superseded callbacks return explicit errors and cannot re-enable a stale rule set.

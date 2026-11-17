@@ -135,3 +135,7 @@ After loading persisted settings, change `adBlocker` from on to off and back wit
 ## P2.2 stale asynchronous completion rejection
 
 With a real Linux debug WebKitGTK instance, induce two native filter updates for the same tab and force the first compilation callback to finish last; it must not alter the newer state. Closing a tab must invalidate pending callbacks, even when the same ID is reused. Test enable→disable and disable→enable, including a 15-second failure path. A successful disabled update must be acknowledged and trigger the existing reload. The generation-state unit tests exercise ordering logic but **do not** prove a GTK runtime race has been eliminated.
+
+## P2.2 pre-navigation deny-and-retry
+
+In a Linux debug build with native rule source configured, navigate from an unwhitelisted origin to a whitelisted destination and back. Instrument the WebKit navigation policy callback and local server: the initial request must be denied when the desired and applied filter modes differ, and only a successfully acknowledged native update may retry it. Force filter compilation failure: the original request must not appear server-side. Check redirect chains, repeated clicks, frames and simultaneous navigations for out-of-order retries or leaked initial requests. **No runtime acceptance yet.**

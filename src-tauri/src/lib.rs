@@ -38,6 +38,10 @@ struct PanelState {
 struct NativeFilterUpdateState {
     counter: std::sync::atomic::AtomicU64,
     latest: Mutex<HashMap<String, u64>>,
+    // Applied state, distinct from the requested/compiling filter state.
+    applied: Mutex<HashMap<String, bool>>,
+    // Current user preference, independent of tab creation-time captures.
+    adblock: Mutex<HashMap<String, bool>>,
 }
 
 #[cfg(all(target_os = "linux", debug_assertions))]
@@ -61,6 +65,31 @@ impl NativeFilterUpdateState {
 
     fn forget(&self, id: &str) {
         self.latest.lock().remove(id);
+        self.applied.lock().remove(id);
+        self.adblock.lock().remove(id);
+    }
+
+    fn register(&self, id: &str, enabled: bool, adblock: bool) {
+        self.applied.lock().insert(id.to_owned(), enabled);
+        self.adblock.lock().insert(id.to_owned(), adblock);
+    }
+
+    fn set_preference(&self, id: &str, adblock: bool) {
+        self.adblock.lock().insert(id.to_owned(), adblock);
+    }
+
+    fn desired_for(&self, id: &str, whitelisted: bool) -> bool {
+        self.adblock.lock().get(id).copied().unwrap_or(false) && !whitelisted
+    }
+
+    fn applied_for(&self, id: &str) -> bool {
+        self.applied.lock().get(id).copied().unwrap_or(false)
+    }
+
+    fn mark_applied(&self, id: &str, ticket: u64, enabled: bool) {
+        if self.current(id, ticket) {
+            self.applied.lock().insert(id.to_owned(), enabled);
+        }
     }
 }
 
@@ -675,6 +704,14 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     {
         builder = builder.native_content_filter_enabled(ad_blocker && !site_whitelisted);
     }
+    // Register the initially installed native filter and the current
+    // adblock preference before navigation callbacks are invoked.
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+        app.state::<Arc<NativeFilterUpdateState>>().register(
+            &id, ad_blocker && !site_whitelisted, ad_blocker
+        );
+    }
     // On Linux profile_name is ignored by Wry. Separate WebContext data
     // directories are the supported isolation mechanism.
     #[cfg(target_os = "linux")]
@@ -713,6 +750,37 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 pending.exceptions.clear();
                 pending.generichide = false;
             }
+            // Native Linux policy must be in place BEFORE WebKitGTK is
+            // allowed to start the destination request. A filter update is
+            // asynchronous: deny this attempt, update, then retry.
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+                let updates = app_nav.state::<Arc<NativeFilterUpdateState>>().inner().clone();
+                let desired = updates.desired_for(&tab_id_nav, destination_whitelisted);
+                if desired != updates.applied_for(&tab_id_nav) {
+                    let retry_app = app_nav.clone();
+                    let retry_id = tab_id_nav.clone();
+                    let retry_url = url.clone();
+                    // Reject immediately; never approve a request with an
+                    // outdated native filter. A failed compile stays denied.
+                    tauri::async_runtime::spawn(async move {
+                        match change_linux_webview_filter(&retry_app, &retry_id, desired).await {
+                            Ok(_) => {
+                                if let Some(view) = retry_app.get_webview(&retry_id) {
+                                    if let Err(err) = view.navigate(retry_url) {
+                                        crash_log::log_error("native-filter-retry",
+                                            &format!("Navigation retry failed: {err}"));
+                                    }
+                                }
+                            }
+                            Err(err) => crash_log::log_error("native-filter-retry",
+                                &format!("Navigation denied; filter update failed: {err}")),
+                        }
+                    });
+                    return false;
+                }
+            }
+
             // adblock-rust engine check for document-level navigations
             if nav_ad_blocker && !destination_whitelisted {
                 let guard = engine_for_nav.read();
@@ -2541,7 +2609,8 @@ async fn change_linux_webview_filter(
         }
         if !enabled {
             manager.remove_all_filters();
-            let _ = tx.send(Ok(true)); // successful removal is an applied change
+            updates_for_callback.mark_applied(&id_for_callback, ticket, false);
+            let _ = tx.send(Ok(true)); // removal is an applied change
             return;
         }
         let cache = dirs::cache_dir().map(|p|
@@ -2568,6 +2637,7 @@ async fn change_linux_webview_filter(
                 Ok(filter) => {
                     manager.remove_all_filters();
                     manager.add_filter(&filter);
+                    updates_for_callback.mark_applied(&id_for_callback, ticket, true);
                     let _ = tx.send(Ok(true));
                 }
                 Err(e) => {
@@ -2602,6 +2672,9 @@ async fn set_tab_native_filter(
         url.host_str().map(|host| host.to_lowercase())).unwrap_or_default();
     let whitelisted = app.state::<WhitelistState>().sites.lock().contains(&domain);
     let enabled = ad_blocker && !whitelisted;
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    app.state::<Arc<NativeFilterUpdateState>>().set_preference(&id, ad_blocker);
 
     #[cfg(all(target_os = "linux", debug_assertions))]
     {
