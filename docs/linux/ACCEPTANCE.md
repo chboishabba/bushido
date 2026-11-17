@@ -56,3 +56,7 @@ Classify actual failures as `dependency`, `source compile`, `link`, `startup`, `
 ## Shared policy versus enforcement (P2.1/P2.2)
 
 The pure `blocker::evaluate_request` consumer should produce the same block/rewrite/filter decision for document and subresource requests on both backends. This is **not** equivalent to actual Linux interception. Acceptance for P2.2 requires proof that WebKitGTK never transmits a blocked resource to the local test server and that it honors redirects in subframes/workers.
+
+## Native WebKitGTK permission boundary (P3.3 partial)
+
+Run separate test origins using local fixtures that request geolocation, notifications, camera/microphone, device information, pointer lock and clipboard. Verify each request receives denial *without* a prompt or allowed capability, and that nested frames, popup views, and separate tabs cannot bypass the boundary. Test other WebKit permission subclasses (including website-data-access) and document any intentional functionality lost. Treat source inspection as a preflight check, **not** runtime evidence. A future origin-scoped permission UI must replace the unconditional deny only after these negative controls pass.

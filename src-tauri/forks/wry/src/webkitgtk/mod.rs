@@ -36,7 +36,8 @@ use std::{
 use webkit2gtk::WebInspectorExt;
 use webkit2gtk::{
   AutoplayPolicy, CookieManagerExt, InputMethodContextExt, LoadEvent, NavigationPolicyDecision,
-  NavigationPolicyDecisionExt, NetworkProxyMode, NetworkProxySettings, PolicyDecisionType,
+  NavigationPolicyDecisionExt, NetworkProxyMode, NetworkProxySettings, PermissionRequestExt,
+  PolicyDecisionType,
   PrintOperationExt, SettingsExt, URIRequest, URIRequestExt, UserContentInjectedFrames,
   UserContentManager, UserContentManagerExt, UserScript, UserScriptInjectionTime,
   WebContextExt as Webkit2gtkWeContextExt, WebView, WebViewExt, WebsiteDataManagerExt,
@@ -455,6 +456,17 @@ impl InnerWebView {
   ) {
     // window.close()
     webview.connect_close(move |webview| unsafe { webview.destroy() });
+
+    // Linux privacy boundary: a prompt mediator is not yet wired into
+    // Bushido's Tauri command/state layer. Never let a native WebKit
+    // permission request fall through to an implicit platform decision.
+    // This applies to embedded child views and newly created popup views.
+    // P3.3 remains open until allow/deny/remember has origin-scoped tests.
+    #[cfg(target_os = "linux")]
+    webview.connect_permission_request(|_webview, request| {
+      request.deny();
+      true // handled; do not propagate to another permissive handler
+    });
 
     // Synthetic mouse events
     synthetic_mouse_events::setup(webview);

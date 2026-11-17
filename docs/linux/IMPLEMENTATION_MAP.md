@@ -13,7 +13,7 @@ This map refers to the 2026-11-17 source snapshot on `linux-port-pr4-source`. Pa
 | WP-E DNS | `src-tauri/src/dns_resolver.rs`, current Windows `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` | Route *actual* WebKit networking through selected resolver; measure leaks | WP-D |
 | WP-F storage | `src-tauri/src/sync/keys.rs`, `src-tauri/src/vault.rs` | Replace DPAPI interface with secure Linux implementation and test persistence/failure | WP-A |
 | WP-G workspace isolation | `with_profile_name`, `clear_workspace_data`, vendored Tauri/Wry | Verify WebKitGTK website data managers, independent cookies/cache, selective clear | WP-B |
-| WP-H permissions | `respond_permission`, Windows COM `PermissionRequested` | Linux request-to-prompt path with definite allow/deny decision and persistence | WP-B |
+| WP-H permissions | `respond_permission`, Windows COM `PermissionRequested`, vendored Wry `webkitgtk/mod.rs` | Linux native default-deny callback added; implement origin-scoped request-to-prompt path with explicit allow/deny and persistence | WP-B |
 | WP-I feature extras | `src-tauri/src/screenshot.rs`, `src-tauri/src/downloads.rs`, zoom/devtools/clipboard commands | Real Linux implementations and tests | WP-B |
 | WP-J release | `src-tauri/tauri.conf.json`, `.github/workflows/release.yml` | Linux-specific bundling/CI; retain Windows NSIS | WP-A–I |
 

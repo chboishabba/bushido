@@ -28,7 +28,7 @@ Produce a native Linux application that browses reliably, enforces its advertise
 | P2.4 | Network | DoH reaches WebKit network stack, no fallback/leak at maximum privacy | Packet/DNS capture and failure-injection tests | OPEN |
 | P3.1 | Security | Per-workspace cookie/cache/storage isolation + selective clear | Two-workspace fixture; no cross-workspace leakage; clear actually erases | OPEN |
 | P3.2 | Security | Secret Service/portal or well-defined secure Linux key storage with versioned format | Rest/encryption, lock, migration and failure tests; no raw fallback | OPEN |
-| P3.3 | Security | Permissions decision and prompt mediation with remember/deny | Camera/location/notifications/clipboard fixtures | OPEN |
+| P3.3 | Security | Native Linux WebKitGTK permission requests explicitly denied by default; origin-scoped prompt mediation still missing | Camera/location/notifications/clipboard fixtures | PARTIAL — deny callback committed, not build/runtime tested |
 | P3.4 | Security | Fingerprint script timing and cross-realm parity on WebKit | Document-start, frame and worker tests | OPEN |
 | P4.1 | Parity | Downloads, authentication cookies, pause/resume and error reporting | Download fixtures; compare explicit Linux fallback capabilities | OPEN |
 | P4.2 | Parity | Screenshot, image clipboard, zoom, DevTools and print | Executable feature matrix | OPEN |
@@ -55,6 +55,12 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M1:** Browser shell: opens local and remote URLs; tab/split/session tests. Still experimental.
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
+
+## Native WebKitGTK permission boundary (P3.3, partial)
+
+- The vendored Wry WebKitGTK backend now attaches `connect_permission_request` on Linux, explicitly calls `PermissionRequestExt::deny()` and returns `true` to consume the signal. This applies to app and child views built via the backend, including popups created through the same path.
+- The implementation deliberately **does not grant permissions**: origin-scoped prompts, allow-once/remember decisions, persisted revocations and frontend explanatory UX are still unimplemented.
+- Linux runtime permission tests, including unexpected WebKit permission subclasses and desktop portal behaviour, remain OPEN. This is a source-level fail-closed cut only.
 
 ## P2 policy extraction in this branch
 
