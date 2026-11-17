@@ -79,17 +79,43 @@ pub fn generate_identity(app_data: &Path) -> Result<DeviceIdentity, String> {
     Ok(identity)
 }
 
+// A failed or interrupted write must not destroy an existing encrypted
+// identity. Restrict Linux files to the current user from creation time.
+#[cfg(target_os = "linux")]
+fn write_linux_secret_atomically(path: &Path, ciphertext: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path.parent().ok_or("Secret file has no parent directory")?;
+    let mut random = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random);
+    let name = format!(".keys-{}.tmp", hex_encode(&random));
+    let temporary = parent.join(name);
+    let write_result = (|| -> Result<(), String> {
+        let mut file = fs::OpenOptions::new()
+            .write(true).create_new(true).mode(0o600)
+            .open(&temporary)
+            .map_err(|e| format!("Cannot create private temporary key file: {e}"))?;
+        file.write_all(ciphertext)
+            .map_err(|e| format!("Cannot write encrypted identity: {e}"))?;
+        file.sync_all().map_err(|e| format!("Cannot sync encrypted identity: {e}"))?;
+        drop(file);
+        fs::rename(&temporary, path)
+            .map_err(|e| format!("Cannot atomically replace encrypted identity: {e}"))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
 pub fn save_identity(app_data: &Path, identity: &DeviceIdentity) -> Result<(), String> {
     let dir = sync_dir(app_data);
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create sync dir: {}", e))?;
 
-    // Write plaintext device_id and peer_id
-    fs::write(dir.join("device_id"), &identity.device_id)
-        .map_err(|e| format!("Failed to write device_id: {}", e))?;
-    fs::write(dir.join("peer_id"), identity.peer_id.to_string())
-        .map_err(|e| format!("Failed to write peer_id: {}", e))?;
-
-    // Bundle secrets for DPAPI encryption
+    // Do not publish metadata if secure encryption or persistence fails.
+    // Bundle secrets for DPAPI/Secret Service encryption
     let bundle = KeyBundle {
         noise_private_key: identity.noise_private_key.clone(),
         noise_public_key: identity.noise_public_key.clone(),
@@ -102,9 +128,18 @@ pub fn save_identity(app_data: &Path, identity: &DeviceIdentity) -> Result<(), S
         .map_err(|e| format!("Failed to serialize key bundle: {}", e))?;
 
     let encrypted = dpapi_encrypt(&plaintext)?;
-    fs::write(dir.join("keys.dat"), encrypted)
-        .map_err(|e| format!("Failed to write keys.dat: {}", e))?;
 
+    #[cfg(target_os = "linux")]
+    write_linux_secret_atomically(&dir.join("keys.dat"), &encrypted)?;
+    #[cfg(not(target_os = "linux"))]
+    fs::write(dir.join("keys.dat"), &encrypted)
+        .map_err(|e| format!("Failed to write keys.dat: {e}"))?;
+
+    // Public identity metadata is written only after ciphertext is durable.
+    fs::write(dir.join("device_id"), &identity.device_id)
+        .map_err(|e| format!("Failed to write device_id: {e}"))?;
+    fs::write(dir.join("peer_id"), identity.peer_id.to_string())
+        .map_err(|e| format!("Failed to write peer_id: {e}"))?;
     Ok(())
 }
 
@@ -266,13 +301,14 @@ fn linux_keyring_lookup() -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, String
         .stdin(Stdio::null())
         .output()
         .map_err(|_| "Cannot access secret-tool; install libsecret-tools and unlock the desktop keyring".to_string())?;
-    // secret-tool has no distinct 'not found' result code across distributions.
-    // Accept an empty result only when it has no diagnostic stderr.
-    if output.stdout.is_empty() && output.stderr.is_empty() {
-        return Ok(None);
+    // A failed invocation is NOT equivalent to an empty keyring. In
+    // particular, locked/unavailable Secret Service instances may return
+    // no stdout. Refuse to generate a replacement key in those cases.
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err("Desktop Secret Service lookup failed or keyring is locked; refusing key rotation".into());
     }
-    if !output.status.success() {
-        return Err("Desktop Secret Service lookup failed or keyring is locked".into());
+    if output.stdout.is_empty() {
+        return Ok(None);
     }
     let hex = zeroize::Zeroizing::new(
         String::from_utf8(output.stdout)
@@ -370,6 +406,25 @@ mod linux_key_storage_tests {
         assert!(linux_open_with_key(&key, b"important").is_err());
         assert!(linux_open_with_key(&key, LINUX_ENVELOPE).is_err());
         assert!(linux_open_with_key(&key, b"BSH-LINUX-V0\0bad").is_err());
+    }
+
+    #[test]
+    fn linux_atomic_write_replaces_existing_ciphertext_without_world_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let name = format!("bushido-key-test-{}", uuid::Uuid::new_v4());
+        let dir = std::env::temp_dir().join(name);
+        std::fs::create_dir(&dir).expect("create isolated temporary directory");
+        let path = dir.join("keys.dat");
+        let result = (|| {
+            write_linux_secret_atomically(&path, b"sealed-one").expect("first");
+            assert_eq!(std::fs::read(&path).expect("read"), b"sealed-one");
+            write_linux_secret_atomically(&path, b"sealed-two").expect("replacement");
+            assert_eq!(std::fs::read(&path).expect("read"), b"sealed-two");
+            assert_eq!(std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o077, 0);
+            assert_eq!(std::fs::read_dir(&dir).expect("list").count(), 1);
+        })();
+        let _ = std::fs::remove_dir_all(&dir);
+        result
     }
 
     #[test]

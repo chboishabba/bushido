@@ -82,3 +82,7 @@ The Wry `profile_name` extension is ignored on Linux. `create_tab` and `open_gla
 - Confirm no key appears in `ps` arguments, logs, exported crash reports, or plaintext files. Confirm file formats reject unversioned previous Linux plaintext.
 - Exercise keyring item deletion and upgrade/migration policies, ensuring previously encrypted entries never silently become unrecoverable.
 - Unit tests for pure AEAD functions alone **do not close** P3.2.
+
+## P3.2 atomic persistence / fail-closed regression
+
+On a Linux desktop with `secret-tool`, confirm behavior for missing item, present item, locked keyring, missing D-Bus service, and invalid output. A **nonzero** lookup status must never trigger key generation. Verify fresh-install provisioning separately: if `secret-tool lookup` reports missing by exit code 1, installation must fail closed rather than silently bootstrap until a verified missing-item mechanism is implemented. Unit test atomic keys.dat replacement: its final mode must be owner-only (0600), only a complete ciphertext may be observed, and no temporary secret file may remain. Inject a write failure and confirm the prior ciphertext survives.

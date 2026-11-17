@@ -56,6 +56,13 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P3.2 persistence and keyring failure hardening
+
+- Encrypted Linux identity writes now use a randomly named, owner-only (0600) temporary file, `sync_all`, then atomic rename. Existing keys.dat is not truncated if the write fails.
+- Public peer/device metadata is written after successful secret wrapping and ciphertext persistence.
+- Secret Service lookup failure (including empty stdout with failed exit status) now produces an error, **never the 'no key exists' result**. This trades compatibility with some `secret-tool` not-found exit conventions for a fail-closed guarantee; initial key creation may require an explicit provisioning path depending on distro and must be exercised before acceptance.
+- Added a Linux regression test for atomic replacement, file permissions and temporary-file cleanup. Tests are still **unexecuted**.
+
 ## P3.2 Linux encrypted secret storage (partial; source-level)
 
 - Linux `dpapi_encrypt`/`dpapi_decrypt` now use a versioned, AEAD-authenticated envelope (ChaCha20-Poly1305 + random 96-bit nonce) under a 256-bit wrapping key kept in the desktop Secret Service via `secret-tool`.
