@@ -64,3 +64,11 @@ Run separate test origins using local fixtures that request geolocation, notific
 ## Linux per-workspace WebKitGTK data directories (P3.1 partial)
 
 The Wry `profile_name` extension is ignored on Linux. `create_tab` and `open_glance` now use `WebviewBuilder::data_directory` with the same deterministic workspace key. Source-level tests cover distinct/path-safe directory mapping. Acceptance requires two concurrent workspaces, independently set cookies/localStorage/service-worker/cache entries, same-workspace Glance access, persistence after restart and complete selective clear of one workspace without erasing another. Inspect both underlying WebKit data locations and browser-facing APIs. No P3.1 acceptance without native run receipts.
+
+## P3.1 selective clear completion tests (not yet executed)
+
+1. Start Linux on X11 or XWayland with two distinct workspace profiles; write cookies/localStorage/cache entries in both, and create two tabs in workspace A.
+2. Invoke `clear_workspace_data` using A's tab ID, await the Tauri command's result; verify the callback completed (not just dispatched).
+3. Refresh both A tabs: A must lose all browser data, including HTTP-only cookies, while B retains every fixture.
+4. Test a missing tab ID, missing WebKitGTK context, failure callback and forced timeout: the command must return `Err` rather than `Ok`.
+5. Repeat while switching tabs and during application shutdown. The 15-second GTK nested event pump is a potential reentrancy hazard and must be inspected before release.

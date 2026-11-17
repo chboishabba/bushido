@@ -12,7 +12,7 @@ This map refers to the 2026-11-17 source snapshot on `linux-port-pr4-source`. Pa
 | WP-D WebKit adapter | Vendored `src-tauri/forks/wry` and `tauri-runtime-wry`, Linux WebKitGTK | Integrate enforceable request events at engine/network layer, not only navigation callbacks | WP-B/C |
 | WP-E DNS | `src-tauri/src/dns_resolver.rs`, current Windows `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` | Route *actual* WebKit networking through selected resolver; measure leaks | WP-D |
 | WP-F storage | `src-tauri/src/sync/keys.rs`, `src-tauri/src/vault.rs` | Replace DPAPI interface with secure Linux implementation and test persistence/failure | WP-A |
-| WP-G workspace isolation | `with_profile_name`, `WebviewBuilder::data_directory`, `clear_workspace_data`, vendored Tauri/Wry | Linux tabs and Glance now select deterministic per-workspace WebContext directories; verify cookies/cache, implement selective clear | WP-B |
+| WP-G workspace isolation | `with_profile_name`, `WebviewBuilder::data_directory`, `clear_workspace_data`, vendored Tauri/Wry | Linux tabs and Glance select distinct WebContext directories; selective clear now propagates native WebKit callback completion (runtime unverified) | WP-B |
 | WP-H permissions | `respond_permission`, Windows COM `PermissionRequested`, vendored Wry `webkitgtk/mod.rs` | Linux native default-deny callback added; implement origin-scoped request-to-prompt path with explicit allow/deny and persistence | WP-B |
 | WP-I feature extras | `src-tauri/src/screenshot.rs`, `src-tauri/src/downloads.rs`, zoom/devtools/clipboard commands | Real Linux implementations and tests | WP-B |
 | WP-J release | `src-tauri/tauri.conf.json`, `.github/workflows/release.yml` | Linux-specific bundling/CI; retain Windows NSIS | WP-A–I |

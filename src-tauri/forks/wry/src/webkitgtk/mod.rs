@@ -813,18 +813,48 @@ impl InnerWebView {
   }
 
   pub fn clear_all_browsing_data(&self) -> Result<()> {
-    if let Some(context) = self.webview.context() {
-      if let Some(data_manger) = context.website_data_manager() {
-        data_manger.clear(
-          webkit2gtk::WebsiteDataTypes::ALL,
-          gtk::glib::TimeSpan::from_seconds(0),
-          None::<&Cancellable>,
-          |_| {},
-        );
+    // WebKitGTK performs this asynchronously. Wait for the real completion
+    // callback instead of claiming that merely scheduling the clear worked.
+    // Keep processing the GTK main context so its callback can run.
+    let context = self.webview.context().ok_or_else(|| {
+      crate::Error::Io(std::io::Error::other("WebKitGTK context unavailable"))
+    })?;
+    let manager = context.website_data_manager().ok_or_else(|| {
+      crate::Error::Io(std::io::Error::other("WebKitGTK data manager unavailable"))
+    })?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    manager.clear(
+      webkit2gtk::WebsiteDataTypes::ALL,
+      gtk::glib::TimeSpan::from_seconds(0),
+      None::<&Cancellable>,
+      move |result| {
+        let _ = tx.send(result);
+      },
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+      match rx.try_recv() {
+        Ok(result) => return result.map_err(crate::Error::from),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+          return Err(crate::Error::Io(std::io::Error::other(
+            "WebKitGTK data-clearing callback disconnected",
+          )));
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+      }
+      if std::time::Instant::now() >= deadline {
+        return Err(crate::Error::Io(std::io::Error::new(
+          std::io::ErrorKind::TimedOut,
+          "WebKitGTK data clearing did not complete within 15 seconds",
+        )));
+      }
+      if gtk::events_pending() {
+        gtk::main_iteration();
+      } else {
+        std::thread::sleep(std::time::Duration::from_millis(5));
       }
     }
-
-    Ok(())
   }
 
   pub fn bounds(&self) -> Result<Rect> {

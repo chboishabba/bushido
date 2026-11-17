@@ -2004,8 +2004,11 @@ async fn clear_workspace_data(app: tauri::AppHandle, tab_id: String) -> Result<(
     }
     #[cfg(not(windows))]
     {
-        let _ = wv;
-        return Err("Workspace data clearing is not implemented on Linux; data was not erased".into());
+        // Wry's Linux backend now waits for WebKitGTK's completed clear.
+        // Because this Webview uses a workspace-specific data_directory,
+        // sibling tabs within the workspace share this context, but other
+        // workspaces' data managers are independent.
+        return wv.clear_all_browsing_data().map_err(|e| e.to_string());
     }
     #[cfg(windows)]
     Ok(())
