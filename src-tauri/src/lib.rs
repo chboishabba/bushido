@@ -392,6 +392,57 @@ fn is_blocked_scheme(url: &str) -> bool {
         || lower.starts_with("ms-cxh:") || lower.starts_with("ms-cxh-full:")
 }
 
+// Linux's WebKitGTK does not support WebView2 profile_name. Tauri's
+// data_directory is supported and keys separate Wry WebContext instances.
+// Always use a relative, deterministic, traversal-proof directory: Tauri
+// resolves relative paths under its application-owned data root.
+#[cfg(target_os = "linux")]
+fn linux_workspace_data_directory(profile_name: Option<&str>) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let identity = profile_name.filter(|name| !name.is_empty()).unwrap_or("default");
+    let digest = Sha256::digest(identity.as_bytes());
+    let name: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    PathBuf::from("linux-workspaces").join(format!("profile-{name}"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_workspace_directory_tests {
+    use super::*;
+
+    #[test]
+    fn same_workspace_reuses_one_web_context_directory() {
+        assert_eq!(
+            linux_workspace_data_directory(Some("ws-1")),
+            linux_workspace_data_directory(Some("ws-1"))
+        );
+        assert_eq!(
+            linux_workspace_data_directory(None),
+            linux_workspace_data_directory(Some(""))
+        );
+    }
+
+    #[test]
+    fn distinct_workspaces_do_not_share_storage() {
+        assert_ne!(
+            linux_workspace_data_directory(Some("ws-1")),
+            linux_workspace_data_directory(Some("ws-2"))
+        );
+        assert_ne!(
+            linux_workspace_data_directory(Some("ws-1")),
+            linux_workspace_data_directory(None)
+        );
+    }
+
+    #[test]
+    fn profile_name_cannot_escape_tauri_app_data_root() {
+        let escaped = linux_workspace_data_directory(Some("../../../../home/user"));
+        assert!(escaped.is_relative());
+        assert_eq!(escaped.components().count(), 2);
+        assert!(escaped.components().all(|part| matches!(part, std::path::Component::Normal(_))));
+        assert!(!escaped.to_string_lossy().contains("home/user"));
+    }
+}
+
 #[tauri::command]
 async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f64, top_offset: f64, https_only: bool, ad_blocker: bool, cookie_auto_reject: bool, is_panel: bool, profile_name: Option<String>, disable_dev_tools: Option<bool>, disable_status_bar: Option<bool>, disable_autofill: Option<bool>, disable_password_save: Option<bool>, block_service_workers: Option<bool>, block_font_enum: Option<bool>, spoof_hw_concurrency: Option<bool>, block_popups: Option<bool>, default_zoom: Option<f64>, max_tabs: Option<u32>) -> Result<(), String> {
     crash_log::log_info("create_tab", &format!("id={} url={}", id, url));
@@ -545,7 +596,15 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     let source_for_nav = current_source_url.clone();
 
     let mut builder = WebviewBuilder::new(&id, webview_url)
-        .with_profile_name(profile_name);
+        .with_profile_name(profile_name.clone());
+    // On Linux profile_name is ignored by Wry. Separate WebContext data
+    // directories are the supported isolation mechanism.
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.data_directory(
+            linux_workspace_data_directory(profile_name.as_deref())
+        );
+    }
 
     if is_panel {
         builder = builder.user_agent("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36");
@@ -1862,7 +1921,14 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
     let glance_s = bs.glance_script.clone();
 
     let mut builder = tauri::WebviewBuilder::new(&glance_id, webview_url)
-        .with_profile_name(profile_name);
+        .with_profile_name(profile_name.clone());
+    // Glance must share only its originating workspace's storage.
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.data_directory(
+            linux_workspace_data_directory(profile_name.as_deref())
+        );
+    }
     builder = builder.initialization_script(&shortcut_s);
     builder = builder.initialization_script(&media_s);
     builder = builder.initialization_script(&fingerprint_s);

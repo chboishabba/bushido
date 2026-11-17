@@ -26,7 +26,7 @@ Produce a native Linux application that browses reliably, enforces its advertise
 | P2.2 | Network | WebKitGTK adapter attached at a *pre-network* enforcement point | Local HTTP fixture verifies blocked requests never reach server | OPEN |
 | P2.3 | Network | HTTPS-only, redirects, third-party matching, scriptlets/cosmetic filters | Positive and negative network fixtures including iframes/workers | OPEN |
 | P2.4 | Network | DoH reaches WebKit network stack, no fallback/leak at maximum privacy | Packet/DNS capture and failure-injection tests | OPEN |
-| P3.1 | Security | Per-workspace cookie/cache/storage isolation + selective clear | Two-workspace fixture; no cross-workspace leakage; clear actually erases | OPEN |
+| P3.1 | Security | Linux per-workspace data_directory assigned to tabs and Glance; selective clear still unsupported | Two-workspace fixture; no cross-workspace leakage; clear actually erases | PARTIAL — source and path tests written, native runtime unverified |
 | P3.2 | Security | Secret Service/portal or well-defined secure Linux key storage with versioned format | Rest/encryption, lock, migration and failure tests; no raw fallback | OPEN |
 | P3.3 | Security | Native Linux WebKitGTK permission requests explicitly denied by default; origin-scoped prompt mediation still missing | Camera/location/notifications/clipboard fixtures | PARTIAL — deny callback committed, not build/runtime tested |
 | P3.4 | Security | Fingerprint script timing and cross-realm parity on WebKit | Document-start, frame and worker tests | OPEN |
@@ -55,6 +55,13 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M1:** Browser shell: opens local and remote URLs; tab/split/session tests. Still experimental.
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
+
+## Native Linux workspace storage isolation (P3.1, partial)
+
+- Audit found the existing `with_profile_name()` is **Windows-only**: the vendored Tauri source explicitly documents Linux as unsupported/ignored. Consequently Linux tabs otherwise shared the same WebKitGTK context.
+- `create_tab` and `open_glance` now pass a deterministic **relative per-workspace `data_directory`** on Linux, keyed by SHA-256 of the workspace profile name. Wry already keys its WebContext cache by the data-directory path; WebKitGTK configures an independent WebsiteDataManager and cookie store for each context.
+- Unit tests define stable mapping, distinct workspaces and traversal-proof relative paths. **Not executed; real cookie/cache/localStorage isolation still requires two-workspace runtime fixtures.**
+- `clear_workspace_data` still returns an explicit Linux error. A safe deletion implementation must coordinate with live context lifetimes; never silently report success.
 
 ## Native WebKitGTK permission boundary (P3.3, partial)
 
