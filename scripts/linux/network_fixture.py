@@ -169,8 +169,12 @@ class FixtureTests(unittest.TestCase):
         self.read("/__reset")
         for path in REQUIRED_ALLOWED - {"/allowed-redirect-to-blocked"}:
             self.read(path)
-        # Unlike visit_allowed_controls, follow the redirect to prove a leak.
-        self.read("/allowed-redirect-to-blocked")
+        # Unlike visit_allowed_controls, follow the redirect to prove a
+        # leak. The destination deliberately responds 404, so catch that
+        # expected HTTP error before consulting the server-side receipt.
+        with self.assertRaises(HTTPError) as destination:
+            self.read("/allowed-redirect-to-blocked")
+        self.assertEqual(destination.exception.code, 404)
         with self.assertRaises(HTTPError) as err:
             self.read("/__assert")
         details = json.loads(err.exception.read())
