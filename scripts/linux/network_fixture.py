@@ -132,6 +132,20 @@ class FixtureTests(unittest.TestCase):
     def read(self, path):
         with urlopen(self.url + path) as response:
             return response.status, response.read().decode("utf-8")
+    def visit_allowed_controls(self):
+        # Do not automatically follow the intentionally malicious redirect.
+        # Its target is checked separately by the negative-control test.
+        from urllib.error import HTTPError
+        from urllib.request import build_opener, HTTPRedirectHandler
+        class NoRedirect(HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        for path in sorted(REQUIRED_ALLOWED - {"/allowed-redirect-to-blocked"}):
+            self.read(path)
+        with self.assertRaises(HTTPError) as response:
+            build_opener(NoRedirect()).open(self.url + "/allowed-redirect-to-blocked")
+        self.assertEqual(response.exception.code, 302)
+
     def test_fixture_rejects_vacuous_absence(self):
         self.read("/__reset")
         from urllib.error import HTTPError
@@ -142,9 +156,7 @@ class FixtureTests(unittest.TestCase):
                          sorted(REQUIRED_ALLOWED))
     def test_fixture_records_blocked_request(self):
         self.read("/__reset")
-        self.read("/")
-        self.read("/allowed.js")
-        self.read("/allowed-pixel")
+        self.visit_allowed_controls()
         self.read("/blocked.js")
         from urllib.error import HTTPError
         with self.assertRaises(HTTPError) as err:
@@ -157,6 +169,7 @@ class FixtureTests(unittest.TestCase):
         self.read("/__reset")
         for path in REQUIRED_ALLOWED - {"/allowed-redirect-to-blocked"}:
             self.read(path)
+        # Unlike visit_allowed_controls, follow the redirect to prove a leak.
         self.read("/allowed-redirect-to-blocked")
         with self.assertRaises(HTTPError) as err:
             self.read("/__assert")
@@ -180,8 +193,7 @@ class FixtureTests(unittest.TestCase):
 
     def test_fixture_accepts_allowed_only(self):
         self.read("/__reset")
-        for path in sorted(REQUIRED_ALLOWED):
-            self.read(path)
+        self.visit_allowed_controls()
         status, data = self.read("/__assert")
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(data)["accepted"])
