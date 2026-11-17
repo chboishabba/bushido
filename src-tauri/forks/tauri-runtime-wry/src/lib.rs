@@ -4633,6 +4633,7 @@ You may have it installed on another user account, but it is not available for t
     .with_accept_first_mouse(webview_attributes.accept_first_mouse)
     .with_incognito(webview_attributes.incognito)
     .with_profile_name(webview_attributes.profile_name.clone())
+    .with_native_content_filter_enabled(webview_attributes.native_content_filter_enabled)
     .with_clipboard(webview_attributes.clipboard)
     .with_hotkeys_zoom(webview_attributes.zoom_hotkeys_enabled);
 

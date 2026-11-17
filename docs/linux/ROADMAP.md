@@ -56,6 +56,13 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 per-WebView native filter opt-in (source implemented)
+
+- Added `native_content_filter_enabled` to Tauri runtime attributes and Wry WebView attributes; the Tauri builder forwards it through `tauri-runtime-wry` to the WebKitGTK backend.
+- Bushido's `create_tab` sets the flag only when `ad_blocker && !site_whitelisted`. The WebKit native filter is attached only when that flag is enabled. A disabled/whitelisted tab skips native filter installation, even when the experimental rule source exists globally.
+- Glance deliberately sets the flag false until its own settings and whitelist handoff is defined. This is a disclosed gap, not equivalent protection.
+- The flag defaults false for unrelated views; the native rule producer remains debug/opt-in and **incomplete**. Linux runtime and per-tab positive/negative tests remain OPEN. Whitelist changes after initial view creation require explicit refresh/recreate or dynamic filter management in a later gate.
+
 ## P2.2 compiled-filter reuse across WebViews
 
 - Vendored Wry now caches the compiled `UserContentFilter` on the GTK thread keyed by **exact JSON bytes**, and attaches that filter to each new view's `UserContentManager` before navigation.

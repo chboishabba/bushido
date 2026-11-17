@@ -757,6 +757,8 @@ pub struct WebViewAttributes<'a> {
   /// When set, creates a named profile that isolates cookies, localStorage, IndexedDB,
   /// Service Workers, HTTP cache, and permissions from other profiles.
   pub profile_name: Option<String>,
+  /// Per-WebView experimental native Linux filter opt-in.
+  pub native_content_filter_enabled: bool,
 
   /// Whether all media can be played without user interaction.
   pub autoplay: bool,
@@ -832,6 +834,7 @@ impl Default for WebViewAttributes<'_> {
       document_title_changed_handler: None,
       incognito: false,
       profile_name: None,
+      native_content_filter_enabled: false,
       autoplay: true,
       on_page_load_handler: None,
       proxy_config: None,
@@ -1366,6 +1369,13 @@ impl<'a> WebViewBuilder<'a> {
   /// Set a profile name for per-workspace cookie/storage isolation (WebView2 only).
   pub fn with_profile_name(mut self, name: Option<String>) -> Self {
     self.attrs.profile_name = name;
+    self
+  }
+
+  /// Enable the experimental native WebKitGTK content filter only on this
+  /// WebView. Non-Linux platforms ignore this flag.
+  pub fn with_native_content_filter_enabled(mut self, enabled: bool) -> Self {
+    self.attrs.native_content_filter_enabled = enabled;
     self
   }
 

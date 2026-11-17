@@ -597,6 +597,13 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
 
     let mut builder = WebviewBuilder::new(&id, webview_url)
         .with_profile_name(profile_name.clone());
+    // Native content filters are strictly opt-in on Linux, tied to Bushido's
+    // actual ad-blocking toggle and source-domain whitelist. The global
+    // native subset remains an experimental, incomplete rule translator.
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.native_content_filter_enabled(ad_blocker && !site_whitelisted);
+    }
     // On Linux profile_name is ignored by Wry. Separate WebContext data
     // directories are the supported isolation mechanism.
     #[cfg(target_os = "linux")]
@@ -1922,6 +1929,12 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
 
     let mut builder = tauri::WebviewBuilder::new(&glance_id, webview_url)
         .with_profile_name(profile_name.clone());
+    // Glance currently lacks a reliable adblock/whitelist setting handoff.
+    // Do not attach the experimental global native filter to this view.
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.native_content_filter_enabled(false);
+    }
     // Glance must share only its originating workspace's storage.
     #[cfg(target_os = "linux")]
     {

@@ -345,6 +345,8 @@ pub struct WebviewAttributes {
   pub window_effects: Option<WindowEffectsConfig>,
   pub incognito: bool,
   pub profile_name: Option<String>,
+  /// Per-WebView opt-in for a native Linux debug content-filter probe.
+  pub native_content_filter_enabled: bool,
   pub transparent: bool,
   pub focus: bool,
   pub bounds: Option<Rect>,
@@ -493,6 +495,7 @@ impl WebviewAttributes {
       window_effects: None,
       incognito: false,
       profile_name: None,
+      native_content_filter_enabled: false,
       transparent: false,
       focus: true,
       bounds: None,

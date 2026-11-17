@@ -1016,6 +1016,17 @@ fn main() {
     self
   }
 
+  /// Opt into the experimental native Linux WebKitGTK content-filter probe.
+  ///
+  /// The probe requires an explicitly configured rule source and does not
+  /// implement the full Rust adblock policy. Disabled by default, and only
+  /// supported for Linux debug builds.
+  #[must_use]
+  pub fn native_content_filter_enabled(mut self, enabled: bool) -> Self {
+    self.webview_attributes.native_content_filter_enabled = enabled;
+    self
+  }
+
   /// Set a proxy URL for the WebView for all network requests.
   ///
   /// Must be either a `http://` or a `socks5://` URL.

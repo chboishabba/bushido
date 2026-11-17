@@ -385,7 +385,9 @@ impl InnerWebView {
     // In debug Linux builds, install the native filter BEFORE navigation.
     // Fail the WebView creation if its requested rule set cannot compile.
     #[cfg(all(target_os = "linux", debug_assertions))]
-    install_linux_fixture_filter(&webview)?;
+    if attributes.native_content_filter_enabled {
+      install_linux_fixture_filter(&webview)?;
+    }
 
     // Webview handlers
     Self::attach_handlers(&webview, web_context, &mut attributes);

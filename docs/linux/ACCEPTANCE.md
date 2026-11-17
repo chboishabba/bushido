@@ -111,3 +111,7 @@ Test `||example.net^` with `@@||login.example.net^$script`: the unconditional na
 ## P2.2 Rust native-source bootstrap
 
 In a Linux debug session, `BUSHIDO_LINUX_NATIVE_SOURCE_SUBSET=peter-lowe npm run tauri -- dev` generates `<app-data>/native-webkit/rules.json` and `receipt.json`, then uses the same vendored Wry WebKit content-filter store before navigation. Verify the receipt, native compile success, and denied traffic against a host from the source list with an independent server-side observer. The bare-host parser intentionally rejects conditional rules; the external Python subset producer and fixture filter remain separate developer probes. Prove parity to the Rust engine and per-tab toggles before considering production promotion.
+
+## Per-WebView native filter selection
+
+Start a Linux debug session with the original-source native filter enabled. Create four distinct WebViews: adblock on/not whitelisted, adblock off, adblock on/whitelisted, and Glance. Record server-side resource requests and verify that only the first receives the native block list. Change the whitelist and adblock preference while a tab remains open: this **must not** be considered complete until the existing view updates or is recreated without a stale filter. Also confirm that a default app WebView is not filtered by the probe. The implementation currently handles initial creation only.
