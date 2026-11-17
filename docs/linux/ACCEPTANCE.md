@@ -139,3 +139,7 @@ With a real Linux debug WebKitGTK instance, induce two native filter updates for
 ## P2.2 pre-navigation deny-and-retry
 
 In a Linux debug build with native rule source configured, navigate from an unwhitelisted origin to a whitelisted destination and back. Instrument the WebKit navigation policy callback and local server: the initial request must be denied when the desired and applied filter modes differ, and only a successfully acknowledged native update may retry it. Force filter compilation failure: the original request must not appear server-side. Check redirect chains, repeated clicks, frames and simultaneous navigations for out-of-order retries or leaked initial requests. **No runtime acceptance yet.**
+
+## Pending navigation supersession
+
+Start a navigation from site A to B that requires a filter transition; before compilation finishes navigate to C. Verify B cannot be retried after the newer navigation. Repeat where C already matches the applied filter, and after closing/recreating the tab. Identical URL retries and redirect chains remain separately open.

@@ -56,6 +56,11 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 latest-destination retry cancellation
+
+- Track a per-tab pending navigation URL when the initial attempt is denied for native filter transition. On completion, only the current matching destination can be retried; a subsequent user navigation supersedes the old URL, including a navigation requiring no filter change.
+- Tab closure clears pending destinations. This prevents a common stale-navigation retry, but repeated requests to the **same URL**, asynchronous timing, redirects, subframes and adblock preference transitions still require native WebKitGTK acceptance.
+
 ## P2.2 pre-navigation deny/update/retry (source implementation)
 
 - Linux debug tabs with a configured native filter source now keep an **applied filter state** separate from both outstanding compilation tickets and the latest adblock preference.

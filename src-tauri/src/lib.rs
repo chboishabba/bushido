@@ -42,6 +42,9 @@ struct NativeFilterUpdateState {
     applied: Mutex<HashMap<String, bool>>,
     // Current user preference, independent of tab creation-time captures.
     adblock: Mutex<HashMap<String, bool>>,
+    // Only the most recent destination may be retried after an async
+    // filter update; replacing the URL cancels an older pending retry.
+    pending_navigation: Mutex<HashMap<String, String>>,
 }
 
 #[cfg(all(target_os = "linux", debug_assertions))]
@@ -67,6 +70,7 @@ impl NativeFilterUpdateState {
         self.latest.lock().remove(id);
         self.applied.lock().remove(id);
         self.adblock.lock().remove(id);
+        self.pending_navigation.lock().remove(id);
     }
 
     fn register(&self, id: &str, enabled: bool, adblock: bool) {
@@ -84,6 +88,24 @@ impl NativeFilterUpdateState {
 
     fn applied_for(&self, id: &str) -> bool {
         self.applied.lock().get(id).copied().unwrap_or(false)
+    }
+
+    fn reserve_navigation(&self, id: &str, url: &str) {
+        self.pending_navigation.lock().insert(id.to_owned(), url.to_owned());
+    }
+
+    fn cancel_navigation(&self, id: &str) {
+        self.pending_navigation.lock().remove(id);
+    }
+
+    fn take_latest_navigation(&self, id: &str, url: &str) -> bool {
+        let mut pending = self.pending_navigation.lock();
+        if pending.get(id).is_some_and(|current| current == url) {
+            pending.remove(id);
+            true
+        } else {
+            false
+        }
     }
 
     fn mark_applied(&self, id: &str, ticket: u64, enabled: bool) {
@@ -758,18 +780,26 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 let updates = app_nav.state::<Arc<NativeFilterUpdateState>>().inner().clone();
                 let desired = updates.desired_for(&tab_id_nav, destination_whitelisted);
                 if desired != updates.applied_for(&tab_id_nav) {
+                    updates.reserve_navigation(&tab_id_nav, &url_str);
                     let retry_app = app_nav.clone();
                     let retry_id = tab_id_nav.clone();
                     let retry_url = url.clone();
+                    let retry_string = url_str.clone();
+                    let retry_state = updates.clone();
                     // Reject immediately; never approve a request with an
                     // outdated native filter. A failed compile stays denied.
                     tauri::async_runtime::spawn(async move {
                         match change_linux_webview_filter(&retry_app, &retry_id, desired).await {
                             Ok(_) => {
-                                if let Some(view) = retry_app.get_webview(&retry_id) {
-                                    if let Err(err) = view.navigate(retry_url) {
-                                        crash_log::log_error("native-filter-retry",
-                                            &format!("Navigation retry failed: {err}"));
+                                // A more recent user navigation (including
+                                // one needing no filter switch) supersedes
+                                // this retry. Never restore an old URL.
+                                if retry_state.take_latest_navigation(&retry_id, &retry_string) {
+                                    if let Some(view) = retry_app.get_webview(&retry_id) {
+                                        if let Err(err) = view.navigate(retry_url) {
+                                            crash_log::log_error("native-filter-retry",
+                                                &format!("Navigation retry failed: {err}"));
+                                        }
                                     }
                                 }
                             }
@@ -778,6 +808,10 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                         }
                     });
                     return false;
+                } else {
+                    // An ordinary accepted navigation supersedes any old
+                    // destination waiting on native filter compilation.
+                    updates.cancel_navigation(&tab_id_nav);
                 }
             }
 
