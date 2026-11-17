@@ -27,7 +27,7 @@ Produce a native Linux application that browses reliably, enforces its advertise
 | P2.3 | Network | HTTPS-only, redirects, third-party matching, scriptlets/cosmetic filters | Positive and negative network fixtures including iframes/workers | OPEN |
 | P2.4 | Network | DoH reaches WebKit network stack, no fallback/leak at maximum privacy | Packet/DNS capture and failure-injection tests | OPEN |
 | P3.1 | Security | Linux per-workspace data_directory plus acknowledged WebKitGTK clear | Two-workspace fixture; no cross-workspace leakage; clear actually erases | PARTIAL — completion propagation source added, Linux runtime unverified |
-| P3.2 | Security | Secret Service/portal or well-defined secure Linux key storage with versioned format | Rest/encryption, lock, migration and failure tests; no raw fallback | OPEN |
+| P3.2 | Security | Linux Secret Service key + versioned ChaCha20-Poly1305 envelope for sync and vault | Rest/encryption, lock, migration and failure tests; no raw fallback | PARTIAL — crypto source/tests written, keyring/runtime acceptance open |
 | P3.3 | Security | Native Linux WebKitGTK permission requests explicitly denied by default; origin-scoped prompt mediation still missing | Camera/location/notifications/clipboard fixtures | PARTIAL — deny callback committed, not build/runtime tested |
 | P3.4 | Security | Fingerprint script timing and cross-realm parity on WebKit | Document-start, frame and worker tests | OPEN |
 | P4.1 | Parity | Downloads, authentication cookies, pause/resume and error reporting | Download fixtures; compare explicit Linux fallback capabilities | OPEN |
@@ -55,6 +55,14 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M1:** Browser shell: opens local and remote URLs; tab/split/session tests. Still experimental.
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
+
+## P3.2 Linux encrypted secret storage (partial; source-level)
+
+- Linux `dpapi_encrypt`/`dpapi_decrypt` now use a versioned, AEAD-authenticated envelope (ChaCha20-Poly1305 + random 96-bit nonce) under a 256-bit wrapping key kept in the desktop Secret Service via `secret-tool`.
+- Secret Service credentials are written via child stdin, not a process command argument or alongside encrypted data. The key is re-read after creation; absent, locked or malfunctioning keyrings return an error. Historical plaintext formats and tampered blobs are rejected.
+- Deterministic Rust tests cover round-trip, wrong key, mutation, legacy plaintext rejection and independent nonces; **tests have not run**. Desktop keyring lock/unlock, concurrent initialization, real sync identity persistence and vault recovery remain unverified.
+- Dependencies already include `chacha20poly1305`, `rand` and `zeroize`; install `libsecret-tools` as a Linux runtime requirement. No plaintext fallback is permitted.
+- **Security limitation:** `secret-tool` is a subprocess and may require an unlocked interactive desktop keyring; an in-process libsecret backend is preferable if practical. Do not ship before an external security review and production runtime validation.
 
 ## P3.1 selective clear implementation (source-level)
 

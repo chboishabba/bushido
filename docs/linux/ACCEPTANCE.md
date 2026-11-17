@@ -72,3 +72,13 @@ The Wry `profile_name` extension is ignored on Linux. `create_tab` and `open_gla
 3. Refresh both A tabs: A must lose all browser data, including HTTP-only cookies, while B retains every fixture.
 4. Test a missing tab ID, missing WebKitGTK context, failure callback and forced timeout: the command must return `Err` rather than `Ok`.
 5. Repeat while switching tabs and during application shutdown. The 15-second GTK nested event pump is a potential reentrancy hazard and must be inspected before release.
+
+## P3.2 Linux encrypted credentials (partial)
+
+- Install `libsecret-tools`, start an unlocked Secret Service session, generate a sync identity, and assert `keys.dat` starts with `BSH-LINUX-V1\0` and never contains the secret key bytes.
+- Save and reload multiple vault entries across application restarts. Assert decryption only with the same desktop keyring item, and verify wrong-key and ciphertext corruption rejection.
+- Lock the keyring or remove `secret-tool` from PATH: saving and decrypting must error without plaintext fallback. Test service-unavailable and corrupted keyring-entry results.
+- Run concurrent first-use processes and confirm they agree on one stored key, without inconsistent new envelopes.
+- Confirm no key appears in `ps` arguments, logs, exported crash reports, or plaintext files. Confirm file formats reject unversioned previous Linux plaintext.
+- Exercise keyring item deletion and upgrade/migration policies, ensuring previously encrypted entries never silently become unrecoverable.
+- Unit tests for pure AEAD functions alone **do not close** P3.2.

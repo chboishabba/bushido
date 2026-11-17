@@ -43,7 +43,7 @@ jobs:
             build-essential pkg-config libssl-dev libgtk-3-dev \
             libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
             libsoup-3.0-dev libayatana-appindicator3-dev \
-            librsvg2-dev libxdo-dev libudev-dev
+            librsvg2-dev libxdo-dev libudev-dev libsecret-tools
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
