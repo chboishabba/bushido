@@ -115,3 +115,7 @@ In a Linux debug session, `BUSHIDO_LINUX_NATIVE_SOURCE_SUBSET=peter-lowe npm run
 ## Per-WebView native filter selection
 
 Start a Linux debug session with the original-source native filter enabled. Create four distinct WebViews: adblock on/not whitelisted, adblock off, adblock on/whitelisted, and Glance. Record server-side resource requests and verify that only the first receives the native block list. Change the whitelist and adblock preference while a tab remains open: this **must not** be considered complete until the existing view updates or is recreated without a stale filter. Also confirm that a default app WebView is not filtered by the probe. The implementation currently handles initial creation only.
+
+## Dynamic native filter update (P2.2)
+
+With a Linux debug WebKitGTK session and explicit native rule source, load a known blocked resource and observe it at the test server. Toggle the current site's whitelist; await the Rust `set_tab_native_filter` acknowledgement before reload and verify the allowed/blocked paths change correspondingly. Force missing filter-store ID and missing content manager; the operation must return `Err` rather than `Ok`. Cover repeated toggles, two tabs with conflicting whitelists, navigation between hosts, and preference changes. The current source implementation only handles explicit whitelist toggles, and other transitions remain OPEN until wired.

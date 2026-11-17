@@ -56,6 +56,14 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 - **M2:** Security candidate: request filtering, HTTPS, DoH, storage isolation and credential handling verified. Limited beta only with disclosed remaining gaps.
 - **M3:** Release candidate: feature matrix, regression suite, packaging and maintainers' review.
 
+## P2.2 native filter updates on existing tabs (source implemented)
+
+- Added `set_tab_native_filter(id, ad_blocker)` to compute the actual site whitelist from Bushido's Rust state and dispatch an update into the live WebKitGTK `UserContentManager`.
+- When enabled, it loads the previously saved native filter, preserves the old filter if that load fails, then replaces native filters on success. When disabled, it removes native content filters. The operation returns a result only after WebKitGTK acknowledges it, with a bounded 15-second timeout.
+- The frontend's explicit whitelist toggle now calls this operation before reloading the tab and reports failures. The command is Linux-debug-only and returns false on other platforms (not a false claim of native enforcement).
+- **Still OPEN:** live changes to the global adblock toggle, navigation between whitelisted and unwhitelisted sites, concurrent update races, the original Rust document-navigation closure's captured whitelist value, and real native acceptance. `remove_all_filters` assumes the WebKit manager owns only Bushido's native subset; preserving unrelated filters is a future strengthening.
+- No claim of full ABP/rust-engine parity.
+
 ## P2.2 per-WebView native filter opt-in (source implemented)
 
 - Added `native_content_filter_enabled` to Tauri runtime attributes and Wry WebView attributes; the Tauri builder forwards it through `tauri-runtime-wry` to the WebKitGTK backend.

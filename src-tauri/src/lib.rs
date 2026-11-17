@@ -2414,6 +2414,87 @@ fn save_permissions(app: &tauri::AppHandle, perms: &HashMap<String, bool>) {
     }
 }
 
+// Explicit dynamic native-filter operation for an existing Linux WebView.
+// A successful return means the real WebKit UserContentManager was updated,
+// not merely that the GTK main-thread task was queued.
+#[cfg(all(target_os = "linux", debug_assertions))]
+async fn change_linux_webview_filter(
+    app: &tauri::AppHandle,
+    id: &str,
+    enabled: bool,
+) -> Result<bool, String> {
+    use webkit2gtk::{UserContentFilterStore, UserContentFilterStoreExt, UserContentManagerExt, WebViewExt};
+    let view = app.get_webview(id).ok_or_else(|| format!("Unknown WebView: {id}"))?;
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<bool, String>>();
+    let rule_path = std::env::var_os("BUSHIDO_LINUX_FILTER_JSON");
+    // Check required source before touching an already-installed filter.
+    if enabled && rule_path.is_none() {
+        return Err("No experimental native content-filter rules configured".into());
+    }
+    view.with_webview(move |view| {
+        let Some(manager) = view.inner().user_content_manager() else {
+            let _ = tx.send(Err("Missing native WebKitGTK content manager".into()));
+            return;
+        };
+        if !enabled {
+            manager.remove_all_filters();
+            let _ = tx.send(Ok(false));
+            return;
+        }
+        let cache = dirs::cache_dir().map(|p|
+            p.join("bushido-browser").join("webkit-content-filter-probe"));
+        let Some(cache) = cache else {
+            let _ = tx.send(Err("WebKitGTK filter cache directory missing".into()));
+            return;
+        };
+        let store = UserContentFilterStore::new(&cache.to_string_lossy());
+        // The initial native Wry path has already compiled/saved this ID.
+        // A failure to load MUST leave the old filter unchanged.
+        store.load("bushido-development-probe",
+                   None::<&webkit2gtk::gio::Cancellable>,
+                   move |result| {
+            match result {
+                Ok(filter) => {
+                    manager.remove_all_filters();
+                    manager.add_filter(&filter);
+                    let _ = tx.send(Ok(true));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(format!("Native filter load failed: {e}")));
+                }
+            }
+        });
+    }).map_err(|e| format!("Failed to dispatch native filter change: {e}"))?;
+    tokio::time::timeout(std::time::Duration::from_secs(15), rx)
+        .await
+        .map_err(|_| "Timed out applying native WebKitGTK filter".to_string())?
+        .map_err(|_| "Native WebKitGTK filter callback was lost".to_string())?
+}
+
+#[tauri::command]
+async fn set_tab_native_filter(
+    app: tauri::AppHandle,
+    id: String,
+    ad_blocker: bool,
+) -> Result<bool, String> {
+    let view = app.get_webview(&id).ok_or_else(|| format!("Unknown WebView: {id}"))?;
+    let domain = view.url().ok().and_then(|url|
+        url.host_str().map(|host| host.to_lowercase())).unwrap_or_default();
+    let whitelisted = app.state::<WhitelistState>().sites.lock().contains(&domain);
+    let enabled = ad_blocker && !whitelisted;
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    {
+        return change_linux_webview_filter(&app, &id, enabled).await;
+    }
+    #[cfg(not(all(target_os = "linux", debug_assertions)))]
+    {
+        let _ = (view, enabled);
+        // Not implemented on Windows/release Linux. Never claim filtering.
+        Ok(false)
+    }
+}
+
 #[tauri::command]
 async fn toggle_whitelist(app: tauri::AppHandle, domain: String) -> Result<bool, String> {
     let ws = app.state::<WhitelistState>();
@@ -3241,6 +3322,7 @@ pub fn run() {
             save_bookmarks,
             load_bookmarks,
             toggle_whitelist,
+            set_tab_native_filter,
             get_whitelist,
             is_whitelisted,
             respond_permission,

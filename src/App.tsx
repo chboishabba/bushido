@@ -1657,9 +1657,24 @@ export default function App() {
     let domain = "";
     try { domain = new URL(tab.url).hostname; } catch {}
     if (!domain) return;
-    invoke<boolean>("toggle_whitelist", { domain }).then(whitelisted => {
+    invoke<boolean>("toggle_whitelist", { domain }).then(async whitelisted => {
+      // Update the existing native Linux WebView before reloading. The Rust
+      // command only acknowledges after WebKit's content manager is updated.
+      try {
+        await invoke<boolean>("set_tab_native_filter", {
+          id: activeTab, adBlocker: settingsRef.current.adBlocker,
+        });
+      } catch (error) {
+        // The whitelist is saved, but a native filter change may have failed.
+        // Surface that limitation instead of silently claiming it applied.
+        console.warn("[bushido] native filter update failed", error);
+        useUiStore.getState().showError("Native content filter update failed");
+      }
       setTabs(prev => prev.map(t => t.id === activeTab ? { ...t, whitelisted } : t));
-      invoke("reload_tab", { id: activeTab });
+      await invoke("reload_tab", { id: activeTab });
+    }).catch(error => {
+      console.warn("[bushido] whitelist toggle failed", error);
+      useUiStore.getState().showError("Unable to update whitelist");
     });
   }, [activeTab, tabs]);
 
