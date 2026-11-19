@@ -45,7 +45,12 @@
             ids: pendingIds.splice(0)
         };
         try {
-            window.chrome.webview.postMessage(JSON.stringify(msg));
+            if (window.webkit && window.webkit.messageHandlers &&
+                window.webkit.messageHandlers.bushidoCosmetic) {
+                window.webkit.messageHandlers.bushidoCosmetic.postMessage(JSON.stringify(msg));
+            } else if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage(JSON.stringify(msg));
+            }
         } catch(e) {}
     }
 

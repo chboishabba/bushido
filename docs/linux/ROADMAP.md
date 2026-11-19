@@ -263,3 +263,7 @@ P2 and P3 are independent in parts and should progress in parallel after the run
 ## Non-goals
 
 No UI framework rewrite, engine replacement without evidence, simulated network filtering counted as enforcement, or auto-merging into the original contributor branch without consent/permissions.
+
+## P2.2 dedicated Linux cosmetic IPC (source implemented)
+
+- Register a separate WebKit `bushidoCosmetic` channel for ordinary tabs, without remote Tauri capabilities. Scope Wry's standard handler to `ipc` only. Reuse the original Rust selector engine with current URL exceptions, generic-hide policy, whitelist and adblock preference. Bound probe size, token counts and rate. Windows retains its original message transport. Registration occurs after view creation; initial-probe timing, frame provenance, native compilation and dynamic release preferences remain open.

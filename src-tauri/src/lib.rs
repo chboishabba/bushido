@@ -1092,6 +1092,72 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     let state = app.state::<WebviewState>();
     state.tabs.lock().insert(tab_id_track, true);
 
+    // Linux remote documents must not receive general Tauri command access.
+    // This dedicated native channel accepts only bounded cosmetic probes
+    // and returns engine-derived selectors to its own WebView.
+    #[cfg(target_os = "linux")]
+    {
+        use webkit2gtk::{UserContentManagerExt, WebViewExt};
+        let cosmetic_app = app.clone();
+        let cosmetic_id = id.clone();
+        let cosmetic_engine = engine.clone();
+        webview.with_webview(move |platform| {
+            let view = platform.inner();
+            let Some(manager) = view.user_content_manager() else { return; };
+            let weak_view = webkit2gtk::glib::ObjectExt::downgrade(&view);
+            let last_probe = std::cell::Cell::new(None::<std::time::Instant>);
+            manager.connect_script_message_received(Some("bushidoCosmetic"), move |_, message| {
+                let Some(view) = weak_view.upgrade() else { return; };
+                let Some(uri) = view.uri() else { return; };
+                let Ok(url) = url::Url::parse(uri.as_str()) else { return; };
+                if !matches!(url.scheme(), "http" | "https") { return; }
+                let Some(host) = url.host_str() else { return; };
+                if cosmetic_app.state::<WhitelistState>().sites.lock().contains(&host.to_lowercase()) {
+                    return;
+                }
+                #[cfg(debug_assertions)]
+                let ad_blocker = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+                    cosmetic_app.state::<Arc<NativeFilterUpdateState>>().preference_for(&cosmetic_id)
+                } else { ad_blocker };
+                if !ad_blocker { return; }
+                let now = std::time::Instant::now();
+                if last_probe.get().is_some_and(|last| now.duration_since(last).as_millis() < 200) {
+                    return;
+                }
+                let Some(value) = message.js_value() else { return; };
+                let raw = value.to_string();
+                if raw.len() > 32768 { return; }
+                let Ok(probe) = serde_json::from_str::<serde_json::Value>(&raw) else { return; };
+                if probe.get("__bushido").and_then(|v| v.as_str()) != Some("cosmetic-probe") { return; }
+                let tokens = |key: &str| -> Vec<String> {
+                    probe.get(key).and_then(|v| v.as_array()).into_iter().flatten()
+                        .take(256).filter_map(|v| v.as_str())
+                        .filter(|s| !s.is_empty() && s.len() <= 128)
+                        .map(str::to_owned).collect()
+                };
+                let classes = tokens("classes");
+                let ids = tokens("ids");
+                if classes.is_empty() && ids.is_empty() { return; }
+                last_probe.set(Some(now));
+                let guard = cosmetic_engine.read();
+                // Recompute for the actual current document, not a pending
+                // navigation's cached exception set.
+                let cosmetic = blocker::get_cosmetic_resources(&guard, uri.as_str());
+                if cosmetic.generichide { return; }
+                let selectors = blocker::get_hidden_selectors(&guard, &classes, &ids, &cosmetic.exceptions);
+                drop(guard);
+                if selectors.is_empty() { return; }
+                if let Ok(json) = serde_json::to_string(&selectors) {
+                    let script = format!("if(window.__bushidoApplyCosmetic)window.__bushidoApplyCosmetic({});", json);
+                    view.run_javascript(&script, None::<&webkit2gtk::gio::Cancellable>, |_| {});
+                }
+            });
+            if !manager.register_script_message_handler("bushidoCosmetic") {
+                crash_log::log_error("cosmetic-ipc", "Unable to register Linux cosmetic channel");
+            }
+        }).map_err(|e| e.to_string())?;
+    }
+
     // intercept downloads + ad blocking via WebView2 COM API
     #[cfg(windows)]
     {

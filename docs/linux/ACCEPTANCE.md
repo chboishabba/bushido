@@ -175,3 +175,7 @@ Force a Linux `add_child` failure after native state registration and confirm th
 ## Document-start privacy/cosmetic separation
 
 Create an unwhitelisted tab with adblock enabled, then turn adblock off and reload: the new document must not install the cosmetic observer or inherit pending CSS/scriptlets from the previous origin. Reverse the toggle, including a tab originally created with adblocking disabled: conditional cosmetic injection should become available. Verify `content_blocker.js` WebRTC restriction is present at document start under either toggle and on whitelisted origins. Check same-document navigation, page-load timing and native WebKitGTK IPC separately before claiming parity.
+
+## Linux cosmetic IPC
+
+Exercise the dedicated channel with valid class/ID batches, invalid JSON, oversized messages, whitelisted pages and generic-hide exceptions. Verify unrelated messages cannot enter ordinary Tauri dispatch. Confirm subsequent DOM mutations and first-load timing on WebKitGTK; no runtime acceptance yet.

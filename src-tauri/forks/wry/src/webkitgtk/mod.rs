@@ -732,7 +732,7 @@ impl InnerWebView {
       .expect("WebView does not have UserContentManager");
 
     // Connect before registering as recommended by the docs
-    manager.connect_script_message_received(None, move |_m, msg| {
+    manager.connect_script_message_received(Some("ipc"), move |_m, msg| {
       #[cfg(feature = "tracing")]
       let _span = tracing::info_span!(parent: None, "wry::ipc::handle").entered();
 
