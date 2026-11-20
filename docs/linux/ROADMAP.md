@@ -289,3 +289,8 @@ Bound observer tracking to 16,384 distinct tokens per kind per document, send at
 - Reuse media channel for bounded video snapshots with independent rate limit and native tab identity. Periodic reports include document video presence, standard PiP API support and actual active element state. Existing Windows event carries optional fields too. Frontend projects only selected-tab snapshots, clears on navigation, and requests initial detection immediately. PiP command checks API and respects disablePictureInPicture; confirmation requires trusted click in the page overlay. No claimed OS-level detached window fallback or WebKit PiP runtime support.
 
 - Video snapshot projection ignores suspended/destroyed or internal active tabs, prunes inactive materializations, and deduplicates identical periodic snapshots to avoid needless React renders. This is UI state management, not authenticated video detection.
+
+## P4 FindBar Linux result transport (source implemented)
+
+- Linux find-in-page now returns a bounded count directly from the WebKit JavaScript evaluation callback, using a five-second timeout and typed result. No new remote message handler. The existing search behavior (`window.find`) and visible-text substring estimate are retained; the count is not necessarily identical to actual find results across frames, Unicode, or hidden DOM.
+- FindBar correlates replies to its initiating request, ignores obsolete queries/tab switches, and clears old counts. Windows keeps its result-event path with request correlation. Native WebKit runtime and exact match/index parity remain open.

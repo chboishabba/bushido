@@ -1699,7 +1699,8 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                                     Some("match-count") => {
                                         let count = msg.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
                                         let _ = app_ref.emit_to("main", "match-count", serde_json::json!({
-                                            "id": *tab_ref, "count": count
+                                            "id": *tab_ref, "count": count.min(100000),
+                                            "requestId": msg.get("requestId").and_then(|v| v.as_u64())
                                         }));
                                     }
                                     Some("vault-check") => {
@@ -2894,26 +2895,67 @@ async fn set_tab_pinned(app: tauri::AppHandle, id: String, pinned: bool) -> Resu
 }
 
 #[tauri::command]
-async fn find_in_page(app: tauri::AppHandle, id: String, query: String, forward: bool) -> Result<(), String> {
-    if let Some(wv) = app.get_webview(&id) {
-        if query.is_empty() {
-            wv.eval("window.getSelection().removeAllRanges()").map_err(|e| e.to_string())?;
-        } else {
-            let dir = if forward { "false" } else { "true" };
-            let escaped = query.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n").replace('\r', "\\r");
-            let js = format!(
-                "window.find('{}', false, {}, true, false, false, false)",
-                escaped, dir
-            );
-            wv.eval(&js).map_err(|e| e.to_string())?;
-            let count_js = format!(
-                "(function(){{var q='{}';var t=(document.body.innerText||'').toLowerCase();var c=t.split(q.toLowerCase()).length-1;window.chrome.webview.postMessage(JSON.stringify({{__bushido:'match-count',count:c}}))}})()",
-                escaped
-            );
-            let _ = wv.eval(&count_js);
-        }
+async fn find_in_page(
+    app: tauri::AppHandle, id: String, query: String, forward: bool,
+    request_id: Option<u32>,
+) -> Result<Option<u32>, String> {
+    let wv = app.get_webview(&id).ok_or("Unknown WebView")?;
+    if query.len() > 4096 { return Err("Search query too long".into()); }
+    if query.is_empty() {
+        wv.eval("window.getSelection()?.removeAllRanges()").map_err(|e| e.to_string())?;
+        return Ok(Some(0));
     }
-    Ok(())
+    let escaped = serde_json::to_string(&query).map_err(|e| e.to_string())?;
+    // Retain the existing window.find behavior and visible-text estimate.
+    // Count without allocating an array proportional to document length.
+    let search = format!(r#"(function(){{
+        const q = {};
+        window.find(q, false, {}, true, false, false, false);
+        const text = (document.body?.innerText || '').toLowerCase();
+        const needle = q.toLowerCase();
+        let count = 0, offset = 0;
+        while (count < 100000) {{
+            const next = text.indexOf(needle, offset);
+            if (next < 0) break;
+            count++;
+            offset = next + needle.length;
+        }}
+        return count;
+    }})()"#, escaped, !forward);
+
+    #[cfg(target_os = "linux")]
+    {
+        use webkit2gtk::WebViewExt;
+        use javascriptcore::ValueExt;
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<u32, String>>();
+        wv.with_webview(move |platform| {
+            let view = platform.inner();
+            view.run_javascript(&search, None::<&gtk::gio::Cancellable>, move |result| {
+                let count = result.map_err(|e| e.to_string()).and_then(|r|
+                    r.js_value().and_then(|v| v.to_json(0))
+                        .ok_or_else(|| "Missing find result".to_owned())
+                        .and_then(|json| serde_json::from_str::<u32>(json.as_str())
+                            .map_err(|e| e.to_string()))
+                        .and_then(|n| if n <= 100000 { Ok(n) } else { Err("Find count exceeded limit".into()) })
+                );
+                let _ = tx.send(count);
+            });
+        }).map_err(|e| e.to_string())?;
+        let _ = request_id;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await
+            .map_err(|_| "Find result timed out".to_owned())?
+            .map_err(|_| "Find callback lost".to_owned())??;
+        Ok(Some(result))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Preserve the existing WebView2 result event, correlated to the
+        // initiating trusted FindBar request.
+        let request = request_id.unwrap_or(0);
+        let js = format!("(function(){{const count={};if(window.chrome&&window.chrome.webview)window.chrome.webview.postMessage(JSON.stringify({{__bushido:'match-count',count:count,requestId:{}}}));}})()", search, request);
+        wv.eval(&js).map_err(|e| e.to_string())?;
+        Ok(None)
+    }
 }
 
 #[tauri::command]

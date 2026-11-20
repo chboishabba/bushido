@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+let nextFindRequest = 0;
 interface Props {
   tabId: string;
   onClose: () => void;
@@ -12,20 +13,32 @@ export default memo(function FindBar({ tabId, onClose }: Props) {
   const [matchCount, setMatchCount] = useState<number | null>(null);
   const [activeIdx, setActiveIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const requestRef = useRef(0);
 
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
 
   useEffect(() => {
-    const p = listen<{ id: string; count: number }>("match-count", (e) => {
-      if (e.payload.id === tabId) setMatchCount(e.payload.count);
+    const p = listen<{ id: string; count: number; requestId?: number }>("match-count", (e) => {
+      if (e.payload.id === tabId && e.payload.requestId === requestRef.current) {
+        setMatchCount(e.payload.count);
+      }
     });
-    return () => { p.then(u => u()); };
+    return () => { requestRef.current = 0; p.then(u => u()); };
   }, [tabId]);
 
   const find = useCallback((forward = true) => {
-    invoke("find_in_page", { id: tabId, query, forward });
+    const requestId = ++nextFindRequest;
+    requestRef.current = requestId;
+    invoke<number | null>("find_in_page", { id: tabId, query, forward, requestId })
+      .then(count => {
+        if (requestRef.current === requestId && count !== null) setMatchCount(count);
+      })
+      .catch(error => {
+        if (requestRef.current === requestId) setMatchCount(null);
+        console.warn("[bushido] find-in-page", error);
+      });
     if (matchCount && matchCount > 0) {
       setActiveIdx(prev => {
         if (forward) return prev >= matchCount ? 1 : prev + 1;
@@ -35,7 +48,9 @@ export default memo(function FindBar({ tabId, onClose }: Props) {
   }, [tabId, query, matchCount]);
 
   const close = useCallback(() => {
-    invoke("find_in_page", { id: tabId, query: "", forward: true });
+    requestRef.current = 0;
+    invoke("find_in_page", { id: tabId, query: "", forward: true, requestId: ++nextFindRequest })
+      .catch(error => console.warn("[bushido] clear find", error));
     setMatchCount(null);
     setActiveIdx(0);
     onClose();
@@ -43,9 +58,10 @@ export default memo(function FindBar({ tabId, onClose }: Props) {
 
   // reset index when query changes
   useEffect(() => {
-    if (!query) { setMatchCount(null); setActiveIdx(0); }
-    else setActiveIdx(1);
-  }, [query]);
+    requestRef.current = 0;
+    setMatchCount(null);
+    setActiveIdx(query ? 1 : 0);
+  }, [query, tabId]);
 
   const countLabel = matchCount !== null
     ? (matchCount > 0 ? `${Math.min(activeIdx, matchCount)} of ${matchCount}` : "no matches")
@@ -57,7 +73,7 @@ export default memo(function FindBar({ tabId, onClose }: Props) {
         ref={inputRef}
         className="find-input"
         value={query}
-        onChange={e => setQuery(e.target.value)}
+        onChange={e => { requestRef.current = 0; setQuery(e.target.value); }}
         onKeyDown={e => {
           if (e.key === "Enter") find(!e.shiftKey);
           if (e.key === "Escape") close();

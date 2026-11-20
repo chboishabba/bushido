@@ -195,3 +195,7 @@ Test Ctrl+T, Ctrl+W, Ctrl+Shift+T, Ctrl+= and F11 in main, tab and Glance views;
 ## Video and PiP acceptance
 
 Exercise initial/lazy video, removal, background tabs, active-tab switches and navigation reset. Confirm unsupported PiP is reported, disabled video is respected, synthetic overlay clicks cannot activate PiP, and confirmed enter/leave states—not requested toggles—drive the toolbar. Test real WebKitGTK standard API availability; no native detached PiP fallback yet. Frame provenance and URL-level stale messages remain open.
+
+## Linux FindBar acceptance
+
+Search text, quoted/escaped strings and absent terms; test forward/backward and query clearing; issue rapid different queries and switch tabs while a result is outstanding. Linux callback returns the count to the initiating trusted command; do not accept unsolicited page messages as Linux search results. Count is a bounded visible-text estimate, not an exact native find-controller count. Validate runtime on WebKitGTK and Windows.
