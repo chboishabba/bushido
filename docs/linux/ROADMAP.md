@@ -525,3 +525,6 @@ Native vault save dialog polling/read deadline and prior fill callback deadline 
 
 ### P2.4e applied policy prefix v8
 - Same per-page native cancellation state records bounded 128 ordered fixed-route decisions and previous-response presence, saturating omission, page UUID. Fresh v2 challenge returns actual generation/table and prefix; Rust validates each row, explicit empty/truncated/malformed/mismatch. No join by aggregate counts, no document/frame/physical identity or execution authority. Two additional tests, three updated; none run. Native acceptance and independent A/B reconciliation OPEN.
+
+### P2.4e strict offline A/B reconciliation
+- Origin v3 fresh process UUID, fixed origin port and finalization flag; preview v9 includes actual operator origin port. Offline four-receipt consumer validates contracts, distinct runs, matching ports, ADAD and nonempty untruncated native prefix with all four controls and previous-response target, baseline reachability and enabled positive/negative controls. Consistency/contradiction/inconclusive only; no same-run or physical request proof. SHA-256 input commitments, private exclusive output. Five Python tests authored, added local runner stage; none run. ITIR typed joint receipt bridge and independent process/OS linkage OPEN.

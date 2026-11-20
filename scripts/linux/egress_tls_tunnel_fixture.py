@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 
 HOST = "bushido-tunnel.test"
 AUTHORITY = HOST + ":443"
@@ -190,6 +191,8 @@ class Proxy:
             raise ValueError("explicit loopback origin port required")
         self.destination=("127.0.0.1",origin_port)
         self.origin=origin
+        self.run_id=uuid.uuid4().hex
+        self.finalized=False
         self.receipt=receipt
         self.counts=Counter()
         self.listener=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
@@ -200,7 +203,9 @@ class Proxy:
 
     def snapshot(self):
         routes=self.origin.snapshot() if self.origin is not None else {}
-        return {"schema":1,"fixture":"fixed_loopback_tls_tunnel_v2",
+        return {"schema":1,"fixture":"fixed_loopback_tls_tunnel_v3",
+                "fixture_run_id":self.run_id,"finalized":self.finalized,
+                "origin_port":self.destination[1],
                 "state":"proposal_only","native_acceptance":"OPEN",
                 "external_forwarding":False,"dns_bound":False,
                 "counts":dict(self.counts),
@@ -352,6 +357,7 @@ def main():
         pass
     finally:
         origin.shutdown();origin.server_close();worker.join(5)
+        proxy.finalized=not worker.is_alive()
         proxy.write_receipt()
     return 0
 

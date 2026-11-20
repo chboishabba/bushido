@@ -105,7 +105,8 @@ pub(crate) async fn preview(app: &tauri::AppHandle, tab_id: &str)
             let extension=epochs.extension_snapshot(&id,&current_owner,&native)
                 .ok_or("Native extension observation lost")?;
             Ok((serde_json::json!({
-                "version":"bushido.egress.scope_preview.v8",
+                "version":"bushido.egress.scope_preview.v9",
+                "fixture_origin_port":proposal.endpoint.port(),
                 "extension_policy_snapshot":fixture.extension_policy(),
                 "extension_policy_delivery_verified":false,
                 "extension_observation":extension,
