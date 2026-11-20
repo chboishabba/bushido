@@ -326,3 +326,5 @@ Use separate fixed loopback TLS fixture with operator-provided trusted synthetic
 Scoped transport receiver: cargo test dns_scoped_transport or full locked cargo test; synthetic loopback checks numeric peer and opaque relay, exact generation notification/ABA and pending cancellation, mismatched scope and concurrency slots. Test-only admission, no real network or browser route. Native compile/test and kernel dispatch/revocation verification OPEN.
 
 Scoped receiver fixture now uses original wire-to-candidate constructor with synthetic DNS bytes, separate exact approved loopback endpoint, transaction/expiry/stale epoch negative control, bounded test waits. Not actual upstream exchange or native browser run.
+
+Operator scope preview: set explicit workspace ID and printed synthetic TLS origin port only in fresh debug fixture. Main-chrome invocation with tab_id; verify proposal-only response for live ordinary tab at exact fixed root; wrong workspace/tab, stale owner, source URL, policy block, partial startup config, non-main and release fail closed. Same-URL document epoch and actual transport scope admission remain OPEN. Three source tests, not executed.

@@ -275,6 +275,7 @@ def main():
     worker.start()
     proxy.write_receipt()
     print("BUSHIDO_LINUX_EGRESS_FIXTURE_PORT="+str(proxy.listener.getsockname()[1]),flush=True)
+    print("BUSHIDO_LINUX_SCOPE_ORIGIN_PORT="+str(origin.server_port),flush=True)
     print("Private receipt: "+str(proxy.receipt),flush=True)
     try:
         proxy.serve()

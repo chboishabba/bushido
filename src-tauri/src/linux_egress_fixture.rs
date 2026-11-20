@@ -4,6 +4,7 @@ use std::os::unix::fs::MetadataExt;
 
 pub(crate) struct EgressFixture {
     proxy: Option<url::Url>,
+    scope: Option<crate::linux_destination_scope::OperatorScope>,
 }
 
 fn endpoint(raw: &str) -> Result<url::Url, String> {
@@ -33,7 +34,8 @@ fn fresh_root(path: &Path) -> Result<PathBuf, String> {
 impl EgressFixture {
     pub(crate) fn from_environment() -> Result<Self, String> {
         let Some(raw) = std::env::var_os("BUSHIDO_LINUX_EGRESS_FIXTURE_PORT") else {
-            return Ok(Self { proxy: None });
+            let scope = crate::linux_destination_scope::OperatorScope::from_environment(false)?;
+            return Ok(Self { proxy: None, scope });
         };
         if !cfg!(debug_assertions) { return Err("Egress fixture unavailable in release".into()); }
         let proxy = endpoint(raw.to_str().ok_or("Invalid fixture port")?)?;
@@ -51,8 +53,11 @@ impl EgressFixture {
                 }
             }
         }
-        Ok(Self { proxy: Some(proxy) })
+        let scope = crate::linux_destination_scope::OperatorScope::from_environment(true)?;
+        Ok(Self { proxy: Some(proxy), scope })
     }
+
+    pub(crate) fn scope(&self) -> Option<&crate::linux_destination_scope::OperatorScope> { self.scope.as_ref() }
 
     pub(crate) fn proxy(&self) -> Option<url::Url> { self.proxy.clone() }
 
@@ -73,11 +78,11 @@ mod tests {
     }
     #[test]
     fn profile_namespace_preserves_workspace() {
-        let f = EgressFixture { proxy: Some(endpoint("8765").unwrap()) };
+        let f = EgressFixture { proxy: Some(endpoint("8765").unwrap()), scope: None };
         let a = PathBuf::from("linux-workspaces/profile-a");
         let b = PathBuf::from("linux-workspaces/profile-b");
         assert_eq!(f.profile_directory(a.clone()),PathBuf::from("egress-fixture").join(&a));
         assert_ne!(f.profile_directory(a.clone()),f.profile_directory(b));
-        assert_eq!(EgressFixture { proxy: None }.profile_directory(a.clone()),a);
+        assert_eq!(EgressFixture { proxy: None, scope: None }.profile_directory(a.clone()),a);
     }
 }

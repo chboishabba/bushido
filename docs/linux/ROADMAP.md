@@ -497,3 +497,6 @@ Native vault save dialog polling/read deadline and prior fill callback deadline 
 - Internal candidate-consuming test-only loopback transport admission with exact owner/epoch/hostname/IP binding, 8 slots, peer verification, bounded bidirectional opaque relay, per-poll policy check and watch cancellation with deadline. Non-test admits fail closed; no browser IPC, live proxy or trusted real destination producer. Three Rust tests authored, not run. P2.4e live DNS-to-transport scope and P2.4f kernel/network confinement OPEN.
 
 - P2.4e same-constructor follow-up: real primary DoH path and synthetic loopback transport use identical private wire-to-candidate constructor; added mismatched transaction/expiry/stale-generation regression and bounded test waits. Four Rust tests in scoped receiver suite, not executed. Actual external admission remains fail closed.
+
+### P2.4e explicit operator scope preview
+- Debug fixture startup selects fixed synthetic loopback TLS scope with explicit workspace and origin port; native main-only proposal preview uses actual owner/URL and shared blocker, no whitelist override or token. Reject mismatch/rewrite/redirect; recheck owner/URL. Native document epoch and CONNECT-to-view/request attribution OPEN. Transport receiver still test-only; no live authority derived from preview. Three Rust tests authored, not run.

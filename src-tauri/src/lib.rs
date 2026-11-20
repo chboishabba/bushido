@@ -22,6 +22,8 @@ mod screenshot;
 mod linux_desktop_actions;
 #[cfg(target_os = "linux")]
 mod linux_egress_fixture;
+#[cfg(target_os = "linux")]
+mod linux_destination_scope;
 mod sync;
 mod vault;
 
@@ -3989,6 +3991,20 @@ async fn set_dns_level(app: tauri::AppHandle, webview: tauri::Webview, level: St
 struct DnsControl(Option<dns_resolver::ResolverControl>);
 
 #[tauri::command]
+fn linux_egress_scope_preview(app: tauri::AppHandle, webview: tauri::Webview, tab_id: String)
+    -> Result<serde_json::Value,String> {
+    if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
+    #[cfg(all(target_os = "linux",debug_assertions))]
+    {
+        let fixture = app.state::<linux_egress_fixture::EgressFixture>();
+        let scope = fixture.scope().ok_or("No explicit operator fixture scope")?;
+        return linux_destination_scope::preview(&app,&tab_id,scope);
+    }
+    #[cfg(not(all(target_os = "linux",debug_assertions)))]
+    { let _ = (app,tab_id); Err("Local debug scope preview unavailable".into()) }
+}
+
+#[tauri::command]
 fn dns_backend_status(app: tauri::AppHandle, webview: tauri::Webview) -> Result<String, String> {
     if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
     let active = app.state::<DnsControl>().0.is_some();
@@ -4729,6 +4745,7 @@ pub fn run() {
             save_settings,
             set_dns_level,
             dns_backend_status,
+            linux_egress_scope_preview,
             load_settings,
             save_history,
             load_history,
