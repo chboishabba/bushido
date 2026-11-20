@@ -8,8 +8,12 @@ use webkit2gtk::{ffi, FindController, FindControllerExt, LoadEvent, WebView, Web
 const MAX_MATCHES: u32 = 100_000;
 type Reply = oneshot::Sender<Result<u32, String>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase { Searching, Counting }
+
 struct Pending {
     id: u32,
+    phase: Phase,
     reply: Option<Reply>,
 }
 
@@ -53,8 +57,12 @@ thread_local! {
     static FIND_STATES: RefCell<HashMap<usize, Rc<RefCell<SearchState>>>> = RefCell::new(HashMap::new());
 }
 
-fn complete(state: &Rc<RefCell<SearchState>>, controller: &FindController, count: u32) {
-    let pending = state.borrow_mut().pending.take();
+fn complete(state: &Rc<RefCell<SearchState>>, controller: &FindController, phase: Phase, count: u32) {
+    let pending = {
+        let mut data = state.borrow_mut();
+        if !data.pending.as_ref().is_some_and(|pending| pending.phase == phase) { return; }
+        data.pending.take()
+    };
     let Some(pending) = pending else { return; };
     if let Some(reply) = pending.reply {
         // G_MAXUINT denotes count above the engine limit, not an exact count.
@@ -66,6 +74,28 @@ fn complete(state: &Rc<RefCell<SearchState>>, controller: &FindController, count
     }
 }
 
+fn found(state: &Rc<RefCell<SearchState>>, controller: &FindController) {
+    // WebKit bug 325421: older versions report 1 for successful next/previous,
+    // regardless of document match count. Never publish that traversal count.
+    let query = {
+        let mut data = state.borrow_mut();
+        let query = data.current_query.clone();
+        let Some(pending) = data.pending.as_mut() else { return; };
+        if pending.phase != Phase::Searching { return; }
+        if pending.reply.is_some() && query.is_some() {
+            pending.phase = Phase::Counting;
+            query
+        } else { None }
+    };
+    if let Some(query) = query {
+        controller.count_matches(&query,
+            ffi::WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE | ffi::WEBKIT_FIND_OPTIONS_WRAP_AROUND,
+            MAX_MATCHES);
+    } else {
+        complete(state, controller, Phase::Searching, 0);
+    }
+}
+
 fn state_for(view: &WebView, controller: &FindController) -> Rc<RefCell<SearchState>> {
     let key = view.as_ptr() as usize;
     if let Some(state) = FIND_STATES.with(|states| states.borrow().get(&key).cloned()) {
@@ -73,10 +103,12 @@ fn state_for(view: &WebView, controller: &FindController) -> Rc<RefCell<SearchSt
     }
     let state = Rc::new(RefCell::new(SearchState::default()));
     FIND_STATES.with(|states| states.borrow_mut().insert(key, state.clone()));
-    let found = state.clone();
-    controller.connect_found_text(move |controller, count| complete(&found, controller, count));
+    let found_state = state.clone();
+    controller.connect_found_text(move |controller, _| found(&found_state, controller));
     let failed = state.clone();
-    controller.connect_failed_to_find_text(move |controller| complete(&failed, controller, 0));
+    controller.connect_failed_to_find_text(move |controller| complete(&failed, controller, Phase::Searching, 0));
+    let counted = state.clone();
+    controller.connect_counted_matches(move |controller, count| complete(&counted, controller, Phase::Counting, count));
 
     let load_state = state.clone();
     view.connect_load_changed(move |view, event| {
@@ -102,6 +134,8 @@ fn dispatch(view: &WebView, query: String, forward: bool, id: u32, reply: Reply)
     };
     let state = state_for(view, &controller);
     let mut data = state.borrow_mut();
+    // A timed-out Tauri dispatch must not initiate invisible traversal later.
+    if reply.is_closed() && !query.is_empty() { return; }
     if let Err(error) = data.accept_id(id) {
         let _ = reply.send(Err(error));
         return;
@@ -121,7 +155,7 @@ fn dispatch(view: &WebView, query: String, forward: bool, id: u32, reply: Reply)
     }
     let action = action_for(data.current_query.as_deref(), &query, forward);
     data.current_query = Some(query.clone());
-    data.pending = Some(Pending { id, reply: Some(reply) });
+    data.pending = Some(Pending { id, phase: Phase::Searching, reply: Some(reply) });
     drop(data);
 
     // Timeout owns the same native request slot. Do not free it and start
@@ -179,13 +213,14 @@ mod tests {
         assert!(state.accept_id(0).is_err());
         let (tx, mut rx) = oneshot::channel();
         state.current_query = Some("old".into());
-        state.pending = Some(Pending { id: 10, reply: Some(tx) });
+        state.pending = Some(Pending { id: 10, phase: Phase::Counting, reply: Some(tx) });
         assert!(state.accept_id(11).is_ok());
         assert!(!state.invalidate("clear"));
         assert!(state.current_query.is_none());
         assert_eq!(rx.try_recv().unwrap(), Err("clear".into()));
         assert!(state.pending.as_ref().unwrap().reply.is_none());
         assert_eq!(state.pending.as_ref().unwrap().id, 10);
+        assert_eq!(state.pending.as_ref().unwrap().phase, Phase::Counting);
         assert!(state.pending.take().is_some()); // signal drain
         assert!(state.invalidate("clear"));
         assert!(state.accept_id(12).is_ok());

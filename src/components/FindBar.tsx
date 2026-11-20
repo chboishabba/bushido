@@ -23,8 +23,9 @@ export default memo(function FindBar({ tabId, onClose }: Props) {
   }, []);
 
   useEffect(() => {
+    let alive = true;
     const nav = listen<{ id: string; loading: boolean }>("tab-loading", (e) => {
-      if (e.payload.id === tabId && e.payload.loading) {
+      if (alive && e.payload.id === tabId && e.payload.loading) {
         requestRef.current = 0;
         setMatchCount(null);
         setActiveIdx(0);
@@ -33,12 +34,13 @@ export default memo(function FindBar({ tabId, onClose }: Props) {
       }
     });
     const p = listen<{ id: string; count: number; requestId?: number }>("match-count", (e) => {
-      if (e.payload.id === tabId && e.payload.requestId === requestRef.current) {
+      if (alive && requestRef.current !== 0 && e.payload.id === tabId && e.payload.requestId === requestRef.current) {
         setNativeCount(false);
         setMatchCount(e.payload.count);
       }
     });
     return () => {
+      alive = false;
       requestRef.current = 0;
       p.then(u => u());
       nav.then(u => u());
