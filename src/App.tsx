@@ -907,7 +907,7 @@ export default function App() {
       }),
       // vault save prompt from autofill script
       // glance: ephemeral link preview
-      listen<{ url: string; sourceTabId: string; sourceUrl?: string }>("glance-request", (e) => {
+      listen<{ url: string; sourceTabId: string; sourceUrl?: string; sourceGeneration?: string }>("glance-request", (e) => {
         if (glanceRef.current) return;
         const state = useTabStore.getState();
         const src = state.tabs.find(t => t.id === e.payload.sourceTabId);
@@ -927,6 +927,7 @@ export default function App() {
           url: e.payload.url, glanceId, sidebarW: layoutOffsetRef.current,
           topOffset, profileName: src.workspaceId,
           sourceTabId: src.id, sourceUrl: e.payload.sourceUrl ?? src.url,
+          sourceGeneration: e.payload.sourceGeneration ?? null,
           adBlocker: settingsRef.current.adBlocker,
           httpsOnly: settingsRef.current.httpsOnly,
           cookieAutoReject: settingsRef.current.cookieAutoReject,

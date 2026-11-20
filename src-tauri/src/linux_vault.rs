@@ -28,8 +28,8 @@ fn enabled(app: &tauri::AppHandle) -> bool {
     }
 }
 
-fn live(app: &tauri::AppHandle, id: &str, workspace: &str, view: &WebView, href: &str) -> bool {
-    enabled(app) && crate::native_tab_has_workspace(app, id, workspace)
+fn live(app: &tauri::AppHandle, id: &str, owner: &crate::NativeTabOwner, view: &WebView, href: &str) -> bool {
+    enabled(app) && crate::native_tab_matches_owner(app, id, owner)
         && !view.is_loading() && view.uri().as_deref() == Some(href)
         && view.tls_info().is_some_and(|(_, errors)| errors.is_empty())
 }
@@ -88,6 +88,8 @@ async fn select(view: &WebView, origin: &str, choices: &[(String, String)]) -> O
 }
 
 pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str, workspace: &str) -> Result<(), String> {
+    let owner = crate::live_native_tab_owner(app, id).filter(|owner| owner.workspace == workspace)
+        .ok_or("Missing native vault owner")?;
     let app = app.clone();
     let id = id.to_owned();
     let workspace = workspace.to_owned();
@@ -104,28 +106,30 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
         view.connect_context_menu(move |view, menu, _, _| {
             let Some(href) = view.uri().map(|s| s.to_string()) else { return false; };
             let Some(origin) = https_origin(&href) else { return false; };
-            if busy.get() || !live(&app, &id, &workspace, view, &href) { return false; }
+            if busy.get() || !live(&app, &id, &owner, view, &href) { return false; }
             let action = gtk::gio::SimpleAction::new("bushido-fill-saved-login", None);
             let weak = view.downgrade();
             let app = app.clone();
             let id = id.clone();
             let workspace = workspace.clone();
+            let owner = owner.clone();
             let generation = generation.clone();
             let opened = generation.get();
             let busy = busy.clone();
             action.connect_activate(move |_, _| {
                 let Some(view) = weak.upgrade() else { return; };
-                if busy.get() || generation.get() != opened || !live(&app, &id, &workspace, &view, &href) { return; }
+                if busy.get() || generation.get() != opened || !live(&app, &id, &owner, &view, &href) { return; }
                 busy.set(true);
                 let (app, id, origin, href, generation, busy) =
                     (app.clone(), id.clone(), origin.clone(), href.clone(), generation.clone(), busy.clone());
                 let workspace = workspace.clone();
+                let owner = owner.clone();
                 glib::MainContext::default().spawn_local(async move {
                     // One operation per view; reset even on an early return.
                     struct Reset(Rc<Cell<bool>>);
                     impl Drop for Reset { fn drop(&mut self) { self.0.set(false); } }
                     let _reset = Reset(busy);
-                    let valid = || generation.get() == opened && live(&app, &id, &workspace, &view, &href);
+                    let valid = || generation.get() == opened && live(&app, &id, &owner, &view, &href);
                     if !valid() { return; }
                     let epoch = match app.state::<crate::vault::VaultState>().session() {
                         Ok(epoch) => epoch,

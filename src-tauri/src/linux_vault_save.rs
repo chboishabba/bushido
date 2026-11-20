@@ -33,8 +33,8 @@ fn enabled(app: &tauri::AppHandle) -> bool {
     }
 }
 
-fn live(app: &tauri::AppHandle, id: &str, workspace: &str, view: &WebView, href: &str) -> bool {
-    enabled(app) && crate::native_tab_has_workspace(app, id, workspace)
+fn live(app: &tauri::AppHandle, id: &str, owner: &crate::NativeTabOwner, view: &WebView, href: &str) -> bool {
+    enabled(app) && crate::native_tab_matches_owner(app, id, owner)
         && !view.is_loading() && view.uri().as_deref() == Some(href)
         && view.tls_info().is_some_and(|(_, errors)| errors.is_empty())
 }
@@ -95,6 +95,8 @@ async fn approve(view: &WebView, origin: &str, username: &str, valid: &impl Fn()
 }
 
 pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str, workspace: &str) -> Result<(), String> {
+    let owner = crate::live_native_tab_owner(app, id).filter(|owner| owner.workspace == workspace)
+        .ok_or("Missing native vault owner")?;
     let app = app.clone();
     let id = id.to_owned();
     let workspace = workspace.to_owned();
@@ -123,7 +125,7 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                 armed.seen = notice.id;
             }
             let Some(origin) = crate::linux_vault::https_origin(&notice.href) else { return; };
-            if busy.get() || !view.has_focus() || !live(&app, &id, &workspace, &view, &notice.href) {
+            if busy.get() || !view.has_focus() || !live(&app, &id, &owner, &view, &notice.href) {
                 discard(&view, &notice); return;
             }
             let Ok(epoch) = app.state::<crate::vault::VaultState>().session() else {
@@ -134,12 +136,13 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
             busy.set(true);
             let (app, id, workspace, generation, busy) =
                 (app.clone(), id.clone(), workspace.clone(), recv_generation.clone(), busy.clone());
+            let owner = owner.clone();
             glib::MainContext::default().spawn_local(async move {
                 struct Reset(Rc<Cell<bool>>);
                 impl Drop for Reset { fn drop(&mut self) { self.0.set(false); } }
                 let _reset = Reset(busy);
                 let valid = || Instant::now() < deadline && generation.load(Ordering::SeqCst) == opened
-                    && live(&app, &id, &workspace, &view, &notice.href)
+                    && live(&app, &id, &owner, &view, &notice.href)
                     && app.state::<crate::vault::VaultState>().with_session(epoch, || ()).is_ok();
                 if !valid() || !approve(&view, &origin, &notice.username, &valid).await {
                     discard(&view, &notice); return;
@@ -163,7 +166,8 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                 drop(raw);
                 let worker_app = app.clone();
                 let result = tauri::async_runtime::spawn_blocking(move || {
-                    let permitted = || Instant::now() < deadline && generation.load(Ordering::SeqCst) == opened && enabled(&worker_app);
+                    let permitted = || Instant::now() < deadline && generation.load(Ordering::SeqCst) == opened
+                        && enabled(&worker_app) && worker_app.state::<crate::NativeTabOwners>().matches(&id, &owner);
                     crate::vault::native_save_new(&worker_app.state::<crate::vault::VaultState>(),
                         &workspace, &origin, &capture.username, pass.as_str(), epoch, permitted)
                 }).await;

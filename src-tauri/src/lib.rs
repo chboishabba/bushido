@@ -132,8 +132,8 @@ fn live_native_tab_owner(app: &tauri::AppHandle, id: &str) -> Option<NativeTabOw
 }
 
 #[cfg(target_os = "linux")]
-fn native_tab_has_workspace(app: &tauri::AppHandle, id: &str, workspace: &str) -> bool {
-    live_native_tab_owner(app, id).is_some_and(|owner| owner.workspace == workspace)
+fn native_tab_matches_owner(app: &tauri::AppHandle, id: &str, owner: &NativeTabOwner) -> bool {
+    live_native_tab_owner(app, id).as_ref() == Some(owner)
 }
 
 struct GlanceRecord {
@@ -578,6 +578,7 @@ fn linux_glance_preview(link_clicked: bool, user_gesture: bool, redirect: bool,
 
 #[cfg(target_os = "linux")]
 fn install_linux_glance_input(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str) -> Result<(), String> {
+    let owner = live_native_tab_owner(app, id).ok_or("Missing native Glance source ownership")?;
     let handle = app.clone();
     let source_id = id.to_owned();
     webview.with_webview(move |platform| {
@@ -585,7 +586,7 @@ fn install_linux_glance_input(app: &tauri::AppHandle, webview: &tauri::Webview, 
         use webkit2gtk::{ffi, WebViewExt};
         let view = platform.inner();
         wry::set_native_navigation_preview(&view, move |view, action, raw_target| {
-            if !view.has_focus() || handle.state::<PanelState>().ids.lock().contains(&source_id) {
+            if !view.has_focus() || !native_tab_matches_owner(&handle, &source_id, &owner) {
                 return false;
             }
             let Some(pinned) = handle.state::<WebviewState>().linux_pin(&source_id) else { return false; };
@@ -610,7 +611,8 @@ fn install_linux_glance_input(app: &tauri::AppHandle, webview: &tauri::Webview, 
             #[cfg(all(target_os = "linux", debug_assertions))]
             handle.state::<Arc<NativeFilterUpdateState>>().begin_navigation(&source_id);
             handle.emit_to("main", "glance-request", serde_json::json!({
-                "url": target.as_str(), "sourceTabId": source_id, "sourceUrl": source.as_str()
+                "url": target.as_str(), "sourceTabId": source_id, "sourceUrl": source.as_str(),
+                "sourceGeneration": owner.generation.to_string()
             })).is_ok()
         });
     }).map_err(|e| e.to_string())
@@ -692,6 +694,7 @@ mod linux_glance_input_tests {
 // Use WebKit's link hit-test and a user-selected native menu action.
 #[cfg(target_os = "linux")]
 fn install_linux_glance_menu(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str) -> Result<(), String> {
+    let owner = live_native_tab_owner(app, id).ok_or("Missing native Glance source ownership")?;
     let handle = app.clone();
     let source_id = id.to_owned();
     webview.with_webview(move |platform| {
@@ -699,8 +702,7 @@ fn install_linux_glance_menu(app: &tauri::AppHandle, webview: &tauri::Webview, i
         use webkit2gtk::{ContextMenuExt, ContextMenuItem, HitTestResultExt, WebViewExt};
         let view = platform.inner();
         view.connect_context_menu(move |view, menu, _, hit| {
-            if !handle.state::<WebviewState>().tabs.lock().contains_key(&source_id)
-                || handle.state::<PanelState>().ids.lock().contains(&source_id) {
+            if !native_tab_matches_owner(&handle, &source_id, &owner) {
                 return false;
             }
             let Some(link) = hit.link_uri() else { return false; };
@@ -711,12 +713,14 @@ fn install_linux_glance_menu(app: &tauri::AppHandle, webview: &tauri::Webview, i
             let weak_view = view.downgrade();
             let app = handle.clone();
             let id = source_id.clone();
+            let owner = owner.clone();
             action.connect_activate(move |_, _| {
                 let Some(view) = weak_view.upgrade() else { return; };
                 if view.uri().as_ref() != Some(&source) { return; }
-                if !app.state::<WebviewState>().tabs.lock().contains_key(&id) { return; }
+                if !native_tab_matches_owner(&app, &id, &owner) { return; }
                 let _ = app.emit_to("main", "glance-request", serde_json::json!({
-                    "url": target.as_str(), "sourceTabId": id, "sourceUrl": source.as_str()
+                    "url": target.as_str(), "sourceTabId": id, "sourceUrl": source.as_str(),
+                    "sourceGeneration": owner.generation.to_string()
                 }));
             });
             let item = ContextMenuItem::from_gaction(&action, "Open in Glance", None);
@@ -1104,6 +1108,11 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     if !is_panel && !profile_name.as_deref().is_some_and(valid_workspace_identity) {
         return Err("Ordinary tab requires an explicit workspace".into());
     }
+
+    // Serialize native ordinary construction/close against preview lifecycle
+    // admission. This does not acknowledge asynchronous engine destruction.
+    let lifecycle = app.state::<GlanceLifecycle>();
+    let _construction = lifecycle.previews.lock().await;
 
     // https upgrade (conditional on https_only setting)
     let final_url = if url.starts_with("https://") {
@@ -2501,6 +2510,8 @@ async fn resume_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let lifecycle = app.state::<GlanceLifecycle>();
+    let _closure = lifecycle.previews.lock().await;
     crash_log::log_info("close_tab", &format!("id={}", id));
     // Invalidate source ownership before closing/recreating the native view.
     app.state::<NativeTabOwners>().remove(&id);
@@ -2763,7 +2774,7 @@ mod glance_policy_tests {
 }
 
 #[tauri::command]
-async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, sidebar_w: f64, top_offset: f64, profile_name: Option<String>, source_tab_id: String, source_url: Option<String>, ad_blocker: bool,
+async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, sidebar_w: f64, top_offset: f64, profile_name: Option<String>, source_tab_id: String, source_url: Option<String>, source_generation: Option<String>, ad_blocker: bool,
     https_only: Option<bool>, cookie_auto_reject: Option<bool>, block_service_workers: Option<bool>, block_font_enum: Option<bool>,
     disable_autofill: Option<bool>, disable_password_save: Option<bool>) -> Result<(), String> {
     let https_only = https_only.unwrap_or(true);
@@ -2776,6 +2787,10 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
     let mut previews = lifecycle.previews.lock().await;
     let source_owner = live_native_tab_owner(&app, &source_tab_id)
         .ok_or("Glance requires a live ordinary source tab")?;
+    #[cfg(target_os = "linux")]
+    if source_generation.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok()) != Some(source_owner.generation) {
+        return Err("Stale Glance source generation".into());
+    }
     let workspace = source_owner.workspace.clone();
     if profile_name.as_deref() != Some(workspace.as_str()) {
         return Err("Glance source workspace does not match native ownership".into());
@@ -3022,15 +3037,13 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
         crash_log::log_error("linux-download", &e);
     }
 
-    // Register once while still a panel. The native preview handlers
-    // require ordinary-tab membership, so they remain inert until promotion.
+    // Preview receives only non-credential media/cosmetic receivers.
+    // Ordinary navigation preview hooks acquire their owner on promotion.
     let ps = app.state::<PanelState>();
     ps.ids.lock().insert(glance_id.clone());
     #[cfg(target_os = "linux")]
     {
         for (kind, result) in [
-            ("linux-glance", install_linux_glance_menu(&app, &_webview, &glance_id)),
-            ("linux-glance-input", install_linux_glance_input(&app, &_webview, &glance_id)),
             ("linux-media", install_linux_media_receiver(&app, &_webview, &glance_id)),
             ("linux-cosmetic", install_linux_cosmetic_receiver(&app, &_webview, &glance_id, bs.engine.clone(), ad_blocker)),
         ] {
@@ -3089,8 +3102,16 @@ async fn promote_glance(app: tauri::AppHandle, glance_id: String, workspace_id: 
     // Only promotion acquires credential handlers: a preview must not even
     // arm a password capture candidate. The record is consumed exactly once.
     #[cfg(target_os = "linux")]
-    install_linux_vault_hooks(&app, &view, &glance_id, &record.workspace,
-        record.disable_autofill, record.disable_password_save);
+    {
+        for (kind, result) in [
+            ("linux-glance", install_linux_glance_menu(&app, &view, &glance_id)),
+            ("linux-glance-input", install_linux_glance_input(&app, &view, &glance_id)),
+        ] {
+            if let Err(e) = result { crash_log::log_error(kind, &e); }
+        }
+        install_linux_vault_hooks(&app, &view, &glance_id, &record.workspace,
+            record.disable_autofill, record.disable_password_save);
+    }
     previews.remove(&glance_id);
     Ok(())
 }
