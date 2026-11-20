@@ -198,6 +198,8 @@ export default function App() {
   const vaultUnlockedRef = useRef(false);
   const vaultSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const glanceRef = useRef<typeof glance>(null);
+  const glanceReadyRef = useRef<string | null>(null);
+  const glancePromotingRef = useRef<string | null>(null);
   const syncToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const urlBarRef = useRef<HTMLInputElement>(null);
   const initialized = useRef(false);
@@ -918,7 +920,8 @@ export default function App() {
           } catch { return; }
         }
         const glanceId = `glance-${crypto.randomUUID()}`;
-        const g = { id: glanceId, url: e.payload.url, title: e.payload.url, sourceTabId: src.id };
+        const g = { id: glanceId, url: e.payload.url, title: e.payload.url, sourceTabId: src.id, workspaceId: src.workspaceId };
+        glanceReadyRef.current = null;
         glanceRef.current = g;
         setGlance(g);
         invoke("open_glance", {
@@ -926,13 +929,16 @@ export default function App() {
           topOffset, profileName: src.workspaceId,
           adBlocker: settingsRef.current.adBlocker,
         }).then(() => {
-          if (glanceRef.current?.id !== glanceId && !useTabStore.getState().tabs.some(t => t.id === glanceId)) {
+          if (glanceRef.current?.id === glanceId) {
+            glanceReadyRef.current = glanceId;
+          } else if (!useTabStore.getState().tabs.some(t => t.id === glanceId)) {
             invoke("close_glance", { glanceId }).catch(e => console.warn("[bushido]", e));
           }
         }).catch(error => {
           console.warn("[bushido] Glance creation failed", error);
           if (glanceRef.current?.id !== glanceId) return;
           useUiStore.getState().showError("Unable to open Glance");
+          glanceReadyRef.current = null;
           glanceRef.current = null;
           setGlance(null);
         });
@@ -1120,6 +1126,13 @@ export default function App() {
   // --- workspace operations ---
 
   const switchWorkspace = useCallback((wsId: string) => {
+    const g = glanceRef.current;
+    if (g && g.workspaceId !== wsId) {
+      glanceRef.current = null;
+      glanceReadyRef.current = null;
+      setGlance(null);
+      invoke("close_glance", { glanceId: g.id }).catch(e => console.warn("[bushido]", e));
+    }
     setActiveWorkspaceId(wsId);
     setWorkspaces(prev => {
       const ws = prev.find(w => w.id === wsId);
@@ -1295,6 +1308,7 @@ export default function App() {
     // if source tab of glance is being closed, close glance too
     if (glanceRef.current?.sourceTabId === id) {
       invoke("close_glance", { glanceId: glanceRef.current.id }).catch(e => console.warn("[bushido]", e));
+      glanceReadyRef.current = null;
       glanceRef.current = null;
       setGlance(null);
     }
@@ -1436,38 +1450,67 @@ export default function App() {
   const closeGlance = useCallback(() => {
     const g = glanceRef.current;
     if (!g) return;
-    invoke("close_glance", { glanceId: g.id });
+    invoke("close_glance", { glanceId: g.id }).catch(e => console.warn("[bushido]", e));
+    glanceReadyRef.current = null;
     glanceRef.current = null;
     setGlance(null);
     syncLayout();
   }, [syncLayout]);
 
-  const expandGlance = useCallback(() => {
+  const expandGlance = useCallback(async () => {
     const g = glanceRef.current;
-    if (!g) return;
-    invoke("promote_glance", { glanceId: g.id });
-    // add as a real tab in React state — use glance_id as tab id (matches webview label)
-    const newTab: Tab = {
-      id: g.id, url: g.url, title: g.title,
-      loading: false, workspaceId: activeWorkspaceId, lastActiveAt: Date.now()
-    };
-    setTabs(prev => [...prev, newTab]);
-    setWorkspaces(prev => prev.map(w => w.id === activeWorkspaceId ? { ...w, activeTabId: g.id, paneLayout: undefined } : w));
-    glanceRef.current = null;
-    setGlance(null);
-    // syncLayout will be called by the workspace/tab update effects
-    setTimeout(() => syncLayout(), 50);
-  }, [activeWorkspaceId, syncLayout]);
+    if (!g || glancePromotingRef.current === g.id) return;
+    if (glanceReadyRef.current !== g.id) {
+      showError("Glance is still opening");
+      return;
+    }
+    const initial = useTabStore.getState();
+    if (initial.activeWorkspaceId !== g.workspaceId || !initial.tabs.some(t => t.id === g.sourceTabId && t.workspaceId === g.workspaceId)) {
+      closeGlance();
+      return;
+    }
+    glancePromotingRef.current = g.id;
+    try {
+      await invoke("promote_glance", { glanceId: g.id, workspaceId: g.workspaceId });
+      const current = glanceRef.current;
+      const state = useTabStore.getState();
+      if (current?.id !== g.id || state.activeWorkspaceId !== g.workspaceId ||
+          !state.tabs.some(t => t.id === g.sourceTabId && t.workspaceId === g.workspaceId)) {
+        // A close or workspace change won while native promotion was pending.
+        // Since promotion succeeded, only close_tab may dispose this view.
+        await invoke("close_tab", { id: g.id });
+        if (glanceRef.current?.id === g.id) {
+          glanceRef.current = null;
+          glanceReadyRef.current = null;
+          setGlance(null);
+        }
+        return;
+      }
+      const newTab: Tab = {
+        id: current.id, url: current.url, title: current.title,
+        loading: false, workspaceId: g.workspaceId, lastActiveAt: Date.now()
+      };
+      setTabs(prev => prev.some(t => t.id === newTab.id) ? prev : [...prev, newTab]);
+      setWorkspaces(prev => prev.map(w => w.id === g.workspaceId ? { ...w, activeTabId: g.id, paneLayout: undefined } : w));
+      glanceReadyRef.current = null;
+      glanceRef.current = null;
+      setGlance(null);
+    } catch (error) {
+      console.warn("[bushido] Glance promotion failed", error);
+      if (glanceRef.current?.id === g.id) showError("Unable to promote Glance");
+    } finally {
+      if (glancePromotingRef.current === g.id) glancePromotingRef.current = null;
+    }
+  }, [closeGlance, showError]);
 
   const splitGlance = useCallback(() => {
     const g = glanceRef.current;
-    if (!g) return;
-    invoke("close_glance", { glanceId: g.id });
-    glanceRef.current = null;
-    setGlance(null);
-    // open URL as a new tab (addTab will handle layout)
+    if (!g || glancePromotingRef.current === g.id) return;
+    if (useTabStore.getState().activeWorkspaceId !== g.workspaceId) { closeGlance(); return; }
+    closeGlance();
+    // Existing split action recreates a tab only in the source workspace.
     addTab(g.url);
-  }, [addTab]);
+  }, [addTab, closeGlance]);
 
   const toggleCollapse = useCallback((id: string) => {
     setTabs(prev => prev.map(t => t.id === id ? { ...t, collapsed: !t.collapsed } : t));

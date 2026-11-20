@@ -69,6 +69,13 @@ struct PanelState {
     ids: Mutex<HashSet<String>>,
 }
 
+// Serializes native preview construction, closure and promotion. Map entries
+// represent only successfully constructed previews, not promoted tabs.
+#[derive(Default)]
+struct GlanceLifecycle {
+    previews: tokio::sync::Mutex<HashMap<String, String>>,
+}
+
 // Each asynchronous WebKitGTK filter compilation carries a monotonically
 // increasing ticket. Only the most recently requested ticket for a tab may
 // mutate that tab's content manager. Tickets never reset when tab IDs reuse.
@@ -630,6 +637,10 @@ fn install_linux_glance_menu(app: &tauri::AppHandle, webview: &tauri::Webview, i
         use webkit2gtk::{ContextMenuExt, ContextMenuItem, HitTestResultExt, WebViewExt};
         let view = platform.inner();
         view.connect_context_menu(move |view, menu, _, hit| {
+            if !handle.state::<WebviewState>().tabs.lock().contains_key(&source_id)
+                || handle.state::<PanelState>().ids.lock().contains(&source_id) {
+                return false;
+            }
             let Some(link) = hit.link_uri() else { return false; };
             let Some(target) = linux_glance_url(link.as_str()) else { return false; };
             let Some(source) = view.uri() else { return false; };
@@ -1436,8 +1447,6 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
         let cosmetic_app = app.clone();
         let cosmetic_id = id.clone();
         let cosmetic_engine = engine.clone();
-        let media_app = app.clone();
-        let media_id = id.clone();
         webview.with_webview(move |platform| {
             let view = platform.inner();
             let Some(manager) = view.user_content_manager() else { return; };
@@ -1496,72 +1505,12 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 crash_log::log_error("cosmetic-ipc", "Unable to register Linux cosmetic channel");
             }
 
-            // Media telemetry is deliberately separate from privileged
-            // shortcuts, vault access, navigation and general Tauri IPC.
-            let weak_media_view = gtk::prelude::ObjectExt::downgrade(&view);
-            let last_media = std::cell::Cell::new(None::<std::time::Instant>);
-            let last_video = std::cell::Cell::new(None::<std::time::Instant>);
-            manager.connect_script_message_received(Some("bushidoMedia"), move |_, message| {
-                let Some(view) = weak_media_view.upgrade() else { return; };
-                let Some(uri) = view.uri() else { return; };
-                let Ok(url) = url::Url::parse(uri.as_str()) else { return; };
-                if !matches!(url.scheme(), "http" | "https") { return; }
-                let now = std::time::Instant::now();
-                let Some(value) = message.js_value() else { return; };
-                let raw = value.to_string();
-                if raw.len() > 8192 { return; }
-                let Ok(msg) = serde_json::from_str::<serde_json::Value>(&raw) else { return; };
-                if msg.get("url").and_then(|v| v.as_str()) != Some(uri.as_str()) { return; }
-                let kind = msg.get("__bushido").and_then(|v| v.as_str());
-                if kind == Some("video") {
-                    if last_video.get().is_some_and(|last| now.duration_since(last).as_millis() < 200) {
-                        return;
-                    }
-                    let (Some(has), Some(supported), Some(active)) = (
-                        msg.get("hasVideo").and_then(|v| v.as_bool()),
-                        msg.get("pipSupported").and_then(|v| v.as_bool()),
-                        msg.get("pipActive").and_then(|v| v.as_bool()),
-                    ) else { return; };
-                    last_video.set(Some(now));
-                    let _ = media_app.emit_to("main", "tab-has-video", serde_json::json!({
-                        "id": media_id, "hasVideo": has, "pipSupported": supported, "pipActive": active
-                    }));
-                    return;
-                }
-                if kind != Some("media") { return; }
-                if last_media.get().is_some_and(|last| now.duration_since(last).as_millis() < 200) {
-                    return;
-                }
-                let Some(state) = msg.get("state").and_then(|v| v.as_str()) else { return; };
-                if !matches!(state, "playing" | "paused" | "ended") { return; }
-                let clean = |s: &str| -> String {
-                    s.chars().filter(|c| !c.is_control() && *c != '<' && *c != '>')
-                        .take(256).collect()
-                };
-                let mut payload = serde_json::json!({
-                    "id": media_id, "state": state,
-                    "title": clean(msg.get("title").and_then(|v| v.as_str()).unwrap_or(""))
-                });
-                for key in ["artist", "metaTitle"] {
-                    if let Some(value) = msg.get(key).and_then(|v| v.as_str()) {
-                        payload[key] = serde_json::json!(clean(value));
-                    }
-                }
-                for key in ["currentTime", "duration", "playbackRate"] {
-                    if let Some(value) = msg.get(key).and_then(|v| v.as_f64()) {
-                        if value.is_finite() && value >= 0.0 {
-                            payload[key] = serde_json::json!(value);
-                        }
-                    }
-                }
-                last_media.set(Some(now));
-                let _ = media_app.emit_to("main", "tab-media-state", payload);
-            });
-            if !manager.register_script_message_handler("bushidoMedia") {
-                crash_log::log_error("media-ipc", "Unable to register Linux media channel");
-            }
+
         }).map_err(|e| e.to_string())?;
     }
+
+    #[cfg(target_os = "linux")]
+    install_linux_media_receiver(&app, &webview, &id)?;
 
     // intercept downloads + ad blocking via WebView2 COM API
     #[cfg(windows)]
@@ -2687,8 +2636,91 @@ async fn clear_network_log(app: tauri::AppHandle, tab_id: String) -> Result<(), 
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn install_linux_media_receiver(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str) -> Result<(), String> {
+    let media_app = app.clone();
+    let media_id = id.to_owned();
+    webview.with_webview(move |platform| {
+        use webkit2gtk::{UserContentManagerExt, WebViewExt};
+        use javascriptcore::ValueExt;
+        let view = platform.inner();
+        let Some(manager) = view.user_content_manager() else { return; };
+        // Media telemetry is deliberately separate from privileged
+        // shortcuts, vault access, navigation and general Tauri IPC.
+        let weak_media_view = gtk::prelude::ObjectExt::downgrade(&view);
+        let last_media = std::cell::Cell::new(None::<std::time::Instant>);
+        let last_video = std::cell::Cell::new(None::<std::time::Instant>);
+        manager.connect_script_message_received(Some("bushidoMedia"), move |_, message| {
+            let Some(view) = weak_media_view.upgrade() else { return; };
+            let Some(uri) = view.uri() else { return; };
+            let Ok(url) = url::Url::parse(uri.as_str()) else { return; };
+            if !matches!(url.scheme(), "http" | "https") { return; }
+            let now = std::time::Instant::now();
+            let Some(value) = message.js_value() else { return; };
+            let raw = value.to_string();
+            if raw.len() > 8192 { return; }
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(&raw) else { return; };
+            if msg.get("url").and_then(|v| v.as_str()) != Some(uri.as_str()) { return; }
+            let kind = msg.get("__bushido").and_then(|v| v.as_str());
+            if kind == Some("video") {
+                if last_video.get().is_some_and(|last| now.duration_since(last).as_millis() < 200) {
+                    return;
+                }
+                let (Some(has), Some(supported), Some(active)) = (
+                    msg.get("hasVideo").and_then(|v| v.as_bool()),
+                    msg.get("pipSupported").and_then(|v| v.as_bool()),
+                    msg.get("pipActive").and_then(|v| v.as_bool()),
+                ) else { return; };
+                last_video.set(Some(now));
+                let _ = media_app.emit_to("main", "tab-has-video", serde_json::json!({
+                    "id": media_id, "hasVideo": has, "pipSupported": supported, "pipActive": active
+                }));
+                return;
+            }
+            if kind != Some("media") { return; }
+            if last_media.get().is_some_and(|last| now.duration_since(last).as_millis() < 200) {
+                return;
+            }
+            let Some(state) = msg.get("state").and_then(|v| v.as_str()) else { return; };
+            if !matches!(state, "playing" | "paused" | "ended") { return; }
+            let clean = |s: &str| -> String {
+                s.chars().filter(|c| !c.is_control() && *c != '<' && *c != '>')
+                    .take(256).collect()
+            };
+            let mut payload = serde_json::json!({
+                "id": media_id, "state": state,
+                "title": clean(msg.get("title").and_then(|v| v.as_str()).unwrap_or(""))
+            });
+            for key in ["artist", "metaTitle"] {
+                if let Some(value) = msg.get(key).and_then(|v| v.as_str()) {
+                    payload[key] = serde_json::json!(clean(value));
+                }
+            }
+            for key in ["currentTime", "duration", "playbackRate"] {
+                if let Some(value) = msg.get(key).and_then(|v| v.as_f64()) {
+                    if value.is_finite() && value >= 0.0 {
+                        payload[key] = serde_json::json!(value);
+                    }
+                }
+            }
+            last_media.set(Some(now));
+            let _ = media_app.emit_to("main", "tab-media-state", payload);
+        });
+        if !manager.register_script_message_handler("bushidoMedia") {
+            crash_log::log_error("media-ipc", "Unable to register Linux media channel");
+        }
+    }).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, sidebar_w: f64, top_offset: f64, profile_name: Option<String>, ad_blocker: bool) -> Result<(), String> {
+    let lifecycle = app.state::<GlanceLifecycle>();
+    let mut previews = lifecycle.previews.lock().await;
+    let workspace = profile_name.as_ref().filter(|s| !s.is_empty())
+        .ok_or("Glance requires an originating workspace")?.clone();
+    if previews.contains_key(&glance_id) || app.get_webview(&glance_id).is_some() {
+        return Err("Glance ID is already in use".into());
+    }
     let window = app.get_window("main").ok_or("no main window")?;
     let size = window.inner_size().map_err(|e| e.to_string())?;
     let scale = window.scale_factor().map_err(|e| e.to_string())?;
@@ -2823,6 +2855,22 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
         true
     });
 
+    let glance_title_app = app.clone();
+    let glance_title_id = glance_id.clone();
+    let glance_load_app = app.clone();
+    let glance_load_id = glance_id.clone();
+    builder = builder.on_document_title_changed(move |_, title| {
+        let clean = title.replace(|c: char| c == '<' || c == '>', "");
+        let _ = glance_title_app.emit_to("main", "tab-title-changed", serde_json::json!({
+            "id": glance_title_id, "title": clean
+        }));
+    }).on_page_load(move |_, payload| {
+        let loading = matches!(payload.event(), tauri::webview::PageLoadEvent::Started);
+        let _ = glance_load_app.emit_to("main", "tab-loading", serde_json::json!({
+            "id": glance_load_id, "loading": loading
+        }));
+    });
+
     #[cfg(not(target_os = "linux"))]
     { builder = builder.initialization_script(&shortcut_s); }
     builder = builder.initialization_script(&media_s);
@@ -2854,42 +2902,65 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
         crash_log::log_error("linux-download", &e);
     }
 
-    // register as panel so layout_webviews skips it
+    // Register once while still a panel. The native preview handlers
+    // require ordinary-tab membership, so they remain inert until promotion.
     let ps = app.state::<PanelState>();
-    ps.ids.lock().insert(glance_id);
+    ps.ids.lock().insert(glance_id.clone());
+    #[cfg(target_os = "linux")]
+    {
+        for (kind, result) in [
+            ("linux-glance", install_linux_glance_menu(&app, &_webview, &glance_id)),
+            ("linux-glance-input", install_linux_glance_input(&app, &_webview, &glance_id)),
+            ("linux-media", install_linux_media_receiver(&app, &_webview, &glance_id)),
+        ] {
+            if let Err(e) = result { crash_log::log_error(kind, &e); }
+        }
+    }
+    previews.insert(glance_id, workspace);
 
     Ok(())
 }
 
 #[tauri::command]
 async fn close_glance(app: tauri::AppHandle, glance_id: String) -> Result<(), String> {
+    let lifecycle = app.state::<GlanceLifecycle>();
+    let mut previews = lifecycle.previews.lock().await;
+    // A stale preview close must never destroy a promoted ordinary tab.
+    if !previews.contains_key(&glance_id) { return Ok(()); }
+    if let Some(wv) = app.get_webview(&glance_id) {
+        wv.close().map_err(|e| e.to_string())?;
+    }
+    previews.remove(&glance_id);
     #[cfg(all(target_os = "linux", debug_assertions))]
     app.state::<Arc<NativeFilterUpdateState>>().forget(&glance_id);
-    // unregister from panels
-    let ps = app.state::<PanelState>();
-    ps.ids.lock().remove(&glance_id);
-
-    // destroy webview
-    if let Some(wv) = app.get_webview(&glance_id) {
-        let _ = wv.close();
-    }
+    app.state::<PanelState>().ids.lock().remove(&glance_id);
     Ok(())
 }
 
 #[tauri::command]
-async fn promote_glance(app: tauri::AppHandle, glance_id: String) -> Result<(), String> {
-    // unregister from panels
+async fn promote_glance(app: tauri::AppHandle, glance_id: String, workspace_id: String) -> Result<(), String> {
+    let lifecycle = app.state::<GlanceLifecycle>();
+    let mut previews = lifecycle.previews.lock().await;
+    if previews.get(&glance_id) != Some(&workspace_id) {
+        return Err("Glance is not a live preview in this workspace".into());
+    }
+    if app.get_webview(&glance_id).is_none() {
+        return Err("Glance WebView is missing".into());
+    }
     let ps = app.state::<PanelState>();
-    ps.ids.lock().remove(&glance_id);
+    if !ps.ids.lock().contains(&glance_id) {
+        return Err("Glance panel is missing".into());
+    }
 
-    // register as a normal tab in WebviewState using the glance_id as tab id
-    // (the webview label IS the glance_id, so layout_webviews can find it)
+    // Same native WebView, same workspace context, no request replay and
+    // no duplicate download/media/filter handler registration.
     let ws = app.state::<WebviewState>();
     #[cfg(target_os = "linux")]
-    ws.register_linux_tab(glance_id, false, false);
+    ws.register_linux_tab(glance_id.clone(), false, false);
     #[cfg(not(target_os = "linux"))]
-    ws.tabs.lock().insert(glance_id, false);
-
+    ws.tabs.lock().insert(glance_id.clone(), false);
+    ps.ids.lock().remove(&glance_id);
+    previews.remove(&glance_id);
     Ok(())
 }
 
@@ -4047,6 +4118,7 @@ pub fn run() {
         .manage(PanelState {
             ids: Mutex::new(HashSet::new()),
         })
+        .manage(GlanceLifecycle::default())
         .manage(PreloadState {
             url: Mutex::new(None),
             webview_id: Mutex::new(None),
