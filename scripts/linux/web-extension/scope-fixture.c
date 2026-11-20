@@ -115,7 +115,7 @@ static void page_created(WebKitWebExtension *extension, WebKitWebPage *page,
     if (g_object_get_data(G_OBJECT(page),"bushido-fixture-state")) {g_free(state);return;}
     gchar *id=g_uuid_string_random();
     guint j=0;
-    for (const gchar *p=id;*p;p++) if (*p!=\'-\' && j<32) state->page_id[j++]=*p;
+    for (const gchar *p=id;*p;p++) if (*p!='-' && j<32) state->page_id[j++]=*p;
     g_free(id);
     state->initialized=initialized;
     memcpy(state->received,received,sizeof(state->received));
