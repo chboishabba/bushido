@@ -2749,6 +2749,63 @@ fn install_linux_media_receiver(app: &tauri::AppHandle, webview: &tauri::Webview
     }).map_err(|e| e.to_string())
 }
 
+fn glance_navigation_allowed(destination: &url::Url, https_only: bool) -> bool {
+    matches!(destination.scheme(), "http" | "https")
+        && destination.host_str().is_some()
+        && destination.username().is_empty() && destination.password().is_none()
+        && (!https_only || destination.scheme() == "https")
+}
+
+fn glance_initial_url(raw: &str, https_only: bool) -> Result<url::Url, String> {
+    let mut requested = url::Url::parse(raw).map_err(|_| "Invalid Glance URL")?;
+    if !glance_navigation_allowed(&requested, false) {
+        return Err("Glance requires an HTTP(S) destination without embedded credentials".into());
+    }
+    if https_only && requested.scheme() == "http" {
+        requested.set_scheme("https").map_err(|_| "HTTPS upgrade failed")?;
+    }
+    Ok(requested)
+}
+
+#[cfg(test)]
+mod glance_policy_tests {
+    use super::*;
+
+    #[test]
+    fn initial_destination_upgrades_and_navigation_refuses_http() {
+        let initial = glance_initial_url("http://example.test/a?q=1", true).unwrap();
+        assert_eq!(initial.as_str(), "https://example.test/a?q=1");
+        let http = url::Url::parse("http://example.test/").unwrap();
+        assert!(glance_navigation_allowed(&http, false));
+        assert!(!glance_navigation_allowed(&http, true));
+        assert!(glance_navigation_allowed(&initial, true));
+        assert_eq!(glance_initial_url("http://example.test/", false).unwrap(), http);
+    }
+
+    #[test]
+    fn unsafe_destinations_rejected_at_both_boundaries() {
+        for raw in ["javascript:alert(1)", "file:///tmp/example", "data:text/plain,example",
+            "ftp://example.test/", "https://alice:secret@example.test/", "https://alice@example.test/"] {
+            let url = url::Url::parse(raw).unwrap();
+            assert!(!glance_navigation_allowed(&url, false));
+            assert!(glance_initial_url(raw, false).is_err());
+        }
+    }
+
+    #[test]
+    fn shared_hardening_respects_independent_policy_flags() {
+        assert!(document_security_script(false, false).is_empty());
+        let sw = document_security_script(true, false);
+        assert!(sw.contains("navigator.serviceWorker"));
+        assert!(!sw.contains("document.fonts"));
+        let fonts = document_security_script(false, true);
+        assert!(!fonts.contains("navigator.serviceWorker"));
+        assert!(fonts.contains("document.fonts"));
+        let both = document_security_script(true, true);
+        assert!(both.contains("navigator.serviceWorker") && both.contains("document.fonts"));
+    }
+}
+
 #[tauri::command]
 async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, sidebar_w: f64, top_offset: f64, profile_name: Option<String>, ad_blocker: bool,
     https_only: Option<bool>, cookie_auto_reject: Option<bool>, block_service_workers: Option<bool>, block_font_enum: Option<bool>,
@@ -2757,16 +2814,7 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
     let cookie_auto_reject = cookie_auto_reject.unwrap_or(false);
     let disable_autofill = disable_autofill.unwrap_or(true);
     let disable_password_save = disable_password_save.unwrap_or(true);
-    let requested = url::Url::parse(&url).map_err(|_| "Invalid Glance URL")?;
-    if !matches!(requested.scheme(), "http" | "https") || requested.host_str().is_none()
-        || !requested.username().is_empty() || requested.password().is_some() {
-        return Err("Glance requires an HTTP(S) destination without embedded credentials".into());
-    }
-    let mut requested = requested;
-    if https_only && requested.scheme() == "http" {
-        requested.set_scheme("https").map_err(|_| "HTTPS upgrade failed")?;
-    }
-    let url = requested.to_string();
+    let url = glance_initial_url(&url, https_only)?.to_string();
     let security_js = document_security_script(block_service_workers.unwrap_or(false), block_font_enum.unwrap_or(false));
     let lifecycle = app.state::<GlanceLifecycle>();
     let mut previews = lifecycle.previews.lock().await;
@@ -2848,9 +2896,7 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
         let sequence = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
             Some(glance_app_nav.state::<Arc<NativeFilterUpdateState>>().begin_navigation(&glance_id_nav))
         } else { None };
-        if is_blocked_scheme(&destination_url) || !matches!(destination.scheme(), "http" | "https")
-            || destination.host_str().is_none() || !destination.username().is_empty() || destination.password().is_some()
-            || (https_only && destination.scheme() == "http") {
+        if !glance_navigation_allowed(destination, https_only) {
             return false;
         }
 

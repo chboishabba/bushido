@@ -297,6 +297,10 @@ export default function App() {
 
     invoke("layout_webviews", { panes, focusedTabId: w.activeTabId, sidebarW: layoutOffset, topOffset });
   }, [activeWs, tabs, layoutOffset, topOffset]);
+  // The long-lived native event listener must restore the *current* layout,
+  // not the initial render's stale workspace or tab array.
+  const syncLayoutRef = useRef(syncLayout);
+  syncLayoutRef.current = syncLayout;
 
   // restore session or create first tab
   useEffect(() => {
@@ -952,6 +956,7 @@ export default function App() {
           glanceReadyRef.current = null;
           glanceRef.current = null;
           setGlance(null);
+          syncLayoutRef.current();
         });
         // hide tab webviews so overlay is visible
         invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffsetRef.current, topOffset });
