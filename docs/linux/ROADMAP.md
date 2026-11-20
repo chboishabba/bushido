@@ -456,3 +456,5 @@ Native vault save dialog polling/read deadline and prior fill callback deadline 
 
 ### P5.1 exact-commit source candidate (partial source)
 - Added local Git archive generator with full tracked-blob and executable-mode verification, lockfile dependency inventory, local fork license declarations, notice paths and filter/scriptlet hash/header evidence. Candidate publication explicitly false and corresponding-source review OPEN. Five synthetic Git regression tests written; native/user acceptance pending. External dependency sources, actual binary closure, third-party license texts and distribution review remain OPEN. See SOURCE_DISTRIBUTION.md. No hosted CI.
+
+- Source candidate synthetic regression suite included in both local preflight and the consolidated receipt runner (now 16 stages). Prevent Python import cache from dirtying the checkout. Tests remain queued for user-side execution; no hosted CI.

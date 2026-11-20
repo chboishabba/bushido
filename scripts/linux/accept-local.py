@@ -110,6 +110,7 @@ def execute(root, out):
         ("filter_fixture", "compile_webkit_subset.py", "--test"),
     ):
         stage(name, [sys.executable, "scripts/linux/" + file, flag])
+    stage("source_candidate_fixture", [sys.executable, "scripts/linux/test-source-candidate.py"])
     stage("npm_install", ["npm", "ci"], ("node", "npm"))
     stage("frontend_build", ["npm", "run", "build"], ("npm_install",))
     stage("frontend_test", ["npm", "test"], ("npm_install",))

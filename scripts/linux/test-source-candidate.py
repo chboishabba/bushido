@@ -4,9 +4,11 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
+sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("source_candidate", Path(__file__).with_name("source-candidate.py"))
 source = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(source)
