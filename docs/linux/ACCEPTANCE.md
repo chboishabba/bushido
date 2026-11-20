@@ -274,3 +274,5 @@ Add delayed native Glance event/menu activation after source close/recreate with
 
 ### P5.1 Linux candidate package
 Follow docs/linux/PACKAGING.md. Local static package-check self-test 9/9 synthetic archives PASS; actual Bushido compile/build remains OPEN. Build on clean pinned native host, inspect exact candidate and receipt, resolve DT_NEEDED and package dependencies, check signed upstream update channel absent Linux, desktop icon/name/category/exec and no MIME/default browser association, license/source offer, install/launch/restart/uninstall in disposable profile and Windows NSIS regression. Two independent builds must demonstrate reproducibility before marking it. No production release approval implied.
+
+P5.1 local build script syntax PASS and missing-tool fail-fast exit 2 verified on exact blob `0f2e8fb2986c6e56e003851bb73dab3a47cd9d2f`; native dependency/compiler gate remains OPEN. Static checker now runs from local preflight. No installer exists from this run.

@@ -46,3 +46,7 @@ The self-test builds tiny synthetic Debian archives using /bin/true only as an E
 Use a disposable clean Linux VM or test profile. Inspect artifact digest, control metadata, full package contents and dependency resolution before installation. Install with the distribution package manager; do not install as an upgrade over real user data. Verify launcher, initial window, remote navigation, workspace cookies, vault/keyring behavior, native download persistence, permissions, X11 and Wayland behavior. Confirm no Linux upstream binary-updater request. Uninstall and check desktop entries/binary removed while user data remain intact. Verify no default-handler or MIME change. Repeat the Windows NSIS build and updater regression separately. Only a reviewed source archive and successful native acceptance may advance the release gate.
 
 References: Tauri Debian distribution documentation https://v2.tauri.app/distribute/debian/; pinned CLI 2.10.0 build.rs and tauri-utils 2.8.2 DebConfig. The local branch retains original upstream source provenance.
+
+## Local execution receipt
+
+Debian 13.3 container, Node 22.16.0: static synthetic archive checks 9/9 PASS; build script `bash -n` PASS; invocation stopped on missing `rustc` (exit 2, as designed). Cargo and the GTK/WebKitGTK/libsoup development pkg-config packages are also absent. Neither actual Bushido compilation nor a .deb was produced. Exact tested checker blob `97694456e37fc024a9b686144a080767efd3b3c6`, build script blob `0f2e8fb2986c6e56e003851bb73dab3a47cd9d2f`.
