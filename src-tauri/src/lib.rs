@@ -26,6 +26,43 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 struct WebviewState {
     tabs: Mutex<HashMap<String, bool>>,
+    #[cfg(target_os = "linux")]
+    pinned: Mutex<HashSet<String>>,
+}
+
+#[cfg(target_os = "linux")]
+impl WebviewState {
+    // Keep the existing tabs map's boolean semantics. Always lock tabs
+    // before pinned, so registering/closing a tab and reading its pin
+    // state cannot observe a mismatched pair.
+    fn register_linux_tab(&self, id: String, ordinary: bool, pinned: bool) {
+        let mut tabs = self.tabs.lock();
+        let mut pins = self.pinned.lock();
+        if pinned { pins.insert(id.clone()); } else { pins.remove(&id); }
+        tabs.insert(id, ordinary);
+    }
+
+    fn unregister_linux_tab(&self, id: &str) {
+        let mut tabs = self.tabs.lock();
+        let mut pins = self.pinned.lock();
+        tabs.remove(id);
+        pins.remove(id);
+    }
+
+    fn linux_pin(&self, id: &str) -> Option<bool> {
+        let tabs = self.tabs.lock();
+        if !tabs.contains_key(id) { return None; }
+        Some(self.pinned.lock().contains(id))
+    }
+
+    fn set_linux_pin(&self, id: &str, pinned: bool) {
+        let tabs = self.tabs.lock();
+        // Internal or destroyed tabs have no native view. Their persisted
+        // frontend flag is supplied to the next create_tab call.
+        if !tabs.contains_key(id) { return; }
+        let mut pins = self.pinned.lock();
+        if pinned { pins.insert(id.to_owned()); } else { pins.remove(id); }
+    }
 }
 
 struct PanelState {
@@ -448,9 +485,26 @@ fn linux_glance_url(raw: &str) -> Option<url::Url> {
 fn linux_glance_alt_click(link_clicked: bool, user_gesture: bool, redirect: bool,
     button: u32, modifiers: u32) -> bool {
     use gtk::gdk::ModifierType as M;
+    linux_glance_direct_click(link_clicked, user_gesture, redirect, button, modifiers)
+        && modifiers & M::MOD1_MASK.bits() != 0
+}
+
+#[cfg(target_os = "linux")]
+fn linux_glance_direct_click(link_clicked: bool, user_gesture: bool, redirect: bool,
+    button: u32, modifiers: u32) -> bool {
+    use gtk::gdk::ModifierType as M;
     let conflicting = (M::CONTROL_MASK | M::SHIFT_MASK | M::SUPER_MASK | M::META_MASK | M::HYPER_MASK).bits();
-    link_clicked && user_gesture && !redirect && button == 1
-        && modifiers & M::MOD1_MASK.bits() != 0 && modifiers & conflicting == 0
+    link_clicked && user_gesture && !redirect && button == 1 && modifiers & conflicting == 0
+}
+
+#[cfg(target_os = "linux")]
+fn linux_glance_preview(link_clicked: bool, user_gesture: bool, redirect: bool,
+    button: u32, modifiers: u32, pinned: bool, source: &url::Url, target: &url::Url) -> bool {
+    // Exactly the original Glance listener's hostname comparison, not an
+    // origin comparison: different ports/schemes on one host do not auto-preview.
+    linux_glance_alt_click(link_clicked, user_gesture, redirect, button, modifiers)
+        || (pinned && source.host_str() != target.host_str()
+            && linux_glance_direct_click(link_clicked, user_gesture, redirect, button, modifiers))
 }
 
 #[cfg(target_os = "linux")]
@@ -462,23 +516,25 @@ fn install_linux_glance_input(app: &tauri::AppHandle, webview: &tauri::Webview, 
         use webkit2gtk::{ffi, WebViewExt};
         let view = platform.inner();
         wry::set_native_navigation_preview(&view, move |view, action, raw_target| {
-            if !view.has_focus() || !handle.state::<WebviewState>().tabs.lock().contains_key(&source_id) {
+            if !view.has_focus() || handle.state::<PanelState>().ids.lock().contains(&source_id) {
                 return false;
             }
+            let Some(pinned) = handle.state::<WebviewState>().linux_pin(&source_id) else { return false; };
+            let Some(target) = linux_glance_url(raw_target) else { return false; };
+            let Some(source) = view.uri().and_then(|uri| linux_glance_url(uri.as_str())) else { return false; };
             // Read the native action metadata synchronously; never retain its pointer.
             let ptr: *mut ffi::WebKitNavigationAction = action.to_glib_none().0;
             let preview = unsafe {
-                linux_glance_alt_click(
+                linux_glance_preview(
                     ffi::webkit_navigation_action_get_navigation_type(ptr) == ffi::WEBKIT_NAVIGATION_TYPE_LINK_CLICKED,
                     ffi::webkit_navigation_action_is_user_gesture(ptr) != 0,
                     ffi::webkit_navigation_action_is_redirect(ptr) != 0,
                     ffi::webkit_navigation_action_get_mouse_button(ptr),
                     ffi::webkit_navigation_action_get_modifiers(ptr),
+                    pinned, &source, &target,
                 )
             };
             if !preview { return false; }
-            let Some(target) = linux_glance_url(raw_target) else { return false; };
-            let Some(source) = view.uri().and_then(|uri| linux_glance_url(uri.as_str())) else { return false; };
             // No ordinary source-tab navigation or URL/history mutation.
             // Invalidate a previous source retry; the existing Glance
             // constructor enforces its own destination policy.
@@ -509,6 +565,49 @@ mod linux_glance_input_tests {
             (true, true, false, 1, alt | M::SUPER_MASK.bits()),
         ] { assert!(!linux_glance_alt_click(link, gesture, redirect, button, mods)); }
     }
+    #[test]
+    fn pinned_preview_preserves_hostname_semantics_and_native_gesture() {
+        let source = linux_glance_url("https://example.org/a").unwrap();
+        let same = linux_glance_url("http://EXAMPLE.org:8080/b").unwrap();
+        let cross = linux_glance_url("https://other.example/b").unwrap();
+        let sub = linux_glance_url("https://sub.example.org/b").unwrap();
+        let check = |target: &url::Url, pinned, modifiers| {
+            linux_glance_preview(true, true, false, 1, modifiers, pinned, &source, target)
+        };
+        assert!(check(&cross, true, 0));
+        assert!(check(&sub, true, 0));
+        assert!(!check(&same, true, 0));
+        assert!(!check(&cross, false, 0));
+        assert!(check(&same, false, M::MOD1_MASK.bits()));
+        assert!(!check(&cross, true, M::CONTROL_MASK.bits()));
+        assert!(!check(&cross, true, M::SHIFT_MASK.bits()));
+        assert!(!linux_glance_preview(true, false, false, 1, 0, true, &source, &cross));
+        assert!(!linux_glance_preview(true, true, true, 1, 0, true, &source, &cross));
+        assert!(!linux_glance_preview(true, true, false, 2, 0, true, &source, &cross));
+    }
+
+    #[test]
+    fn native_pin_state_tracks_live_tab_lifetime() {
+        let state = WebviewState { tabs: Mutex::new(HashMap::new()), pinned: Mutex::new(HashSet::new()) };
+        assert_eq!(state.linux_pin("tab"), None);
+        state.set_linux_pin("tab", true);
+        assert_eq!(state.linux_pin("tab"), None);
+        state.register_linux_tab("tab".into(), true, true);
+        assert_eq!(state.linux_pin("tab"), Some(true));
+        state.set_linux_pin("tab", false);
+        assert_eq!(state.linux_pin("tab"), Some(false));
+        state.set_linux_pin("tab", true);
+        assert_eq!(state.linux_pin("tab"), Some(true));
+        state.unregister_linux_tab("tab");
+        assert_eq!(state.linux_pin("tab"), None);
+        state.register_linux_tab("tab".into(), false, false);
+        assert_eq!(state.linux_pin("tab"), Some(false));
+        state.unregister_linux_tab("tab");
+        state.register_linux_tab("tab".into(), true, true);
+        assert_eq!(state.linux_pin("tab"), Some(true));
+        assert_eq!(state.linux_pin("other"), None);
+    }
+
     #[test]
     fn preview_url_requires_http_host_and_no_credentials() {
         assert!(linux_glance_url("https://example.org/path").is_some());
@@ -854,7 +953,7 @@ mod linux_workspace_directory_tests {
 }
 
 #[tauri::command]
-async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f64, top_offset: f64, https_only: bool, ad_blocker: bool, cookie_auto_reject: bool, is_panel: bool, profile_name: Option<String>, disable_dev_tools: Option<bool>, disable_status_bar: Option<bool>, disable_autofill: Option<bool>, disable_password_save: Option<bool>, block_service_workers: Option<bool>, block_font_enum: Option<bool>, spoof_hw_concurrency: Option<bool>, block_popups: Option<bool>, default_zoom: Option<f64>, max_tabs: Option<u32>) -> Result<(), String> {
+async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f64, top_offset: f64, https_only: bool, ad_blocker: bool, cookie_auto_reject: bool, is_panel: bool, profile_name: Option<String>, disable_dev_tools: Option<bool>, disable_status_bar: Option<bool>, disable_autofill: Option<bool>, disable_password_save: Option<bool>, block_service_workers: Option<bool>, block_font_enum: Option<bool>, spoof_hw_concurrency: Option<bool>, block_popups: Option<bool>, default_zoom: Option<f64>, max_tabs: Option<u32>, pinned: Option<bool>) -> Result<(), String> {
     crash_log::log_info("create_tab", &format!("id={} url={}", id, url));
     let disable_dev_tools = disable_dev_tools.unwrap_or(false);
     let disable_status_bar = disable_status_bar.unwrap_or(false);
@@ -1159,6 +1258,9 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                             let panel_s = app_nav.state::<PanelState>();
                             panel_s.ids.lock().remove(&pid);
                             let ws = app_nav.state::<WebviewState>();
+                            #[cfg(target_os = "linux")]
+                            ws.register_linux_tab(pid.clone(), false, false);
+                            #[cfg(not(target_os = "linux"))]
                             ws.tabs.lock().insert(pid.clone(), false);
                             let _ = app_nav.emit_to("main", "preload-promoted", serde_json::json!({
                                 "preloadId": pid,
@@ -1299,6 +1401,9 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     };
 
     let state = app.state::<WebviewState>();
+    #[cfg(target_os = "linux")]
+    state.register_linux_tab(tab_id_track, true, !is_panel && pinned.unwrap_or(false));
+    #[cfg(not(target_os = "linux"))]
     state.tabs.lock().insert(tab_id_track, true);
 
     #[cfg(target_os = "linux")]
@@ -1307,13 +1412,13 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     }
 
     #[cfg(target_os = "linux")]
-    if let Err(e) = install_linux_glance_menu(&app, &webview, &id) {
-        crash_log::log_error("linux-glance", &e);
-    }
-
-    #[cfg(target_os = "linux")]
-    if let Err(e) = install_linux_glance_input(&app, &webview, &id) {
-        crash_log::log_error("linux-glance-input", &e);
+    if !is_panel {
+        if let Err(e) = install_linux_glance_menu(&app, &webview, &id) {
+            crash_log::log_error("linux-glance", &e);
+        }
+        if let Err(e) = install_linux_glance_input(&app, &webview, &id) {
+            crash_log::log_error("linux-glance-input", &e);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2544,6 +2649,9 @@ async fn close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
     crash_log::log_info("close_tab", &format!("id={}", id));
     // remove from state FIRST so layout_webviews won't try to position a dying webview
     let state = app.state::<WebviewState>();
+    #[cfg(target_os = "linux")]
+    state.unregister_linux_tab(&id);
+    #[cfg(not(target_os = "linux"))]
     state.tabs.lock().remove(&id);
     #[cfg(all(target_os = "linux", debug_assertions))]
     app.state::<Arc<NativeFilterUpdateState>>().forget(&id);
@@ -2777,6 +2885,9 @@ async fn promote_glance(app: tauri::AppHandle, glance_id: String) -> Result<(), 
     // register as a normal tab in WebviewState using the glance_id as tab id
     // (the webview label IS the glance_id, so layout_webviews can find it)
     let ws = app.state::<WebviewState>();
+    #[cfg(target_os = "linux")]
+    ws.register_linux_tab(glance_id, false, false);
+    #[cfg(not(target_os = "linux"))]
     ws.tabs.lock().insert(glance_id, false);
 
     Ok(())
@@ -3030,6 +3141,9 @@ async fn copy_text_to_clipboard(text: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn set_tab_pinned(app: tauri::AppHandle, id: String, pinned: bool) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    app.state::<WebviewState>().set_linux_pin(&id, pinned);
+    #[cfg(not(target_os = "linux"))]
     if let Some(wv) = app.get_webview(&id) {
         let js = format!("window.__bushidoPinned = {};", pinned);
         let _ = wv.eval(&js);
@@ -3927,6 +4041,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(WebviewState {
             tabs: Mutex::new(HashMap::new()),
+            #[cfg(target_os = "linux")]
+            pinned: Mutex::new(HashSet::new()),
         })
         .manage(PanelState {
             ids: Mutex::new(HashSet::new()),
