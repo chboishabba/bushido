@@ -9,6 +9,8 @@ mod linux_downloads;
 mod linux_find;
 #[cfg(target_os = "linux")]
 mod linux_vault;
+#[cfg(target_os = "linux")]
+mod linux_vault_save;
 mod import;
 mod screenshot;
 mod sync;
@@ -1436,10 +1438,15 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
         if let Err(e) = install_linux_glance_input(&app, &webview, &id) {
             crash_log::log_error("linux-glance-input", &e);
         }
-        if !disable_autofill {
-            if let Some(workspace) = profile_name.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(workspace) = profile_name.as_deref().filter(|s| !s.is_empty()) {
+            if !disable_autofill {
                 if let Err(e) = linux_vault::install(&app, &webview, &id, workspace) {
                     crash_log::log_error("linux-vault", &e);
+                }
+            }
+            if !disable_password_save {
+                if let Err(e) = linux_vault_save::install(&app, &webview, &id, workspace) {
+                    crash_log::log_error("linux-vault-save", &e);
                 }
             }
         }

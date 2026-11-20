@@ -51,6 +51,15 @@ fn open(key: &[u8; 32], nonce: &[u8], metadata: &[u8], cipher: &[u8]) -> Result<
 
 pub(super) fn save(state: &VaultState, workspace: &str, origin: &str, user: &str, pass: &str) -> Result<String, String> {
     let epoch = state.session()?;
+    save_admitted(state, workspace, origin, user, pass, epoch, false, || true)
+}
+
+// Consent is bound to the original epoch; never reacquire a new authorization
+// after a lock/reunlock while encryption or platform wrapping is in flight.
+pub(super) fn save_admitted(state: &VaultState, workspace: &str, origin: &str, user: &str, pass: &str,
+    epoch: u64, only_new: bool, permitted: impl Fn() -> bool) -> Result<String, String> {
+    state.with_session(epoch, || ())?;
+    if !permitted() { return Err("Login save authorization expired".into()); }
     let key = state.get_key()?;
     let id = Uuid::new_v4().to_string();
     let mut nonce = [0u8; 12];
@@ -58,10 +67,17 @@ pub(super) fn save(state: &VaultState, workspace: &str, origin: &str, user: &str
     let cipher = seal(&key, &nonce, &aad(&id, workspace, origin, user), pass)?;
     let wrapped = dpapi_encrypt(&cipher)?;
     let conn = state.open_db()?;
-    state.with_session(epoch, || conn.execute(
-        "INSERT INTO vault_scoped_v2 (id,workspace,origin,username,password_enc,nonce,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-        rusqlite::params![id, workspace, origin, user, wrapped, nonce.as_slice(), chrono::Utc::now().timestamp()]
-    ).map_err(|_| "Scoped vault insert failed".to_owned()))??;
+    state.with_session(epoch, || {
+        if !permitted() { return Err("Login save authorization expired".into()); }
+        let count = conn.execute(
+            "INSERT INTO vault_scoped_v2 (id,workspace,origin,username,password_enc,nonce,updated_at)
+             SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE NOT ?8 OR NOT EXISTS
+             (SELECT 1 FROM vault_scoped_v2 WHERE workspace=?2 AND origin=?3 AND username=?4)",
+            rusqlite::params![id, workspace, origin, user, wrapped, nonce.as_slice(), chrono::Utc::now().timestamp(), only_new]
+        ).map_err(|_| "Scoped vault insert failed".to_owned())?;
+        if count != 1 { return Err("Saved account already exists; no password overwritten".into()); }
+        Ok(())
+    })??;
     Ok(id)
 }
 

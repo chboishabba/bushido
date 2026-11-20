@@ -207,6 +207,16 @@ pub(crate) fn native_selected(state: &VaultState, workspace: &str, origin: &str,
     scoped::selected(state, workspace, Some(origin), id, Some(user), epoch)
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn native_save_new(state: &VaultState, workspace: &str, origin: &str, user: &str, pass: &str,
+    epoch: u64, permitted: impl Fn() -> bool) -> Result<String, String> {
+    let workspace = scoped::workspace(Some(workspace))?;
+    if crate::linux_vault::https_origin(origin).as_deref() != Some(origin) {
+        return Err("Invalid saved login origin".into());
+    }
+    scoped::save_admitted(state, workspace, origin, user, pass, epoch, true, permitted)
+}
+
 #[tauri::command]
 pub fn vault_scoped_mode() -> bool { cfg!(target_os = "linux") }
 
