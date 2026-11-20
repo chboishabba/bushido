@@ -862,6 +862,11 @@ async fn get_perf_metrics(app: tauri::AppHandle) -> Result<serde_json::Value, St
 
 #[tauri::command]
 async fn preconnect_url(url: String) -> Result<(), String> {
+    // Raw TCP preconnect bypasses the browser resolver/policy. Disable on Linux.
+    #[cfg(target_os = "linux")]
+    { let _ = url; return Err("Speculative TCP preconnect disabled on Linux".into()); }
+    #[cfg(not(target_os = "linux"))]
+    {
     let parsed = url::Url::parse(&url).map_err(|e| e.to_string())?;
     let host = parsed.host_str().ok_or("no host")?;
     let port = parsed.port_or_known_default().unwrap_or(443);
@@ -873,6 +878,7 @@ async fn preconnect_url(url: String) -> Result<(), String> {
         ).await;
     });
     Ok(())
+    }
 }
 
 #[tauri::command]
@@ -3967,17 +3973,13 @@ async fn save_settings(app: tauri::AppHandle, data: String) -> Result<(), String
 }
 
 #[tauri::command]
-async fn set_dns_level(app: tauri::AppHandle, level: String) -> Result<(), String> {
-    let port = app.state::<DnsPort>().0;
-    if port == 0 { return Err("dns resolver not running".into()); }
-    let client = reqwest::Client::new();
-    client.post(format!("http://127.0.0.1:{}/level", port))
-        .body(format!("\"{}\"", level))
-        .send().await.map_err(|e| e.to_string())?;
-    Ok(())
+async fn set_dns_level(app: tauri::AppHandle, webview: tauri::Webview, level: String) -> Result<(), String> {
+    if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
+    let state = app.state::<DnsControl>();
+    state.0.as_ref().ok_or("Browser DoH resolver not active on this platform")?.set_level(&level)
 }
 
-struct DnsPort(u16);
+struct DnsControl(Option<dns_resolver::ResolverControl>);
 
 #[tauri::command]
 async fn load_settings(app: tauri::AppHandle) -> Result<String, String> {
@@ -4248,18 +4250,29 @@ pub fn run() {
         }
     };
     // start local DoH resolver before any webview creation
-    let (dns_flags, dns_port) = {
+    let (dns_flags, dns_control) = {
+        let settings = dirs::data_dir().and_then(|p| fs::read_to_string(p.join("com.bushido.browser/settings.json")).ok())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        let level = settings.as_ref().and_then(|s| s.get("dnsLevel")).and_then(|v| v.as_str())
+            .and_then(|v| dns_resolver::parse_level(v).ok()).unwrap_or_default();
+        // Chromium flags do not configure WebKitGTK. Do not open an unused local resolver.
+        #[cfg(target_os = "linux")]
+        let enabled = cfg!(debug_assertions) && std::env::var("BUSHIDO_LINUX_DOH_FIXTURE").as_deref() == Ok("1");
+        #[cfg(not(target_os = "linux"))]
+        let enabled = true;
+        if !enabled { (String::new(), None) } else {
         let rt = tokio::runtime::Runtime::new().expect("tokio rt for dns");
-        match rt.block_on(dns_resolver::start()) {
-            Ok(port) => {
+        match rt.block_on(dns_resolver::start_controlled(level)) {
+            Ok((port, control)) => {
                 println!("DoH resolver on port {}", port);
                 std::thread::spawn(move || { rt.block_on(std::future::pending::<()>()); });
-                (dns_resolver::flags(port), port)
+                (dns_resolver::flags(port), Some(control))
             }
             Err(e) => {
                 eprintln!("dns resolver failed: {}", e);
-                (String::new(), 0)
+                (String::new(), None)
             }
+        }
         }
     };
 
@@ -4442,7 +4455,7 @@ pub fn run() {
             // are created. Avoid cfg attributes inside a builder method chain.
             #[cfg(all(target_os = "linux", debug_assertions))]
             app.manage(Arc::new(NativeFilterUpdateState::default()));
-            app.manage(DnsPort(dns_port));
+            app.manage(DnsControl(dns_control.clone()));
 
             #[cfg(windows)]
             {

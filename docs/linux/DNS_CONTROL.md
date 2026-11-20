@@ -1,0 +1,12 @@
+# P2.4 resolver control and egress boundary (partial source)
+
+This changes the original application DoH resolver, not WebKitGTK's network process. Chromium flags are not a WebKit producer. Linux no longer starts the unused loopback resolver by default. A debug-only BUSHIDO_LINUX_DOH_FIXTURE=1 starts the resolver for isolated lab use; no claim that the browser routes through it. The standalone test_dns binary remains available.
+
+- Remove HTTP /level authority. Trusted main-WebView IPC updates the actual in-process ResolverControl; startup reads the persisted privacy level before resolver creation. Unknown values reject. No automatic downgrade. Query policy snapshot includes monotone generation, rejecting stale returns across level changes, including ABA. Already issued network traffic cannot be recalled. The tiny race between a snapshot check and a subsequent network dispatch remains open for atomic admission.
+- Pin upstream bootstrap addresses for existing Cloudflare/Google HTTPS hostnames, keep TLS hostname/certificate validation, disable ambient proxies and redirects. No system DNS bootstrap by this client is intended; actual packet verification is OPEN. Maximum mode disallows fallback; Standard/Strict retain original alternate provider. Endpoint reachability/certificates require native tests; no broader WebKit DNS or third-party egress guarantee.
+- Bound DNS message size, validate single query and matching response ID/question/type/opcode/nontruncated, case-normalize blocklist, require DNS media type on POST and upstream response. Unknown shapes fail; full DNS protocol/EDNS semantics review remains open.
+- Disable raw response caching pending correct transaction ID, TTL aging, DNSSEC/EDNS/query scope and policy semantics. Deliberate latency regression, not a performance optimization. Stats expose cache_enabled=false and proposal_only. No fake cache hits.
+- Disable generic speculative raw TCP preconnect on Linux because it bypasses browser DNS/request policy. Windows raw preconnect unchanged.
+- HTTP GET/POST and aggregate stats still exist on loopback in enabled runs. Local untrusted request admission, DNS rebinding, rate limits, DNS query metadata exposure and other network producer edges remain OPEN; do not deploy the debug fixture on real profiles.
+
+Next: exact message-aware cache and independent zkperf measurements; determine enforceable native WebKit egress path, test all processes, redirect/frame/worker/DNS failure cases and ground via same-binary zkSEC witnesses. No hosted CI or native testing.
