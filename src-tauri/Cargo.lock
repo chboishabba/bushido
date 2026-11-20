@@ -548,6 +548,7 @@ dependencies = [
  "hostname",
  "image",
  "javascriptcore-rs",
+ "libc",
  "loro",
  "lz4_flex",
  "mdns-sd",

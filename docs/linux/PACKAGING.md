@@ -50,3 +50,6 @@ References: Tauri Debian distribution documentation https://v2.tauri.app/distrib
 ## Local execution receipt
 
 Debian 13.3 container, Node 22.16.0: static synthetic archive checks 9/9 PASS; build script `bash -n` PASS; invocation stopped on missing `rustc` (exit 2, as designed). Cargo and the GTK/WebKitGTK/libsoup development pkg-config packages are also absent. Neither actual Bushido compilation nor a .deb was produced. Exact tested checker blob `97694456e37fc024a9b686144a080767efd3b3c6`, build script blob `0f2e8fb2986c6e56e003851bb73dab3a47cd9d2f`.
+
+### External activation prerequisite (partial source)
+Linux has an early private instance lock and bounded same-user socket queue. Explicit CLI URLs are limited to HTTP(S) without embedded credentials; main browser chrome asks for the target current workspace before opening. This is not yet native-accepted; desktop launcher still advertises no URI arguments or MIME registration until cold/warm activation, focus, user consent and singleton lifecycle are verified. Pending queue is volatile, and paths exceeding Unix socket limits fail closed. See roadmap and acceptance.

@@ -8,6 +8,8 @@ mod linux_downloads;
 #[cfg(target_os = "linux")]
 mod native_download_history;
 #[cfg(target_os = "linux")]
+mod linux_instance;
+#[cfg(target_os = "linux")]
 mod linux_find;
 #[cfg(target_os = "linux")]
 mod linux_vault;
@@ -4173,8 +4175,41 @@ fn binary_updater_enabled() -> bool {
     cfg!(target_os = "windows")
 }
 
+#[derive(serde::Serialize)]
+struct ExternalActivation { url: Option<String> }
+
+#[tauri::command]
+fn take_external_activation(app: tauri::AppHandle, webview: tauri::Webview) -> Result<Option<ExternalActivation>, String> {
+    // Child remote documents share the main window, but not its webview label.
+    if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
+    #[cfg(target_os = "linux")]
+    if let Some(url) = app.state::<linux_instance::ActivationQueue>().take() {
+        if let Some(window) = app.get_window("main") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+        return Ok(Some(ExternalActivation { url }));
+    }
+    Ok(None)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    let instance = {
+        // Match the existing early startup data root. No fallback to cwd:
+        // the same XDG data root must have one process before any services.
+        let Some(root) = dirs::data_dir() else {
+            eprintln!("Bushido: no application data directory");
+            std::process::exit(2);
+        };
+        match linux_instance::enter(&root.join("com.bushido.browser")) {
+            Ok(Some(instance)) => instance,
+            Ok(None) => return,
+            Err(e) => { eprintln!("Bushido: {e}"); std::process::exit(2); }
+        }
+    };
     // start local DoH resolver before any webview creation
     let (dns_flags, dns_port) = {
         let rt = tokio::runtime::Runtime::new().expect("tokio rt for dns");
@@ -4306,6 +4341,8 @@ pub fn run() {
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init());
+    #[cfg(target_os = "linux")]
+    let builder = builder.manage(instance.queue.clone());
     // Linux packages are distributed by the package manager or rebuilt
     // locally. Never install binaries from the upstream Windows channel.
     #[cfg(target_os = "windows")]
@@ -4583,6 +4620,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             binary_updater_enabled,
+            take_external_activation,
             create_tab,
             suspend_tab,
             resume_tab,
