@@ -39,3 +39,15 @@ A4: only after local acceptance, decide CI integration. Do not run hosted CI for
 
 ### A0 local receipt seam
 `python3 scripts/linux/accept-local.py` now records the P0 stage outcomes, exact source SHA and lock hashes, host/tool versions, and private per-stage log hashes. This is a build/fixture orchestrator, not an MCP server or WebDriver session. A1 must consume its successful receipt and attach distinct scenario evidence for the actual same-source executable and isolated profile.
+
+## A0.1 ITIR shared zkSEC/zkperf connectors
+
+ITIR-suite PR #73 (ad35e4ac8c9ce606418a760a122bc603aaf92b94) introduces the three read-only tools itir.zksec.policy_preview, itir.zkperf.window_plan, itir.zkperf.evidence_index_check in the existing registry, visible via FastMCP and existing native JSON-lines bridge. No new protocol or browser runtime server. The tool families are observation-only and cannot execute, publish, grant permissions or establish grounded security claims.
+
+The external operator-side scripts/linux/itir-evidence-check.py calls only the evidence-index tool via existing python -m itir_mcp --bridge safe_call. Explicit trusted local Python executable and suite checkout required. Example:
+```sh
+python3 scripts/linux/itir-evidence-check.py --index /private/index.json \
+  --python /absolute/itir/.venv/bin/python --suite-root /absolute/itir \
+  --output /private/new-itir-receipt.json
+```
+The client requires abstained/proposal-only response, checks claimed index digest and commit identity and rejects all verified-file/proof/authorization claims. No arbitrary tool name, no shell, no embedded MCP. Trusted local provider only; subprocess timeout and input bounds; response size checked after capture (not a sandbox for hostile provider). No actual provider calls during preflight, just synthetic contract tests. The future Rust sidecar can consume the same registry over MCP stdio with a pinned SDK and explicit tool allowlist, distinct from the browser action driver. Actual native bridge/provider acceptance remains OPEN.

@@ -308,3 +308,6 @@ See ZKSEC_ZKPERF.md. Run witness-receipt fixture from consolidated preflight. On
 
 ### P2.4 resolver control
 Use isolated test_dns binary and dns_test.py with randomized transaction IDs; confirm mismatches reject, /level unavailable, main-only native control and policy generation ABA, startup policy, no proxy/redirect and pinned upstream packet destinations; failure injection in maximum vs strict, no plain DNS bootstrap. Verify Linux default starts no resolver, debug opt-in only, preconnect denied. Cache disabled: report latency as proposal observations, not acceptance thresholds. Actual WebKit process coverage and origin-scoped network enforcement remain OPEN. See DNS_CONTROL.md.
+
+### A0.1 external ITIR evidence check
+Run the synthetic client test via consolidated preflight. On pinned local ITIR PR #73 checkout install existing suite dependencies, discover three new tools, test actual provider calls, pass private synthetic five-layer index via fixed client and verify abstained/proposal-only receipt; altered digest, authority promotion and wrong commit/receipt reject. Not proof of browser execution or linked artifacts. Native Rust automation and WebKit egress unchanged.
