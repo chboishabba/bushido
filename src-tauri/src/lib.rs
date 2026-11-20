@@ -30,6 +30,8 @@ mod linux_destination_scope;
 mod linux_document_epoch;
 #[cfg(all(target_os = "linux", debug_assertions))]
 mod linux_resource_observation;
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod linux_extension_observation;
 mod sync;
 mod vault;
 

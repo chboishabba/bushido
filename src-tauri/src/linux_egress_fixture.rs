@@ -62,6 +62,8 @@ impl EgressFixture {
 
     pub(crate) fn scope(&self) -> Option<&crate::linux_destination_scope::OperatorScope> { self.scope.as_ref() }
 
+    pub(crate) fn extension_configured(&self) -> bool { self.extension.is_some() }
+
     pub(crate) fn extension_path(&self) -> Result<Option<PathBuf>,String> {
         self.extension.as_ref().map(|f|f.path()).transpose()
     }

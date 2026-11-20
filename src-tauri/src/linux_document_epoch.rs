@@ -74,6 +74,7 @@ struct Entry {
     native_identity: usize,
     state: Arc<Mutex<LoadState>>,
     resources: Arc<Mutex<crate::linux_resource_observation::Ledger>>,
+    extension: Option<Arc<Mutex<crate::linux_extension_observation::ExtensionObservation>>>,
 }
 
 #[derive(Default)]
@@ -86,6 +87,14 @@ fn uri(view: &WebView) -> Option<url::Url> {
 impl DocumentEpochs {
     pub(crate) fn remove(&self, id: &str) {
         self.0.lock().remove(id);
+    }
+
+    pub(crate) fn extension_snapshot(&self,id:&str,owner:&NativeTabOwner,view:&WebView) -> Option<serde_json::Value> {
+        let entries=self.0.lock();
+        let entry=entries.get(id)?;
+        if &entry.owner!=owner || entry.native_identity!=view.as_ptr() as usize { return None; }
+        let observation=entry.extension.as_ref().map(|l|l.lock().snapshot());
+        Some(serde_json::json!({"configured":observation.is_some(),"observation":observation}))
     }
 
     pub(crate) fn resource_snapshot(&self, id:&str, owner:&NativeTabOwner, view:&WebView,
@@ -124,6 +133,8 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
         let state=Arc::new(Mutex::new(LoadState::Unknown));
         let identity=view.as_ptr() as usize;
         let resources=Arc::new(Mutex::new(crate::linux_resource_observation::Ledger::default()));
+        let extension=app.state::<crate::linux_egress_fixture::EgressFixture>().extension_configured()
+            .then(||Arc::new(Mutex::new(crate::linux_extension_observation::ExtensionObservation::default())));
         // Never adopt a currently displayed page; attach fresh observation.
         let registry=app.state::<DocumentEpochs>();
         {
@@ -131,9 +142,10 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
             if entries.get(&id).is_some_and(|e| e.owner==owner && e.native_identity==identity) {
                 return;
             }
-            entries.insert(id.clone(),Entry {owner,native_identity:identity,state:state.clone(),resources:resources.clone()});
+            entries.insert(id.clone(),Entry {owner,native_identity:identity,state:state.clone(),resources:resources.clone(),extension:extension.clone()});
         }
         crate::linux_resource_observation::attach(&view,state.clone(),resources);
+        if let Some(ledger)=extension { crate::linux_extension_observation::attach(&view,ledger); }
         let load=state.clone();
         view.connect_load_changed(move |view,event| {
             let mut state=load.lock();

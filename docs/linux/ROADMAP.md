@@ -514,3 +514,5 @@ Native vault save dialog polling/read deadline and prior fill callback deadline 
 
 ### P2.4e debug web-process extension source and loader
 - Original extensions_path chain reused; explicit private single ELF and SHA-256 check, optional separate clean source build receipt, isolated debug scope only. Native C page-created/send-request exact synthetic direct/redirect target cancellation; bounded fixed messages, independent A/B origin control routes and missing baseline rules. UI message receiver, extension build/loading and request enforcement acceptance OPEN; source/binary attestation and TOCTOU OPEN. One Rust test authored, not run.
+
+- P2.4e v5 extension receiver: native WebView fixed-name user messages only, no parameters/FDs, 512 observations per view lifetime, separate from epoch attribution; owner/native view recheck, no binary linkage or execution authority. Two Rust tests authored, not run. Actual native build/load/message delivery and independent A/B enforcement OPEN.
