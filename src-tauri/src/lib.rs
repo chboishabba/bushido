@@ -5,6 +5,8 @@ pub mod dns_resolver;
 mod downloads;
 #[cfg(target_os = "linux")]
 mod linux_downloads;
+#[cfg(target_os = "linux")]
+mod linux_find;
 mod import;
 mod screenshot;
 mod sync;
@@ -3229,54 +3231,33 @@ async fn find_in_page(
 ) -> Result<Option<u32>, String> {
     let wv = app.get_webview(&id).ok_or("Unknown WebView")?;
     if query.len() > 4096 { return Err("Search query too long".into()); }
-    if query.is_empty() {
-        wv.eval("window.getSelection()?.removeAllRanges()").map_err(|e| e.to_string())?;
-        return Ok(Some(0));
-    }
-    let escaped = serde_json::to_string(&query).map_err(|e| e.to_string())?;
-    // Retain the existing window.find behavior and visible-text estimate.
-    // Count without allocating an array proportional to document length.
-    let search = format!(r#"(function(){{
-        const q = {};
-        window.find(q, false, {}, true, false, false, false);
-        const text = (document.body?.innerText || '').toLowerCase();
-        const needle = q.toLowerCase();
-        let count = 0, offset = 0;
-        while (count < 100000) {{
-            const next = text.indexOf(needle, offset);
-            if (next < 0) break;
-            count++;
-            offset = next + needle.length;
-        }}
-        return count;
-    }})()"#, escaped, !forward);
-
     #[cfg(target_os = "linux")]
     {
-        use webkit2gtk::WebViewExt;
-        use javascriptcore::ValueExt;
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<u32, String>>();
-        wv.with_webview(move |platform| {
-            let view = platform.inner();
-            view.run_javascript(&search, None::<&gtk::gio::Cancellable>, move |result| {
-                let count = result.map_err(|e| e.to_string()).and_then(|r|
-                    r.js_value().and_then(|v| v.to_json(0))
-                        .ok_or_else(|| "Missing find result".to_owned())
-                        .and_then(|json| serde_json::from_str::<u32>(json.as_str())
-                            .map_err(|e| e.to_string()))
-                        .and_then(|n| if n <= 100000 { Ok(n) } else { Err("Find count exceeded limit".into()) })
-                );
-                let _ = tx.send(count);
-            });
-        }).map_err(|e| e.to_string())?;
-        let _ = request_id;
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await
-            .map_err(|_| "Find result timed out".to_owned())?
-            .map_err(|_| "Find callback lost".to_owned())??;
-        Ok(Some(result))
+        return linux_find::find(&wv, query, forward, request_id.ok_or("Missing find request ID")?).await.map(Some);
     }
     #[cfg(not(target_os = "linux"))]
     {
+        if query.is_empty() {
+            wv.eval("window.getSelection()?.removeAllRanges()").map_err(|e| e.to_string())?;
+            return Ok(Some(0));
+        }
+        let escaped = serde_json::to_string(&query).map_err(|e| e.to_string())?;
+        // Retain the existing window.find behavior and visible-text estimate.
+        // Count without allocating an array proportional to document length.
+        let search = format!(r#"(function(){{
+            const q = {};
+            window.find(q, false, {}, true, false, false, false);
+            const text = (document.body?.innerText || '').toLowerCase();
+            const needle = q.toLowerCase();
+            let count = 0, offset = 0;
+            while (count < 100000) {{
+                const next = text.indexOf(needle, offset);
+                if (next < 0) break;
+                count++;
+                offset = next + needle.length;
+            }}
+            return count;
+        }})()"#, escaped, !forward);
         // Preserve the existing WebView2 result event, correlated to the
         // initiating trusted FindBar request.
         let request = request_id.unwrap_or(0);
@@ -3284,6 +3265,7 @@ async fn find_in_page(
         wv.eval(&js).map_err(|e| e.to_string())?;
         Ok(None)
     }
+
 }
 
 #[tauri::command]
