@@ -945,6 +945,10 @@ export default function App() {
         // hide tab webviews so overlay is visible
         invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffsetRef.current, topOffset });
       }),
+      listen<string>("linux-vault-status", (e) => {
+        // Native status is text only; no credentials or URLs are transported.
+        useUiStore.getState().showError(e.payload);
+      }),
       listen<{ domain: string; username: string; password: string }>("vault-save-prompt", (e) => {
         setVaultSavePrompt(e.payload);
         if (vaultSaveTimer.current) clearTimeout(vaultSaveTimer.current);

@@ -1266,6 +1266,37 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
               </button>
             </div>
 
+            <form autoComplete="off" onSubmit={async e => {
+              e.preventDefault();
+              const form = e.currentTarget;
+              const values = new FormData(form);
+              const submit = form.querySelector<HTMLButtonElement>('button[type="submit"]');
+              if (!submit || submit.disabled) return;
+              submit.disabled = true;
+              try {
+                await invoke("vault_save_manual_entry", {
+                  site: String(values.get("site") ?? ""),
+                  username: String(values.get("username") ?? ""),
+                  password: String(values.get("password") ?? ""),
+                });
+                form.reset();
+                const entries = await invoke<VaultEntry[]>("vault_get_entries", {});
+                if (await invoke<boolean>("vault_is_unlocked")) setVaultEntries(entries);
+              } catch (error) {
+                // Do not log form data or password-containing errors.
+                useUiStore.getState().showError(typeof error === "string" ? error : "Unable to save login");
+              } finally {
+                form.reset();
+                submit.disabled = false;
+              }
+            }} style={{ display: "flex", flexDirection: "column", gap: 8, maxWidth: 420, margin: "12px 0" }}>
+              <span style={{ fontSize: 13, fontWeight: 600 }}>Add saved login</span>
+              <span className="settings-hint">Enter the full HTTPS site, including a non-default port if needed. Linux matches the exact origin; use the native page context menu to fill.</span>
+              <input name="site" type="url" placeholder="https://example.com" aria-label="HTTPS site" required maxLength={4096} className="settings-input" />
+              <input name="username" type="text" placeholder="Username" aria-label="Username" autoComplete="off" required maxLength={4096} className="settings-input" />
+              <input name="password" type="password" placeholder="Password" aria-label="Password" autoComplete="new-password" required maxLength={65536} className="settings-input" />
+              <button type="submit" className="settings-about-btn">Add saved login</button>
+            </form>
             <div className="vault-entries">
               {filtered.length === 0 && <p style={{ opacity: 0.5, fontSize: 13, padding: "12px 0" }}>No saved passwords{vaultSearch ? " matching search" : ""}.</p>}
               {filtered.map(entry => (

@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 const WORLD: &str = "bushido-native-vault";
 const FILL: &str = include_str!("linux_vault_fill.js");
 
-fn https_origin(raw: &str) -> Option<String> {
+pub(crate) fn https_origin(raw: &str) -> Option<String> {
     let url = url::Url::parse(raw).ok()?;
     if url.scheme() != "https" || url.host_str().is_none()
         || !url.username().is_empty() || url.password().is_some() { return None; }
@@ -97,6 +97,8 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
         view.connect_load_changed(move |_, event| {
             if event == LoadEvent::Started { on_load.set(on_load.get().wrapping_add(1)); }
         });
+        let on_destroy = generation.clone();
+        view.connect_destroy(move |_| on_destroy.set(on_destroy.get().wrapping_add(1)));
         let busy = Rc::new(Cell::new(false));
         view.connect_context_menu(move |view, menu, _, _| {
             let Some(href) = view.uri().map(|s| s.to_string()) else { return false; };
@@ -133,7 +135,7 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                     let choices = match choices {
                         Ok(Ok(v)) if !v.is_empty() => v,
                         Ok(Err(e)) => { message(&app, &e); return; }
-                        _ => { message(&app, "No exact-origin saved login; add the HTTPS origin in vault Settings"); return; }
+                        _ => { message(&app, "No exact-origin saved login; add the HTTPS origin in Settings → Passwords"); return; }
                     };
                     if !valid() { return; }
                     let Some(selected) = select(&view, &origin, &choices).await else { return; };

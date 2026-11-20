@@ -265,7 +265,8 @@ pub async fn vault_save_entry(
     password: String,
     notes: Option<String>,
 ) -> Result<String, String> {
-    let (enc, nonce) = state.encrypt_password(&password)?;
+    let password = zeroize::Zeroizing::new(password);
+    let (enc, nonce) = state.encrypt_password(password.as_str())?;
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp();
     let notes = notes.unwrap_or_default();
@@ -277,6 +278,34 @@ pub async fn vault_save_entry(
     ).map_err(|e| format!("save: {}", e))?;
 
     Ok(id)
+}
+
+// Explicit browser-chrome provisioning, independent of page save prompts.
+#[tauri::command]
+pub async fn vault_save_manual_entry(
+    state: tauri::State<'_, VaultState>,
+    site: String,
+    username: String,
+    password: String,
+) -> Result<String, String> {
+    if site.len() > 4096 || username.len() > 4096 || password.len() > 65536
+        || username.is_empty() || password.is_empty() {
+        return Err("Enter a valid HTTPS site, username and password".into());
+    }
+    // Linux fill never silently upgrades hostname-only legacy credentials:
+    // the user explicitly supplies the HTTPS site and its port.
+    #[cfg(target_os = "linux")]
+    let domain = crate::linux_vault::https_origin(&site)
+        .ok_or("Enter an HTTPS URL without embedded credentials")?;
+    #[cfg(not(target_os = "linux"))]
+    let domain = {
+        let url = url::Url::parse(&site).map_err(|_| "Enter a valid HTTPS URL")?;
+        if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+            return Err("Enter an HTTPS URL without embedded credentials".into());
+        }
+        url.host_str().ok_or("Missing hostname")?.to_owned()
+    };
+    vault_save_entry(state, domain, username, password, None).await
 }
 
 #[tauri::command]
