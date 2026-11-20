@@ -26,6 +26,8 @@ mod linux_egress_fixture;
 mod linux_destination_scope;
 #[cfg(all(target_os = "linux", debug_assertions))]
 mod linux_document_epoch;
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod linux_resource_observation;
 mod sync;
 mod vault;
 

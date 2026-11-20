@@ -503,3 +503,6 @@ Native vault save dialog polling/read deadline and prior fill callback deadline 
 
 ### P2.4e native top-level document epoch observation
 - Debug-only scope observer uses native Started/Committed/Finished (not Tauri's committed-mapped Started), fresh UUID, owner and native object identity, failure/TLS/process/destroy/URI invalidation. Late attach requires complete subsequent load; close forgets; promoted Glance starts unknown. GTK-thread v2 scope preview rechecks same epoch and original policy, still proposal-only and document_epoch_verified=false. Three Rust tests authored, not run. Native lifecycle edge acceptance and request attribution OPEN.
+
+### P2.4e native resource lifecycle observation
+- v3 preview uses same native document epoch observer, resource-load-started and per-resource URI/failed/TLS/finished callbacks; fixed categories, bounded hooks and omission counts, old epoch excluded. No frame identity, dispatch/redirect proof or CONNECT binding; nullable sent-request argument deferred pending pinned binding verification. Three Rust tests authored, not run. Native coverage, attribution and live scope issuance OPEN.
