@@ -26,6 +26,13 @@ fn decision(engine:&Engine,url:&str)->char {
     seen.unwrap_or('X')
 }
 
+pub(crate) fn launch_snapshot(engine:&Engine)->String {
+    let generation=uuid::Uuid::new_v4().simple().to_string();
+    let projected=snapshot(engine);
+    let table=projected.strip_prefix("bushido.fixture.policy.v1:").expect("original projection format");
+    format!("bushido.fixture.policy.v2:{generation}:{table}")
+}
+
 pub(crate) fn snapshot(engine:&Engine)->String {
     let table:String=ROUTES.iter().map(|route|decision(engine,&format!("{ROOT}{route}"))).collect();
     format!("bushido.fixture.policy.v1:{table}")
@@ -51,6 +58,15 @@ mod tests {
     fn context_sensitive_rule_abstains() {
         let e=engine(&["|https://bushido-tunnel.test/extension-deny|$script"]);
         assert_eq!(snapshot(&e),"bushido.fixture.policy.v1:AXAA");
+    }
+    #[test]
+    fn same_table_new_launch_identity() {
+        let e=Engine::default();
+        let a=launch_snapshot(&e);
+        let b=launch_snapshot(&e);
+        assert_ne!(a,b);
+        assert!(a.ends_with(":AAAA") && b.ends_with(":AAAA"));
+        assert_eq!(a.len(),"bushido.fixture.policy.v2:".len()+32+1+4);
     }
     #[test]
     fn empty_engine_does_not_manufacture_denials() {

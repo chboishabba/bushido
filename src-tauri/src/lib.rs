@@ -34,6 +34,8 @@ mod linux_document_epoch;
 mod linux_resource_observation;
 #[cfg(all(target_os = "linux", debug_assertions))]
 mod linux_extension_observation;
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod linux_extension_ack;
 mod sync;
 mod vault;
 

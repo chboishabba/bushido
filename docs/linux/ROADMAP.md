@@ -519,3 +519,6 @@ Native vault save dialog polling/read deadline and prior fill callback deadline 
 
 ### P2.4e original blocker finite fixture projection
 - Original list compiler + two exact synthetic rules, same live fixture engine, no normal cache, freeze manual/background updates. 4 routes x 3 sources x 9 types -> A/D/X via original evaluate_request. Versioned WebKit GVariant init data via vendored constructor, first-view immutable guard, C consumes only fixed table, X/missing abstains. No universal frame/type equivalence or production enforcement. Three Rust tests authored, not run; C/native compile, delivery, runtime policy identity, dynamic updates and physical A/B OPEN.
+
+### P2.4e fresh native policy challenge
+- v2 immutable generation+table initialization; original WebView-to-WebPage request/reply with fresh nonce, actual parsed table and launch UUID, exact response/nonpayload-FD checks, native owner/document recheck, bounded single outstanding per view. No reusable authority or binary/application attestation. v7 scope receipt records matching reply only; four Rust tests authored, not run. Physical reply, process replacement, original enforcement and dynamic policy update OPEN.

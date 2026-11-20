@@ -97,8 +97,10 @@ impl WebContextImpl {
     let requested=(path.to_owned(),data.to_owned());
     if self.fixture_initialization.as_ref()==Some(&requested) { return Ok(()); }
     if self.used_for_view || self.fixture_initialization.is_some() || !cfg!(debug_assertions)
-      || !data.strip_prefix("bushido.fixture.policy.v1:").is_some_and(|s|s.len()==4 &&
-          s.bytes().all(|b|matches!(b,b'A'|b'D'|b'X'))) {
+      || !data.strip_prefix("bushido.fixture.policy.v2:").and_then(|s|s.split_once(':'))
+        .is_some_and(|(generation,table)| generation.len()==32 &&
+          generation.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) &&
+          table.len()==4 && table.bytes().all(|b|matches!(b,b'A'|b'D'|b'X')))  {
       return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput,
         "Extension fixture context already used or invalid initialization")));
     }

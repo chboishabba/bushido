@@ -75,6 +75,7 @@ struct Entry {
     state: Arc<Mutex<LoadState>>,
     resources: Arc<Mutex<crate::linux_resource_observation::Ledger>>,
     extension: Option<Arc<Mutex<crate::linux_extension_observation::ExtensionObservation>>>,
+    probe_slot: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Default)]
@@ -87,6 +88,16 @@ fn uri(view: &WebView) -> Option<url::Url> {
 impl DocumentEpochs {
     pub(crate) fn remove(&self, id: &str) {
         self.0.lock().remove(id);
+    }
+
+    pub(crate) fn probe_slot(&self,id:&str,owner:&NativeTabOwner,view:&WebView)
+        -> Result<tokio::sync::OwnedSemaphorePermit,String> {
+        let entries=self.0.lock();
+        let entry=entries.get(id).ok_or("Missing native observation")?;
+        if &entry.owner!=owner || entry.native_identity!=view.as_ptr() as usize || entry.extension.is_none() {
+            return Err("Missing exact extension observer".into());
+        }
+        entry.probe_slot.clone().try_acquire_owned().map_err(|_|"Extension challenge already pending".into())
     }
 
     pub(crate) fn extension_snapshot(&self,id:&str,owner:&NativeTabOwner,view:&WebView) -> Option<serde_json::Value> {
@@ -142,7 +153,7 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
             if entries.get(&id).is_some_and(|e| e.owner==owner && e.native_identity==identity) {
                 return;
             }
-            entries.insert(id.clone(),Entry {owner,native_identity:identity,state:state.clone(),resources:resources.clone(),extension:extension.clone()});
+            entries.insert(id.clone(),Entry {owner,native_identity:identity,state:state.clone(),resources:resources.clone(),extension:extension.clone(),probe_slot:Arc::new(tokio::sync::Semaphore::new(1))});
         }
         crate::linux_resource_observation::attach(&view,state.clone(),resources);
         if let Some(ledger)=extension { crate::linux_extension_observation::attach(&view,ledger); }

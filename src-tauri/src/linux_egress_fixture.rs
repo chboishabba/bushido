@@ -64,7 +64,9 @@ impl EgressFixture {
     pub(crate) fn scope(&self) -> Option<&crate::linux_destination_scope::OperatorScope> { self.scope.as_ref() }
 
     pub(crate) fn bind_extension_policy(&mut self, engine:&adblock::engine::Engine) {
-        if self.extension.is_some() { self.extension_policy=Some(crate::linux_extension_policy::snapshot(engine)); }
+        if self.extension.is_some() && self.extension_policy.is_none() {
+            self.extension_policy=Some(crate::linux_extension_policy::launch_snapshot(engine));
+        }
     }
     pub(crate) fn extension_policy(&self)->Option<&str> { self.extension_policy.as_deref() }
 

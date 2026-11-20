@@ -6,10 +6,14 @@
 
 #define ROOT "https://bushido-tunnel.test/"
 #define MAX_MESSAGES 128
-#define PREFIX "bushido.fixture.policy.v1:"
+#define PREFIX "bushido.fixture.policy.v2:"
+#define QUERY "bushido.fixture.policy.challenge.v1"
+#define REPLY "bushido.fixture.policy.reply.v1"
+static gchar received[sizeof(PREFIX)+32+1+4];
+static gboolean initialized = FALSE;
 static gchar decisions[4] = {'X','X','X','X'};
 
-typedef struct { guint sent; } PageState;
+typedef struct { guint sent; guint challenges; } PageState;
 
 static void observe(WebKitWebPage *page, PageState *state, const gchar *name)
 {
@@ -54,10 +58,32 @@ static gboolean on_send(WebKitWebPage *page, WebKitURIRequest *request,
     return FALSE;
 }
 
-static void free_state(gpointer state, GClosure *closure)
+static gboolean lower_hex(const gchar *s, gsize len)
 {
-    (void)closure;
-    g_free(state);
+    for (gsize i=0;i<len;i++)
+        if (!g_ascii_isdigit(s[i]) && !(s[i]>='a' && s[i]<='f')) return FALSE;
+    return TRUE;
+}
+
+/* Reply on the original native request/reply channel. Report only the
+ * immutable parsed initialization string actually used by on_send. */
+static gboolean on_challenge(WebKitWebPage *page, WebKitUserMessage *message, gpointer data)
+{
+    (void)page;
+    PageState *state=data;
+    if (g_strcmp0(webkit_user_message_get_name(message), QUERY)!=0) return FALSE;
+    if (state->challenges>=32) return TRUE;
+    state->challenges++;
+    GVariant *param=webkit_user_message_get_parameters(message);
+    if (!param || !g_variant_is_of_type(param,G_VARIANT_TYPE_STRING) ||
+        webkit_user_message_get_fd_list(message)) return TRUE;
+    const gchar *nonce=g_variant_get_string(param,NULL);
+    if (strlen(nonce)!=32 || !lower_hex(nonce,32)) return TRUE;
+    gchar *payload=g_strdup_printf("%s:%s",nonce,initialized?received:"invalid");
+    webkit_user_message_send_reply(message,
+        webkit_user_message_new(REPLY,g_variant_new_string(payload)));
+    g_free(payload);
+    return TRUE;
 }
 
 static void page_created(WebKitWebExtension *extension, WebKitWebPage *page,
@@ -66,8 +92,10 @@ static void page_created(WebKitWebExtension *extension, WebKitWebPage *page,
     (void)extension;
     (void)unused;
     PageState *state = g_new0(PageState, 1);
-    g_signal_connect_data(page, "send-request", G_CALLBACK(on_send), state,
-                          free_state, 0);
+    g_object_set_data_full(G_OBJECT(page),"bushido-fixture-state",state,g_free);
+    g_signal_connect(page,"send-request",G_CALLBACK(on_send),state);
+    // Both callbacks use state owned by the page, not by either signal.
+    g_signal_connect(page,"user-message-received",G_CALLBACK(on_challenge),state);
     observe(page, state, "bushido.fixture.v1.page_created");
 }
 
@@ -75,12 +103,19 @@ G_MODULE_EXPORT void webkit_web_extension_initialize_with_user_data(
     WebKitWebExtension *extension, const GVariant *user_data)
 {
     /* No data or malformed data => all X; no hard-coded cancellation. */
+    memset(decisions,'X',sizeof(decisions));
+    memset(received,0,sizeof(received));
+    initialized=FALSE;
     if (user_data && g_variant_is_of_type((GVariant *)user_data,G_VARIANT_TYPE_STRING)) {
         const gchar *s=g_variant_get_string((GVariant *)user_data,NULL);
         if (g_str_has_prefix(s,PREFIX)) {
-            const gchar *table=s+strlen(PREFIX);
-            if (strlen(table)==4 && strspn(table,"ADX")==4)
-                memcpy(decisions,table,4);
+            const gchar *generation=s+strlen(PREFIX);
+            if (strlen(generation)==37 && lower_hex(generation,32) && generation[32]==':' &&
+                strspn(generation+33,"ADX")==4) {
+                memcpy(decisions,generation+33,4);
+                g_strlcpy(received,s,sizeof(received));
+                initialized=TRUE;
+            }
         }
     }
     g_signal_connect(extension, "page-created", G_CALLBACK(page_created), NULL);

@@ -81,7 +81,7 @@ pub(crate) async fn preview(app: &tauri::AppHandle, tab_id: &str)
     let (tx,rx)=tokio::sync::oneshot::channel();
     view.with_webview(move |platform| {
         if tx.is_closed() { return; }
-        let result=(|| -> Result<serde_json::Value,String> {
+        let result=(|| -> Result<(serde_json::Value,crate::linux_document_epoch::DocumentSnapshot,Option<String>),String> {
             if !crate::native_tab_matches_owner(&app,&id,&owner) {
                 return Err("Tab owner changed".into());
             }
@@ -104,8 +104,8 @@ pub(crate) async fn preview(app: &tauri::AppHandle, tab_id: &str)
                 .ok_or("Native resource observation lost")?;
             let extension=epochs.extension_snapshot(&id,&current_owner,&native)
                 .ok_or("Native extension observation lost")?;
-            Ok(serde_json::json!({
-                "version":"bushido.egress.scope_preview.v6",
+            Ok((serde_json::json!({
+                "version":"bushido.egress.scope_preview.v7",
                 "extension_policy_snapshot":fixture.extension_policy(),
                 "extension_policy_delivery_verified":false,
                 "extension_observation":extension,
@@ -122,9 +122,40 @@ pub(crate) async fn preview(app: &tauri::AppHandle, tab_id: &str)
                 "request_attribution_verified":false,
                 "execution_authorized":false,
                 "native_acceptance":"OPEN"
-            }))
+            }),current_doc,fixture.extension_policy().map(str::to_owned)))
         })();
-        let _=tx.send(result);
+        let (mut receipt,doc,expected)=match result {
+            Ok(v)=>v,
+            Err(e)=>{let _=tx.send(Err(e));return;}
+        };
+        let Some(expected)=expected else {
+            receipt["extension_policy_ack"]=serde_json::json!({"status":"not_configured"});
+            let _=tx.send(Ok(receipt));
+            return;
+        };
+        let slot=match app.state::<DocumentEpochs>().probe_slot(&id,&owner,&native) {
+            Ok(slot)=>slot,
+            Err(e)=>{let _=tx.send(Err(e));return;}
+        };
+        let callback_view=native.clone();
+        crate::linux_extension_ack::probe(&native,expected,move |status| {
+            let _slot=slot;
+            if tx.is_closed() {return;}
+            let epochs=app.state::<DocumentEpochs>();
+            if !crate::native_tab_matches_owner(&app,&id,&owner)
+                || epochs.snapshot(&id,&owner,&callback_view).as_ref()!=Some(&doc) {
+                let _=tx.send(Err("Native observation changed during policy challenge".into()));
+                return;
+            }
+            receipt["extension_policy_ack"]=serde_json::json!({
+                "status":status,
+                "matching_reply_observed":status=="matching_reply_observed",
+                "document_observation_rechecked":true,
+                "runtime_binary_linkage_verified":false,
+                "applied_request_policy_verified":false
+            });
+            let _=tx.send(Ok(receipt));
+        });
     }).map_err(|e| e.to_string())?;
     tokio::time::timeout(std::time::Duration::from_secs(5),rx).await
         .map_err(|_| "Scope preview dispatch timed out".to_string())?
