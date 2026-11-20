@@ -364,6 +364,89 @@ fn normalize_combo(combo: &str) -> String {
     result
 }
 
+// Linux shortcuts are application-focused. No website script is allowed to
+// dispatch these actions, and the existing configurable action map is reused.
+#[cfg(target_os = "linux")]
+fn linux_key_combo(name: &str, ctrl: bool, shift: bool, alt: bool) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let key = match lower.as_str() {
+        "equal" | "plus" => "=",
+        "minus" | "underscore" => "-",
+        "backslash" | "bar" => "\\",
+        "slash" | "question" => "/",
+        "period" | "greater" => ".",
+        "comma" | "less" => ",",
+        "semicolon" | "colon" => ";",
+        "apostrophe" | "quotedbl" => "'",
+        "grave" | "asciitilde" => "`",
+        "bracketleft" | "braceleft" => "[",
+        "bracketright" | "braceright" => "]",
+        s if s.len() == 1 && s.as_bytes()[0].is_ascii_alphanumeric() => s,
+        s if matches!(s, "f1"|"f2"|"f3"|"f4"|"f5"|"f6"|"f7"|"f8"|"f9"|"f10"|"f11"|"f12") => s,
+        _ => return None,
+    };
+    // Do not steal unmodified text entry.
+    if !ctrl && !alt && !shift && !key.starts_with('f') { return None; }
+    let combo = format!("{}{}{}{}", if ctrl {"Ctrl+"} else {""},
+        if shift {"Shift+"} else {""}, if alt {"Alt+"} else {""}, key);
+    Some(normalize_combo(&combo))
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_shortcuts(app: &tauri::AppHandle, webview: &tauri::Webview) -> Result<(), String> {
+    let handle = app.clone();
+    webview.with_webview(move |platform| {
+        use gtk::{gdk::ModifierType, prelude::*};
+        let view = platform.inner();
+        let pressed = std::rc::Rc::new(std::cell::RefCell::new(HashSet::<u16>::new()));
+        let held = pressed.clone();
+        view.connect_key_press_event(move |widget, event| {
+            // GTK supplies the event, not a page-controlled IPC message.
+            if !widget.has_focus() { return false.into(); }
+            let modifiers = event.state();
+            if modifiers.intersects(ModifierType::SUPER_MASK | ModifierType::META_MASK | ModifierType::HYPER_MASK) {
+                return false.into();
+            }
+            let Some(name) = event.keyval().name() else { return false.into(); };
+            let Some(combo) = linux_key_combo(name.as_str(),
+                modifiers.contains(ModifierType::CONTROL_MASK),
+                modifiers.contains(ModifierType::SHIFT_MASK),
+                modifiers.contains(ModifierType::MOD1_MASK)) else { return false.into(); };
+            let action = handle.state::<KeybindingState>().map.lock().get(&combo).cloned();
+            let Some(action) = action else { return false.into(); };
+            if !DEFAULT_KEYBINDINGS.iter().any(|(known, _)| *known == action.as_str()) {
+                return false.into();
+            }
+            if held.borrow_mut().insert(event.hardware_keycode()) {
+                let _ = handle.emit_to("main", "global-shortcut", action);
+            }
+            true.into()
+        });
+        let released = pressed.clone();
+        view.connect_key_release_event(move |_, event| {
+            released.borrow_mut().remove(&event.hardware_keycode());
+            false.into()
+        });
+        view.connect_focus_out_event(move |_, _| {
+            pressed.borrow_mut().clear();
+            false.into()
+        });
+    }).map_err(|e| e.to_string())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_shortcut_tests {
+    use super::*;
+    #[test]
+    fn gtk_names_match_existing_shortcut_map() {
+        assert_eq!(linux_key_combo("T", true, true, false), Some(normalize_combo("Ctrl+Shift+T")));
+        assert_eq!(linux_key_combo("equal", true, false, false), Some(normalize_combo("Ctrl+=")));
+        assert_eq!(linux_key_combo("F11", false, false, false), Some(normalize_combo("F11")));
+        assert_eq!(linux_key_combo("x", false, false, false), None);
+        assert_eq!(linux_key_combo("Control_L", true, false, false), None);
+    }
+}
+
 #[cfg(windows)]
 struct PendingPermission {
     deferral: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Deferral,
@@ -991,6 +1074,7 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
             }));
             // re-inject on every page load
             if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
+                #[cfg(not(target_os = "linux"))]
                 let _ = wv.eval(&inject_shortcut);
                 let _ = wv.eval(&inject_media);
                 let _ = wv.eval(&inject_fingerprint);
@@ -1051,7 +1135,8 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
         });
 
     builder = builder.initialization_script(&scriptlet_preamble);
-    builder = builder.initialization_script(&shortcut_script);
+    #[cfg(not(target_os = "linux"))]
+    { builder = builder.initialization_script(&shortcut_script); }
     builder = builder.initialization_script(&media_script);
     builder = builder.initialization_script(&fingerprint_script);
     // fingerprint_verify.js is injected ONLY via on_page_load (not initialization_script)
@@ -1092,12 +1177,18 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     let state = app.state::<WebviewState>();
     state.tabs.lock().insert(tab_id_track, true);
 
+    #[cfg(target_os = "linux")]
+    if let Err(e) = install_linux_shortcuts(&app, &webview) {
+        crash_log::log_error("linux-shortcuts", &e);
+    }
+
     // Linux remote documents must not receive general Tauri command access.
     // This dedicated native channel accepts only bounded cosmetic probes
     // and returns engine-derived selectors to its own WebView.
     #[cfg(target_os = "linux")]
     {
         use webkit2gtk::{UserContentManagerExt, WebViewExt};
+        use javascriptcore::ValueExt;
         let cosmetic_app = app.clone();
         let cosmetic_id = id.clone();
         let cosmetic_engine = engine.clone();
@@ -1106,7 +1197,7 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
         webview.with_webview(move |platform| {
             let view = platform.inner();
             let Some(manager) = view.user_content_manager() else { return; };
-            let weak_view = webkit2gtk::glib::ObjectExt::downgrade(view);
+            let weak_view = gtk::prelude::ObjectExt::downgrade(&view);
             let last_probe = std::cell::Cell::new(None::<std::time::Instant>);
             manager.connect_script_message_received(Some("bushidoCosmetic"), move |_, message| {
                 let Some(view) = weak_view.upgrade() else { return; };
@@ -1154,7 +1245,7 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 if selectors.is_empty() { return; }
                 if let Ok(json) = serde_json::to_string(&selectors) {
                     let script = format!("if(window.__bushidoApplyCosmetic)window.__bushidoApplyCosmetic({});", json);
-                    view.run_javascript(&script, None::<&webkit2gtk::gio::Cancellable>, |_| {});
+                    view.run_javascript(&script, None::<&gtk::gio::Cancellable>, |_| {});
                 }
             });
             if !manager.register_script_message_handler("bushidoCosmetic") {
@@ -1163,7 +1254,7 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
 
             // Media telemetry is deliberately separate from privileged
             // shortcuts, vault access, navigation and general Tauri IPC.
-            let weak_media_view = webkit2gtk::glib::ObjectExt::downgrade(view);
+            let weak_media_view = gtk::prelude::ObjectExt::downgrade(&view);
             let last_media = std::cell::Cell::new(None::<std::time::Instant>);
             manager.connect_script_message_received(Some("bushidoMedia"), move |_, message| {
                 let Some(view) = weak_media_view.upgrade() else { return; };
@@ -2467,7 +2558,8 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
         true
     });
 
-    builder = builder.initialization_script(&shortcut_s);
+    #[cfg(not(target_os = "linux"))]
+    { builder = builder.initialization_script(&shortcut_s); }
     builder = builder.initialization_script(&media_s);
     builder = builder.initialization_script(&fingerprint_s);
     builder = builder.initialization_script(&vault_s);
@@ -2485,6 +2577,11 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
             return Err(e.to_string());
         }
     };
+
+    #[cfg(target_os = "linux")]
+    if let Err(e) = install_linux_shortcuts(&app, &_webview) {
+        crash_log::log_error("linux-shortcuts", &e);
+    }
 
     // register as panel so layout_webviews skips it
     let ps = app.state::<PanelState>();
@@ -3002,9 +3099,9 @@ async fn change_linux_webview_filter(
         // Compile on first enable as well: an initially unfiltered tab may
         // be the first WebView to require this rule set. Never assume that
         // the Wry initial-create hook has already saved it.
-        let bytes = webkit2gtk::glib::Bytes::from_owned(rule_bytes.unwrap_or_default());
+        let bytes = gtk::glib::Bytes::from_owned(rule_bytes.unwrap_or_default());
         store.save("bushido-development-probe", &bytes,
-                   None::<&webkit2gtk::gio::Cancellable>,
+                   None::<&gtk::gio::Cancellable>,
                    move |result| {
             // A subsequent toggle may have completed while this compilation
             // was still in flight. Never apply stale compiled rule sets.
@@ -3192,17 +3289,20 @@ async fn revoke_permission(app: tauri::AppHandle, domain: String, permission: St
 
 #[tauri::command]
 fn rebind_shortcut(app: tauri::AppHandle, action: String, old_combo: String, new_combo: String) -> Result<(), String> {
-    use tauri_plugin_global_shortcut::GlobalShortcutExt;
-    let gs = app.global_shortcut();
-
-    // Unregister old (ignore error if it wasn't registered)
-    if !old_combo.is_empty() {
-        let _ = gs.unregister(old_combo.as_str());
+    #[cfg(not(target_os = "linux"))]
+    {
+        use tauri_plugin_global_shortcut::GlobalShortcutExt;
+        let gs = app.global_shortcut();
+        if !old_combo.is_empty() {
+            let _ = gs.unregister(old_combo.as_str());
+        }
+        gs.register(new_combo.as_str())
+            .map_err(|e| format!("Failed to register {}: {}", new_combo, e))?;
     }
-
-    // Register new
-    gs.register(new_combo.as_str())
-        .map_err(|e| format!("Failed to register {}: {}", new_combo, e))?;
+    #[cfg(target_os = "linux")]
+    if !DEFAULT_KEYBINDINGS.iter().any(|(known, _)| *known == action.as_str()) {
+        return Err("Unsupported Linux shortcut action".into());
+    }
 
     // Update the keybinding map
     let kb = app.state::<KeybindingState>();
@@ -3677,7 +3777,15 @@ pub fn run() {
                 unsafe { let _ = SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS); }
             }
 
-            // Register global shortcuts one-by-one, skipping any that fail (e.g., already registered by another app)
+            // Linux uses focused GTK events, not desktop-wide hotkeys.
+            #[cfg(target_os = "linux")]
+            if let Some(main) = app.get_webview("main") {
+                if let Err(e) = install_linux_shortcuts(app.handle(), &main) {
+                    crash_log::log_error("linux-shortcuts", &e);
+                }
+            }
+            // Register global shortcuts one-by-one on other platforms.
+            #[cfg(not(target_os = "linux"))]
             {
                 use tauri_plugin_global_shortcut::GlobalShortcutExt;
                 for combo in &shortcut_combos {

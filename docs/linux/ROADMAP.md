@@ -276,3 +276,8 @@ Bound observer tracking to 16,384 distinct tokens per kind per document, send at
 
 - The original media listener now sends bounded playback metadata via dedicated `bushidoMedia` WebKit channel, preserving Windows transport. Native receiver validates current URL, event kind, state, finite nonnegative numbers and bounded text; derives tab ID locally and emits existing `tab-media-state`. No artwork URLs, privileged shortcut actions, vault or general remote Tauri permissions are introduced.
 - Late bridge does not consume the listener's deduplication state. Rate limiting can discard rapid transitions; actual playback telemetry, frame provenance and native compilation remain open. Shortcut actions require a trusted native key-event path, not arbitrary website messages.
+
+## P4 focused native GTK keyboard shortcuts (source implemented)
+
+- Register focused GTK key press/release/focus-out handlers on main, tab and Glance WebViews. Resolve GDK names through the original normalized keybinding map, dispatch only known application actions, consume matched presses, and clear held keys on focus loss. Linux no longer registers duplicate desktop-wide hotkeys or injects the Windows shortcut bridge into ordinary tabs/Glance. Rebinding updates the same map without global registration. Windows path is retained.
+- GTK and JavaScriptCore direct dependencies are pinned to existing lockfile versions; fix owned WebView downgrade and use GTK gio/glib types in existing native IPC. Key mapping is intentionally bounded; shifted digits, arbitrary custom keys, main-window focus/propagation, auto-repeat and Wayland/plugin initialization require native tests. Not a global-shortcut parity claim.

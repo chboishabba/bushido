@@ -187,3 +187,7 @@ Exercise more than 256 distinct DOM classes/IDs, escaped Unicode/control charact
 ## Linux media telemetry
 
 Exercise playing/paused/ended and metadata updates against the existing frontend event consumer. Reject invalid kinds, oversized payloads and mismatched URLs; verify tab ID cannot be supplied by page content. Test late channel registration and rapid transitions. URL equality is not authenticated frame provenance. No native runtime pass claimed.
+
+## Linux native shortcut acceptance
+
+Test Ctrl+T, Ctrl+W, Ctrl+Shift+T, Ctrl+= and F11 in main, tab and Glance views; verify one frontend action per key sequence, unbound keys reach the page, rebind uses the live map, focus-out clears held keys, and synthetic JS keyboard events cannot reach the native GTK handler. Test Wayland and X11 independently; global plugin initialization remains an open compatibility check. Pure mapping tests added but not executed.
