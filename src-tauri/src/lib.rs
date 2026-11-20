@@ -386,7 +386,7 @@ fn linux_key_combo(name: &str, ctrl: bool, shift: bool, alt: bool) -> Option<Str
         _ => return None,
     };
     // Do not steal unmodified text entry.
-    if !ctrl && !alt && !shift && !key.starts_with('f') { return None; }
+    if !ctrl && !alt && !matches!(key, "f1"|"f2"|"f3"|"f4"|"f5"|"f6"|"f7"|"f8"|"f9"|"f10"|"f11"|"f12") { return None; }
     let combo = format!("{}{}{}{}", if ctrl {"Ctrl+"} else {""},
         if shift {"Shift+"} else {""}, if alt {"Alt+"} else {""}, key);
     Some(normalize_combo(&combo))
@@ -443,6 +443,8 @@ mod linux_shortcut_tests {
         assert_eq!(linux_key_combo("equal", true, false, false), Some(normalize_combo("Ctrl+=")));
         assert_eq!(linux_key_combo("F11", false, false, false), Some(normalize_combo("F11")));
         assert_eq!(linux_key_combo("x", false, false, false), None);
+        assert_eq!(linux_key_combo("f", false, false, false), None);
+        assert_eq!(linux_key_combo("T", false, true, false), None);
         assert_eq!(linux_key_combo("Control_L", true, false, false), None);
     }
 }
