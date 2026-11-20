@@ -203,3 +203,7 @@ Search text, quoted/escaped strings and absent terms; test forward/backward and 
 ## Linux Glance link context menu
 
 Right-click an HTTP(S) anchor in an ordinary tab and select Open in Glance. Verify the existing preview opens in the originating workspace and follows the existing filter policy. Check non-link menu, disallowed schemes and URL credentials, stale menu after navigation, closed source tab, normal Alt-click behavior without the Windows interceptor, and synthetic JavaScript messages. Native shortcut/pinned-tab automatic preview parity is still OPEN. No runtime acceptance yet.
+
+## Linux native downloads
+
+Exercise simultaneous same-name downloads in one shared workspace and another workspace, authenticated and POST/blob downloads, a failure followed by a separate success, cancellation before/after destination selection, tab destruction, MIME routing and collision protection. Verify no cookie export or replay GET, exactly one record, native-only controls hidden and completed files preserved on record removal. Verify actual WebKit data counts and callback ordering; no runtime pass claimed.

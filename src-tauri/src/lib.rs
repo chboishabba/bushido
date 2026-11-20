@@ -3,6 +3,8 @@ mod blocker;
 mod crash_log;
 pub mod dns_resolver;
 mod downloads;
+#[cfg(target_os = "linux")]
+mod linux_downloads;
 mod import;
 mod screenshot;
 mod sync;
@@ -1229,6 +1231,11 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     #[cfg(target_os = "linux")]
     if let Err(e) = install_linux_glance_menu(&app, &webview, &id) {
         crash_log::log_error("linux-glance", &e);
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Err(e) = linux_downloads::install(&app, &webview) {
+        crash_log::log_error("linux-download", &e);
     }
 
     // Linux remote documents must not receive general Tauri command access.
@@ -2651,6 +2658,11 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
         crash_log::log_error("linux-shortcuts", &e);
     }
 
+    #[cfg(target_os = "linux")]
+    if let Err(e) = linux_downloads::install(&app, &_webview) {
+        crash_log::log_error("linux-download", &e);
+    }
+
     // register as panel so layout_webviews skips it
     let ps = app.state::<PanelState>();
     ps.ids.lock().insert(glance_id);
@@ -3626,12 +3638,20 @@ async fn start_download(app: tauri::AppHandle, url: String, filename: String, do
 
 #[tauri::command]
 async fn pause_download(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if linux_downloads::is_native(&app, &id) {
+        return Err("Native WebKit downloads cannot be paused".into());
+    }
     downloads::pause(&app, &id)
 }
 
 #[tauri::command]
 async fn resume_download(app: tauri::AppHandle, id: String) -> Result<(), String> {
     let rl = app.state::<std::sync::Arc<downloads::RateLimiter>>();
+    #[cfg(target_os = "linux")]
+    if linux_downloads::is_native(&app, &id) {
+        return Err("Native WebKit downloads cannot be resumed".into());
+    }
     downloads::resume(app.clone(), id, rl.inner().clone()).await
 }
 
@@ -3649,6 +3669,10 @@ async fn set_bandwidth_limit(app: tauri::AppHandle, limit: u64) -> Result<(), St
 
 #[tauri::command]
 async fn cancel_download(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if linux_downloads::is_native(&app, &id) {
+        return linux_downloads::cancel(&app, id).await;
+    }
     downloads::cancel(&app, &id)
 }
 
@@ -3665,6 +3689,7 @@ async fn open_download(app: tauri::AppHandle, id: String) -> Result<(), String> 
     let path = {
         let downloads = dm.downloads.lock();
         let item = downloads.get(&id).ok_or("not found")?;
+        if item.state != downloads::DlState::Completed { return Err("Download not completed".into()); }
         item.file_path.clone()
     };
     tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| e.to_string())

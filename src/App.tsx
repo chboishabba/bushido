@@ -778,6 +778,7 @@ export default function App() {
         setDownloadsOpen(true);
       }),
       listen<DownloadItem>("download-started", (e) => {
+        if (e.payload.native) setDownloadsOpen(true);
         setDownloads(prev => {
           if (prev.find(d => d.id === e.payload.id)) return prev;
           return [e.payload, ...prev];

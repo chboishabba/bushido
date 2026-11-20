@@ -195,6 +195,7 @@ export interface DownloadItem {
   error: string | null;
   createdAt: number;
   supportsRange: boolean;
+  native?: boolean;
   segments: number; // 0 = single-stream, >1 = parallel connections
   priority: number;
 }

@@ -38,6 +38,7 @@ pub struct DlItem {
     pub error: Option<String>,
     pub created_at: u64,
     pub supports_range: bool,
+    pub native: bool,
     pub segments: u32, // active connection count (0 = single-stream)
     pub priority: u32,
 }
@@ -194,6 +195,7 @@ pub fn load_pending(app: &AppHandle) -> Vec<DlItem> {
                             error: None,
                             created_at: m.created_at,
                             supports_range: m.supports_range,
+                            native: false,
                             segments: seg_count,
                             priority: m.priority,
                         });
@@ -341,6 +343,7 @@ pub async fn start(app: AppHandle, url: String, file_name: String, download_dir:
         error: None,
         created_at: now_epoch(),
         supports_range: head_supports_range,
+        native: false,
         segments: 0,
         priority: 0,
     };
