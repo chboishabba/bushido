@@ -322,3 +322,5 @@ Use EGRESS_FIXTURE.md procedure and independent process/packet capture. Assert p
 
 ### P2.4e HTTPS positive and address candidate
 Use separate fixed loopback TLS fixture with operator-provided trusted synthetic certificate in disposable account; require CONNECT established, opaque relay and actual origin HTTP, correct hostname/certificate, negative trust and dead origin, wrong authority and bounded relay. Independent trace no direct fallback. Direct address producer synthetic wire/epoch/expiry and mismatch tests; actual DoH call and socket weld OPEN. Tests authored, not executed.
+
+Scoped transport receiver: cargo test dns_scoped_transport or full locked cargo test; synthetic loopback checks numeric peer and opaque relay, exact generation notification/ABA and pending cancellation, mismatched scope and concurrency slots. Test-only admission, no real network or browser route. Native compile/test and kernel dispatch/revocation verification OPEN.

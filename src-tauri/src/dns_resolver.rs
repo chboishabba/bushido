@@ -88,7 +88,10 @@ impl ResolverControl {
         let mut policy = self.0.policy.write();
         let previous = *policy;
         policy.change(parse_level(value)?)?;
-        if *policy != previous { self.0.cache.lock().clear(); }
+        if *policy != previous {
+            self.0.cache.lock().clear();
+            self.0.policy_events.send_replace(policy.generation);
+        }
         Ok(())
     }
 }
@@ -120,6 +123,12 @@ impl AddressCandidate {
     }
 }
 
+// Child module has access to the original resolver/candidate fields. No IPC
+// or HTTP handler can invoke its transport; standalone acceptance only.
+#[cfg(any(test, all(target_os = "linux", debug_assertions)))]
+#[path = "dns_scoped_transport.rs"]
+mod scoped_transport;
+
 pub struct Stats {
     pub queries: AtomicU64,
     pub hits: AtomicU64,
@@ -139,6 +148,8 @@ struct Resolver {
     client: reqwest::Client,
     stats: Arc<Stats>,
     policy: RwLock<Policy>,
+    policy_events: tokio::sync::watch::Sender<u64>,
+    transport_slots: tokio::sync::Semaphore,
 }
 
 impl Resolver {
@@ -169,6 +180,8 @@ impl Resolver {
                 errors: AtomicU64::new(0),
             }),
             policy: RwLock::new(Policy { level, generation: 0 }),
+            policy_events: tokio::sync::watch::channel(0).0,
+            transport_slots: tokio::sync::Semaphore::new(8),
         }))
     }
 
