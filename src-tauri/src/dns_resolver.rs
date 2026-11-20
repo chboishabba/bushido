@@ -83,6 +83,7 @@ struct DohReply { bytes: Vec<u8>, started: Instant, cache_max_age: Option<u32> }
 struct Resolver {
     cache: Mutex<PositiveCache>,
     cache_enabled: bool,
+    admission: tokio::sync::Semaphore,
     blocklist: RwLock<HashSet<String>>,
     client: reqwest::Client,
     stats: Arc<Stats>,
@@ -96,6 +97,7 @@ impl Resolver {
 
         Ok(Arc::new(Self {
             cache: Mutex::new(PositiveCache::default()),
+            admission: tokio::sync::Semaphore::new(32),
             cache_enabled: cfg!(debug_assertions) && std::env::var("BUSHIDO_DOH_POSITIVE_CACHE").as_deref() == Ok("1"),
             blocklist: RwLock::new(bl),
             client: reqwest::Client::builder()
@@ -162,13 +164,15 @@ impl Resolver {
         // RFC 8484 requires accounting for HTTP Age. Until general
         // message-aware aging exists, refuse nonzero/malformed/duplicate Age
         // rather than forward overstated TTLs. Absence is treated as zero.
-        let mut ages = r.headers().get_all(reqwest::header::AGE).iter();
+        let age_values = r.headers().get_all(reqwest::header::AGE);
+        let mut ages = age_values.iter();
         if let Some(age) = ages.next() {
             if age.to_str().ok().and_then(|v| v.parse::<u64>().ok()) != Some(0) || ages.next().is_some() {
                 return Err("Aged or ambiguous upstream DNS response".into());
             }
         }
-        let mut controls = r.headers().get_all(reqwest::header::CACHE_CONTROL).iter();
+        let control_values = r.headers().get_all(reqwest::header::CACHE_CONTROL);
+        let mut controls = control_values.iter();
         let cache_max_age = controls.next().and_then(|v| v.to_str().ok())
             .and_then(dns_positive_cache::explicit_max_age);
         let cache_max_age = if controls.next().is_none()
@@ -226,6 +230,8 @@ impl Resolver {
 
     async fn resolve(&self, raw: &[u8]) -> Result<Vec<u8>, String> {
         self.stats.queries.fetch_add(1, Ordering::Relaxed);
+        // Bound active resolver work; no unbounded pending queue.
+        let _permit = self.admission.try_acquire().map_err(|_| "DNS resolver busy")?;
         let req = Self::checked_request(raw)?;
         let q = &req.queries()[0];
         let snapshot = *self.policy.read();
@@ -321,6 +327,23 @@ async fn handle_stats(State(r): State<Arc<Resolver>>) -> axum::Json<serde_json::
     }))
 }
 
+// Linux fixture is not a privileged browser endpoint. These checks reject
+// ordinary browser-originated traffic and rebinding Host values, not arbitrary
+// same-host native processes. Never interpret them as client authentication.
+#[cfg(target_os = "linux")]
+fn fixture_http_admitted(headers: &axum::http::HeaderMap, uri: &axum::http::Uri, port: u16) -> bool {
+    let expected = format!("127.0.0.1:{port}");
+    let local = format!("localhost:{port}");
+    let allowed = |h: &str| h == expected || h == local;
+    let hosts = headers.get_all(header::HOST);
+    let mut values = hosts.iter();
+    let Some(host) = values.next().and_then(|h| h.to_str().ok()) else { return false; };
+    if !allowed(host) || values.next().is_some() { return false; }
+    if uri.authority().is_some_and(|a| !allowed(a.as_str())) { return false; }
+    !headers.contains_key(header::ORIGIN) && !headers.contains_key(header::REFERER)
+        && !headers.keys().any(|name| name.as_str().starts_with("sec-fetch-"))
+}
+
 pub async fn start() -> Result<u16, String> {
     start_controlled(PrivacyLevel::Strict).await.map(|(port, _)| port)
 }
@@ -328,6 +351,9 @@ pub async fn start() -> Result<u16, String> {
 pub async fn start_controlled(level: PrivacyLevel) -> Result<(u16, ResolverControl), String> {
     let resolver = Resolver::new(level)?;
     let control = ResolverControl(resolver.clone());
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await.map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let app = Router::new()
         .route("/dns-query", post(handle_post))
         .route("/dns-query", get(handle_get))
@@ -335,9 +361,18 @@ pub async fn start_controlled(level: PrivacyLevel) -> Result<(u16, ResolverContr
         .layer(axum::extract::DefaultBodyLimit::max(MAX_DNS_MESSAGE))
         .with_state(resolver);
 
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await.map_err(|e| e.to_string())?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    #[cfg(target_os = "linux")]
+    let app = app.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| async move {
+            use axum::response::IntoResponse;
+            let mut response = if fixture_http_admitted(req.headers(), req.uri(), port) {
+                next.run(req).await
+            } else { StatusCode::FORBIDDEN.into_response() };
+            response.headers_mut().insert(header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"));
+            response
+        },
+    ));
 
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
@@ -414,6 +449,28 @@ mod tests {
         assert!(Resolver::checked_response(&parsed, &response).is_err());
         req.add_query(Query::query(Name::from_ascii("other.test.").unwrap(), RecordType::AAAA));
         assert!(Resolver::checked_request(&req.to_bytes().unwrap()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixture_http_rebinding_and_browser_metadata_rejected() {
+        use axum::http::{HeaderMap, HeaderValue, Uri};
+        let uri: Uri = "/dns-query".parse().unwrap();
+        let mut h = HeaderMap::new();
+        assert!(!fixture_http_admitted(&h,&uri,1234));
+        h.insert(header::HOST,HeaderValue::from_static("127.0.0.1:1234"));
+        assert!(fixture_http_admitted(&h,&uri,1234));
+        assert!(!fixture_http_admitted(&h,&uri,1235));
+        h.insert(header::ORIGIN,HeaderValue::from_static("null"));
+        assert!(!fixture_http_admitted(&h,&uri,1234));
+        h.remove(header::ORIGIN);
+        h.insert("sec-fetch-site",HeaderValue::from_static("cross-site"));
+        assert!(!fixture_http_admitted(&h,&uri,1234));
+        h.remove("sec-fetch-site");
+        h.append(header::HOST,HeaderValue::from_static("localhost:1234"));
+        assert!(!fixture_http_admitted(&h,&uri,1234));
+        h.insert(header::HOST,HeaderValue::from_static("attacker.test:1234"));
+        assert!(!fixture_http_admitted(&h,&uri,1234));
     }
 
     #[test]

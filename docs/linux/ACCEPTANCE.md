@@ -314,3 +314,5 @@ Run the synthetic client test via consolidated preflight. On pinned local ITIR P
 
 ### P2.4d debug-only cache
 Run default resolver script with cache off. Separately enable BUSHIDO_DOH_POSITIVE_CACHE=1 in synthetic native test; expect eligible simple positive records only, transaction IDs and nonincreasing TTLs, policy ABA eviction, no CNAME/EDNS/negative/alternate-provider entries, bypass on unknown Cache-Control, rejection on nonzero Age. Use controlled upstream fixture before attributing latency; real-provider results may bypass all cache entries. Compile and four Rust fixtures unexecuted. No production change or native network binding claimed.
+
+Linux standalone resolver: valid Host/port permits fixture traffic; wrong/duplicate Host, Origin including null, Referer, Sec-Fetch headers and mismatched absolute URI must reject with no-store. Exercise concurrency admission independently (32 calls, excess rejected); no assertion of same-UID authentication. No execution yet.

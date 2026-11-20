@@ -482,3 +482,5 @@ Native vault save dialog polling/read deadline and prior fill callback deadline 
 
 ### P2.4d restricted positive DNS replay constructor
 - Added debug-only opt-in exact-wire positive A/AAAA cache, transaction rebinding, conservative TTL aging, explicit HTTP freshness gating, primary-only storage, policy generation and bounded capacity. Default/release remains uncached. Upstream nonzero/ambiguous Age fails closed until general TTL aging. Four Rust regressions written, not run. Native proxy/egress and general cache admission remain OPEN.
+
+- P2.4d/e follow-up: cache constructors recheck key/query identity, Linux loopback fixture Host and browser-origin metadata checks + no-store, 32 active resolver calls cap. No native authentication or proxy binding implied. One additional Rust negative control written, not run.

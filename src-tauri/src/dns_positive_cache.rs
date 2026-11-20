@@ -116,6 +116,7 @@ impl PositiveCache {
 
     pub(crate) fn insert(&mut self, key: Key, query: &[u8], packet: &[u8],
                          started: Instant, now: Instant, max_age: u32) {
+        if self::key(query, key.generation).as_ref() != Some(&key) { return; }
         let Some(entry) = make_entry(query, packet, started, max_age) else { return; };
         if ceil_seconds(now.saturating_duration_since(started)) >= u64::from(entry.lifetime) { return; }
         if self.entries.len() >= CAPACITY && !self.entries.contains_key(&key) {
@@ -125,6 +126,7 @@ impl PositiveCache {
     }
 
     pub(crate) fn lookup(&mut self, key: &Key, query: &[u8], now: Instant) -> Option<Vec<u8>> {
+        if self::key(query, key.generation).as_ref() != Some(key) { return None; }
         let entry = self.entries.get(key)?;
         let elapsed = ceil_seconds(now.saturating_duration_since(entry.started));
         if elapsed >= u64::from(entry.lifetime) {
