@@ -479,3 +479,6 @@ Native vault save dialog polling/read deadline and prior fill callback deadline 
 
 ### A0.1 shared ITIR MCP observation route
 - ITIR-suite PR #73 introduces read-only zkSEC policy preview, zkperf stream window planning and Bushido evidence-index self-hash checks. External local evidence client uses existing ITIR JSON bridge safe_call with fixed tool and proposal-only receipt validation; tests authored, not run. No new browser dependencies or embedded MCP. Local runner 18 stages. Rust sidecar live MCP/driver and same-object grounding remain OPEN. P2 native proxy/DoH binding still OPEN; this tranche advances acceptance-side integration, not network enforcement.
+
+### P2.4d restricted positive DNS replay constructor
+- Added debug-only opt-in exact-wire positive A/AAAA cache, transaction rebinding, conservative TTL aging, explicit HTTP freshness gating, primary-only storage, policy generation and bounded capacity. Default/release remains uncached. Upstream nonzero/ambiguous Age fails closed until general TTL aging. Four Rust regressions written, not run. Native proxy/egress and general cache admission remain OPEN.

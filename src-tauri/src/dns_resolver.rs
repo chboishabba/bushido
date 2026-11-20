@@ -2,13 +2,14 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use crate::dns_positive_cache::{self, PositiveCache};
 
 use axum::{Router, body::Bytes, extract::State, http::{StatusCode, header}, routing::{get, post}};
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::RData;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 const MAX_DNS_MESSAGE: usize = 65_535;
 const UPSTREAM_TIMEOUT: u64 = 3;
@@ -19,7 +20,7 @@ const FALLBACK: &str = "https://dns.google/dns-query";
 pub enum PrivacyLevel {
     Standard,  // doh + basic tracker blocklist
     Strict,    // + cname uncloaking + expanded lists
-    Maximum,   // + block all third-party dns, fail-closed
+    Maximum,   // + deny alternate DoH upstream (not a browser-wide egress guarantee)
 }
 
 impl Default for PrivacyLevel { fn default() -> Self { Self::Strict } }
@@ -60,7 +61,11 @@ pub struct ResolverControl(Arc<Resolver>);
 
 impl ResolverControl {
     pub fn set_level(&self, value: &str) -> Result<(), String> {
-        self.0.policy.write().change(parse_level(value)?)
+        let mut policy = self.0.policy.write();
+        let previous = *policy;
+        policy.change(parse_level(value)?)?;
+        if *policy != previous { self.0.cache.lock().clear(); }
+        Ok(())
     }
 }
 
@@ -73,7 +78,11 @@ pub struct Stats {
     pub errors: AtomicU64,
 }
 
+struct DohReply { bytes: Vec<u8>, started: Instant, cache_max_age: Option<u32> }
+
 struct Resolver {
+    cache: Mutex<PositiveCache>,
+    cache_enabled: bool,
     blocklist: RwLock<HashSet<String>>,
     client: reqwest::Client,
     stats: Arc<Stats>,
@@ -86,6 +95,8 @@ impl Resolver {
         for t in CNAME_TRACKERS { bl.insert(t.to_string()); }
 
         Ok(Arc::new(Self {
+            cache: Mutex::new(PositiveCache::default()),
+            cache_enabled: cfg!(debug_assertions) && std::env::var("BUSHIDO_DOH_POSITIVE_CACHE").as_deref() == Ok("1"),
             blocklist: RwLock::new(bl),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(UPSTREAM_TIMEOUT + 2))
@@ -118,7 +129,7 @@ impl Resolver {
         Ok(())
     }
 
-    async fn query(&self, bytes: &[u8], snapshot: Policy) -> Result<Vec<u8>, String> {
+    async fn query(&self, bytes: &[u8], snapshot: Policy) -> Result<DohReply, String> {
         self.check_policy(snapshot)?;
         if let Ok(r) = self.doh(PRIMARY, bytes).await {
             self.check_policy(snapshot)?;
@@ -128,15 +139,18 @@ impl Resolver {
         if snapshot.level == PrivacyLevel::Maximum {
             return Err("primary failed, maximum mode blocks fallback".into());
         }
-        let result = self.doh(FALLBACK, bytes).await?;
+        let mut result = self.doh(FALLBACK, bytes).await?;
         self.check_policy(snapshot)?;
+        result.cache_max_age = None; // never replay alternate-provider results
         Ok(result)
     }
 
-    async fn doh(&self, url: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    async fn doh(&self, url: &str, bytes: &[u8]) -> Result<DohReply, String> {
+        let started = Instant::now();
         let mut r = self.client.post(url)
             .header("content-type", "application/dns-message")
             .header("accept", "application/dns-message")
+            .header("cache-control", "no-cache")
             .body(bytes.to_vec())
             .timeout(Duration::from_secs(UPSTREAM_TIMEOUT))
             .send().await.map_err(|e| e.to_string())?;
@@ -145,6 +159,22 @@ impl Resolver {
             .is_some_and(|v| v.split(';').next().is_some_and(|v| v.trim().eq_ignore_ascii_case("application/dns-message"))) {
             return Err("Unexpected DNS response media type".into());
         }
+        // RFC 8484 requires accounting for HTTP Age. Until general
+        // message-aware aging exists, refuse nonzero/malformed/duplicate Age
+        // rather than forward overstated TTLs. Absence is treated as zero.
+        let mut ages = r.headers().get_all(reqwest::header::AGE).iter();
+        if let Some(age) = ages.next() {
+            if age.to_str().ok().and_then(|v| v.parse::<u64>().ok()) != Some(0) || ages.next().is_some() {
+                return Err("Aged or ambiguous upstream DNS response".into());
+            }
+        }
+        let mut controls = r.headers().get_all(reqwest::header::CACHE_CONTROL).iter();
+        let cache_max_age = controls.next().and_then(|v| v.to_str().ok())
+            .and_then(dns_positive_cache::explicit_max_age);
+        let cache_max_age = if controls.next().is_none()
+            && !r.headers().contains_key(reqwest::header::VARY)
+            && !r.headers().contains_key(reqwest::header::SET_COOKIE)
+            { cache_max_age } else { None };
         let mut out = Vec::new();
         while let Some(chunk) = r.chunk().await.map_err(|e| e.to_string())? {
             if chunk.len() > MAX_DNS_MESSAGE.saturating_sub(out.len()) {
@@ -152,7 +182,7 @@ impl Resolver {
             }
             out.extend_from_slice(&chunk);
         }
-        Ok(out)
+        Ok(DohReply { bytes: out, started, cache_max_age })
     }
 
     fn nxdomain(req: &Message) -> Vec<u8> {
@@ -204,11 +234,21 @@ impl Resolver {
             self.check_policy(snapshot)?;
             return Ok(Self::nxdomain(&req));
         }
-        // Raw cached packets reused a different transaction ID and failed to
-        // age TTLs. Disable that cache until a message-aware cache is verified.
+        let key = if self.cache_enabled { dns_positive_cache::key(raw, snapshot.generation) } else { None };
+        if let Some(key) = &key {
+            // Shared lock order: policy then cache. A policy write clears
+            // prior entries; generation binds lookup to exact policy epoch.
+            let policy = self.policy.read();
+            if *policy != snapshot { return Err("DNS policy changed during query".into()); }
+            if let Some(hit) = self.cache.lock().lookup(key, raw, Instant::now()) {
+                Self::checked_response(&req, &hit)?;
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(hit);
+            }
+        }
         self.stats.upstream.fetch_add(1, Ordering::Relaxed);
         let resp = self.query(raw, snapshot).await?;
-        let msg = Self::checked_response(&req, &resp)?;
+        let msg = Self::checked_response(&req, &resp.bytes)?;
         if snapshot.level != PrivacyLevel::Standard {
             for target in Self::cnames(&msg) {
                 if self.is_blocked(&target) {
@@ -218,8 +258,12 @@ impl Resolver {
                 }
             }
         }
-        self.check_policy(snapshot)?;
-        Ok(resp)
+        let policy = self.policy.read();
+        if *policy != snapshot { return Err("DNS policy changed during query".into()); }
+        if let (Some(key), Some(max_age)) = (key, resp.cache_max_age) {
+            self.cache.lock().insert(key, raw, &resp.bytes, resp.started, Instant::now(), max_age);
+        }
+        Ok(resp.bytes)
     }
 }
 
@@ -270,8 +314,9 @@ async fn handle_stats(State(r): State<Arc<Resolver>>) -> axum::Json<serde_json::
         "cname_blocked": r.stats.cname_blocked.load(Ordering::Relaxed),
         "upstream": r.stats.upstream.load(Ordering::Relaxed),
         "errors": r.stats.errors.load(Ordering::Relaxed),
-        "cache": 0,
-        "cache_enabled": false,
+        "cache": r.cache.lock().len(),
+        "cache_enabled": r.cache_enabled,
+        "cache_scope": "debug_positive_address_only",
         "state": "proposal_only",
     }))
 }

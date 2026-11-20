@@ -311,3 +311,6 @@ Use isolated test_dns binary and dns_test.py with randomized transaction IDs; co
 
 ### A0.1 external ITIR evidence check
 Run the synthetic client test via consolidated preflight. On pinned local ITIR PR #73 checkout install existing suite dependencies, discover three new tools, test actual provider calls, pass private synthetic five-layer index via fixed client and verify abstained/proposal-only receipt; altered digest, authority promotion and wrong commit/receipt reject. Not proof of browser execution or linked artifacts. Native Rust automation and WebKit egress unchanged.
+
+### P2.4d debug-only cache
+Run default resolver script with cache off. Separately enable BUSHIDO_DOH_POSITIVE_CACHE=1 in synthetic native test; expect eligible simple positive records only, transaction IDs and nonincreasing TTLs, policy ABA eviction, no CNAME/EDNS/negative/alternate-provider entries, bypass on unknown Cache-Control, rejection on nonzero Age. Use controlled upstream fixture before attributing latency; real-provider results may bypass all cache entries. Compile and four Rust fixtures unexecuted. No production change or native network binding claimed.

@@ -2,6 +2,7 @@ mod bench;
 mod blocker;
 mod crash_log;
 pub mod dns_resolver;
+mod dns_positive_cache;
 mod downloads;
 #[cfg(target_os = "linux")]
 mod linux_downloads;
