@@ -1101,6 +1101,8 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
         let cosmetic_app = app.clone();
         let cosmetic_id = id.clone();
         let cosmetic_engine = engine.clone();
+        let media_app = app.clone();
+        let media_id = id.clone();
         webview.with_webview(move |platform| {
             let view = platform.inner();
             let Some(manager) = view.user_content_manager() else { return; };
@@ -1157,6 +1159,56 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
             });
             if !manager.register_script_message_handler("bushidoCosmetic") {
                 crash_log::log_error("cosmetic-ipc", "Unable to register Linux cosmetic channel");
+            }
+
+            // Media telemetry is deliberately separate from privileged
+            // shortcuts, vault access, navigation and general Tauri IPC.
+            let weak_media_view = webkit2gtk::glib::ObjectExt::downgrade(view);
+            let last_media = std::cell::Cell::new(None::<std::time::Instant>);
+            manager.connect_script_message_received(Some("bushidoMedia"), move |_, message| {
+                let Some(view) = weak_media_view.upgrade() else { return; };
+                let Some(uri) = view.uri() else { return; };
+                let Ok(url) = url::Url::parse(uri.as_str()) else { return; };
+                if !matches!(url.scheme(), "http" | "https") { return; }
+                let now = std::time::Instant::now();
+                if last_media.get().is_some_and(|last| now.duration_since(last).as_millis() < 200) {
+                    return;
+                }
+                let Some(value) = message.js_value() else { return; };
+                let raw = value.to_string();
+                if raw.len() > 8192 { return; }
+                let Ok(msg) = serde_json::from_str::<serde_json::Value>(&raw) else { return; };
+                if msg.get("__bushido").and_then(|v| v.as_str()) != Some("media")
+                    || msg.get("url").and_then(|v| v.as_str()) != Some(uri.as_str()) {
+                    return;
+                }
+                let Some(state) = msg.get("state").and_then(|v| v.as_str()) else { return; };
+                if !matches!(state, "playing" | "paused" | "ended") { return; }
+                let clean = |s: &str| -> String {
+                    s.chars().filter(|c| !c.is_control() && *c != '<' && *c != '>')
+                        .take(256).collect()
+                };
+                let mut payload = serde_json::json!({
+                    "id": media_id, "state": state,
+                    "title": clean(msg.get("title").and_then(|v| v.as_str()).unwrap_or(""))
+                });
+                for key in ["artist", "metaTitle"] {
+                    if let Some(value) = msg.get(key).and_then(|v| v.as_str()) {
+                        payload[key] = serde_json::json!(clean(value));
+                    }
+                }
+                for key in ["currentTime", "duration", "playbackRate"] {
+                    if let Some(value) = msg.get(key).and_then(|v| v.as_f64()) {
+                        if value.is_finite() && value >= 0.0 {
+                            payload[key] = serde_json::json!(value);
+                        }
+                    }
+                }
+                last_media.set(Some(now));
+                let _ = media_app.emit_to("main", "tab-media-state", payload);
+            });
+            if !manager.register_script_message_handler("bushidoMedia") {
+                crash_log::log_error("media-ipc", "Unable to register Linux media channel");
             }
         }).map_err(|e| e.to_string())?;
     }

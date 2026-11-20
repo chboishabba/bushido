@@ -271,3 +271,8 @@ No UI framework rewrite, engine replacement without evidence, simulated network 
 ## P2.2 cosmetic transport batching
 
 Bound observer tracking to 16,384 distinct tokens per kind per document, send at most 64 classes and 64 IDs per batch, bound serialized UTF-8 size, drain batches at the existing 500 ms cadence, and retain pending tokens when the bridge is not available. Linux receiver rejects inconsistent document URLs (not authenticated frame provenance). Native runtime acceptance remains open.
+
+## P4 Linux media telemetry bridge (source implemented)
+
+- The original media listener now sends bounded playback metadata via dedicated `bushidoMedia` WebKit channel, preserving Windows transport. Native receiver validates current URL, event kind, state, finite nonnegative numbers and bounded text; derives tab ID locally and emits existing `tab-media-state`. No artwork URLs, privileged shortcut actions, vault or general remote Tauri permissions are introduced.
+- Late bridge does not consume the listener's deduplication state. Rate limiting can discard rapid transitions; actual playback telemetry, frame provenance and native compilation remain open. Shortcut actions require a trusted native key-event path, not arbitrary website messages.

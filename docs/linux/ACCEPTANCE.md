@@ -183,3 +183,7 @@ Exercise the dedicated channel with valid class/ID batches, invalid JSON, oversi
 ## Cosmetic batch acceptance
 
 Exercise more than 256 distinct DOM classes/IDs, escaped Unicode/control characters, a late bridge, and stale URL messages. Batches must fit the native receipt limits and eventually drain when the channel is available. URL equality is not a frame-authentication mechanism.
+
+## Linux media telemetry
+
+Exercise playing/paused/ended and metadata updates against the existing frontend event consumer. Reject invalid kinds, oversized payloads and mismatched URLs; verify tab ID cannot be supplied by page content. Test late channel registration and rapid transitions. URL equality is not authenticated frame provenance. No native runtime pass claimed.

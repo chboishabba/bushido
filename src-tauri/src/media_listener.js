@@ -34,11 +34,24 @@
 
     var stateKey = state + '|' + Math.floor(msg.currentTime);
     if (!force && stateKey === lastState) return;
-    lastState = stateKey;
-
-    if (window.chrome && window.chrome.webview) {
-      window.chrome.webview.postMessage(JSON.stringify(msg));
-    }
+    try {
+      if (window.webkit && window.webkit.messageHandlers &&
+          window.webkit.messageHandlers.bushidoMedia) {
+        // Only forward fields consumed by the existing browser UI.
+        delete msg.artwork;
+        delete msg.album;
+        msg.url = location.href;
+        ['title', 'artist', 'metaTitle'].forEach(function(key) {
+          if (typeof msg[key] === 'string') msg[key] = msg[key].slice(0, 256);
+        });
+        window.webkit.messageHandlers.bushidoMedia.postMessage(JSON.stringify(msg));
+      } else if (window.chrome && window.chrome.webview) {
+        window.chrome.webview.postMessage(JSON.stringify(msg));
+      } else {
+        return; // keep the state eligible for a later poll
+      }
+      lastState = stateKey;
+    } catch (_) {}
   }
 
   // Event listeners on media elements
