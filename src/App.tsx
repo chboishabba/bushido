@@ -2227,6 +2227,18 @@ export default function App() {
 
   // Screenshot: capture viewport while webview is on-screen, then hide + open overlay
   const screenshotPending = useRef(false);
+  const screenshotContext = useRef<{ workspace: string; tab: string; url: string } | null>(null);
+  useEffect(() => {
+    const captured = screenshotContext.current;
+    if (screenshotPreview === null && annotationData === null) { screenshotContext.current = null; return; }
+    if (captured && (captured.workspace !== activeWorkspaceId || captured.tab !== activeTab
+        || !tabs.some(t => t.id === captured.tab && t.workspaceId === captured.workspace && t.url === captured.url))) {
+      screenshotContext.current = null;
+      setScreenshotPreview(null);
+      setAnnotationData(null);
+      syncLayoutRef.current();
+    }
+  }, [activeWorkspaceId, activeTab, tabs, screenshotPreview, annotationData]);
   const openScreenshot = useCallback(async () => {
     if (!activeTab || screenshotPending.current || useFeatureStore.getState().screenshotPreview !== null) return;
     const workspace = activeWorkspaceId;
@@ -2246,6 +2258,7 @@ export default function App() {
       hidden = true;
       await invoke("layout_webviews", { panes: [], focusedTabId: activeTab, sidebarW: 0, topOffset: 0 });
       if (!stillCurrent()) { syncLayoutRef.current(); return; }
+      screenshotContext.current = { workspace, tab: activeTab, url: source.url };
       setScreenshotPreview(b64);
     } catch (e) {
       if (hidden) syncLayoutRef.current();

@@ -131,8 +131,8 @@ pub async fn capture_visible(app: tauri::AppHandle, id: String) -> Result<String
 }
 
 /// Capture viewport preview + hide webview off-screen (for area select overlay)
-#[tauri::command]
 #[cfg(windows)]
+#[tauri::command]
 pub async fn capture_preview_for_select(app: tauri::AppHandle, id: String) -> Result<String, String> {
     use tauri::Manager;
 
@@ -341,12 +341,13 @@ fn decode_png(data: &str) -> Result<(Vec<u8>, image::RgbaImage), String> {
 
 #[cfg(target_os = "linux")]
 #[tauri::command]
-pub async fn capture_visible(app: tauri::AppHandle, id: String) -> Result<String, String> {
+pub async fn capture_visible(app: tauri::AppHandle, webview: tauri::Webview, id: String) -> Result<String, String> {
     use base64::Engine as _;
     use gtk::{glib, gio, prelude::*};
     use tauri::Manager;
     use webkit2gtk::{LoadEvent, SnapshotOptions, SnapshotRegion, WebViewExt};
     use std::{cell::Cell, rc::Rc, time::Duration};
+    if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
     let owner = crate::live_native_tab_owner(&app, &id).ok_or("Not a live ordinary tab")?;
     let wv = app.get_webview(&id).ok_or("Webview not found")?;
     let pos = wv.position().map_err(|e| e.to_string())?;
@@ -454,7 +455,8 @@ fn save_png_exclusive(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result
 
 #[cfg(target_os = "linux")]
 #[tauri::command]
-pub async fn save_screenshot(data: String, suggested_name: String) -> Result<String, String> {
+pub async fn save_screenshot(webview: tauri::Webview, data: String, suggested_name: String) -> Result<String, String> {
+    if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
     tokio::task::spawn_blocking(move || {
         let (bytes, _) = decode_png(&data)?;
         let dir = dirs::download_dir().ok_or("Downloads directory unavailable")?;
@@ -467,8 +469,9 @@ pub async fn save_screenshot(data: String, suggested_name: String) -> Result<Str
 
 #[cfg(target_os = "linux")]
 #[tauri::command]
-pub async fn copy_image_to_clipboard(app: tauri::AppHandle, data: String) -> Result<(), String> {
+pub async fn copy_image_to_clipboard(app: tauri::AppHandle, webview: tauri::Webview, data: String) -> Result<(), String> {
     use gtk::{gdk, gdk_pixbuf, glib};
+    if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
     let (_, rgba) = tokio::task::spawn_blocking(move || decode_png(&data))
         .await.map_err(|_| "Screenshot decoder failed".to_string())??;
     let (w, h) = rgba.dimensions();
