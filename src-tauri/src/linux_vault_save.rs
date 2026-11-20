@@ -1,6 +1,7 @@
 //! Submission-triggered consent. Only metadata crosses the world-specific
 //! message handler. A selected password is read after native GTK approval.
 use gtk::{glib, prelude::*};
+use futures_util::future::{select, Either};
 use javascriptcore::ValueExt;
 use serde::Deserialize;
 use std::{cell::{Cell, RefCell}, rc::Rc, sync::{Arc, atomic::{AtomicU64, Ordering}}, time::{Duration, Instant}};
@@ -85,9 +86,9 @@ async fn approve(view: &WebView, origin: &str, username: &str, valid: &impl Fn()
     dialog.show_all();
     let approved = loop {
         if !valid() { break false; }
-        tokio::select! {
-            reply = &mut rx => break reply.unwrap_or(false),
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        match select(&mut rx, glib::timeout_future(Duration::from_millis(200))).await {
+            Either::Left((reply, _)) => break reply.unwrap_or(false),
+            Either::Right(((), _)) => {}
         }
     };
     dialog.close();
@@ -146,8 +147,11 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                 }
                 let ticket = serde_json::to_string(&notice.ticket).expect("string serializes");
                 let source = format!("globalThis.__bushidoSaveTake?.({ticket},{}) ?? null", notice.id);
-                let result = tokio::time::timeout(Duration::from_secs(3), view.run_javascript_in_world_future(&source, WORLD)).await;
-                let Ok(Ok(result)) = result else { status(&app, "Login save cancelled: form no longer available"); return; };
+                let result = select(view.run_javascript_in_world_future(&source, WORLD),
+                    glib::timeout_future(Duration::from_secs(3))).await;
+                let Either::Left((Ok(result), _)) = result else {
+                    status(&app, "Login save cancelled: form no longer available"); return;
+                };
                 if !valid() { return; }
                 let Some(value) = result.js_value() else { return; };
                 let raw = Zeroizing::new(value.to_string().to_string());

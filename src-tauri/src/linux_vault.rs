@@ -1,5 +1,6 @@
 //! Explicit native credential selection. No remote IPC or automatic secret broadcast.
 use gtk::{glib, prelude::*};
+use futures_util::future::{select as race, Either};
 use javascriptcore::ValueExt;
 use std::{cell::Cell, rc::Rc};
 use tauri::{Emitter, Manager};
@@ -170,9 +171,9 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                             });
                     }).is_err() { return; }
                     drop(source);
-                    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
-                        Ok(Ok(true)) => message(&app, "Saved login filled; review before submitting"),
-                        Ok(Ok(false)) => message(&app, "Login form changed; nothing filled"),
+                    match race(rx, glib::timeout_future(std::time::Duration::from_secs(5))).await {
+                        Either::Left((Ok(true), _)) => message(&app, "Saved login filled; review before submitting"),
+                        Either::Left((Ok(false), _)) => message(&app, "Login form changed; nothing filled"),
                         _ => message(&app, "Login fill result unavailable; inspect the form"),
                     }
                 });
