@@ -4168,6 +4168,11 @@ async fn open_download_folder(app: tauri::AppHandle, id: String) -> Result<(), S
     tauri_plugin_opener::open_path(&parent, None::<&str>).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn binary_updater_enabled() -> bool {
+    cfg!(target_os = "windows")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // start local DoH resolver before any webview creation
@@ -4299,10 +4304,14 @@ pub fn run() {
         map: Mutex::new(keybinding_map),
     };
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .manage(WebviewState {
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init());
+    // Linux packages are distributed by the package manager or rebuilt
+    // locally. Never install binaries from the upstream Windows channel.
+    #[cfg(target_os = "windows")]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+
+    builder.manage(WebviewState {
             tabs: Mutex::new(HashMap::new()),
             #[cfg(target_os = "linux")]
             pinned: Mutex::new(HashSet::new()),
@@ -4573,6 +4582,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            binary_updater_enabled,
             create_tab,
             suspend_tab,
             resume_tab,

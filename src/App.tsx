@@ -533,6 +533,7 @@ export default function App() {
   useEffect(() => {
     const t = setTimeout(async () => {
       try {
+        if (!await invoke<boolean>("binary_updater_enabled")) return;
         const update = await checkUpdate();
         if (update) {
           setPendingUpdate({ version: update.version, downloading: false });
@@ -2817,6 +2818,10 @@ export default function App() {
         if (pendingUpdate.downloading) return;
         setPendingUpdate({ ...pendingUpdate, downloading: true });
         try {
+          if (!await invoke<boolean>("binary_updater_enabled")) {
+            setPendingUpdate(null);
+            return;
+          }
           const update = await checkUpdate();
           if (update) {
             await update.downloadAndInstall();
