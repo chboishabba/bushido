@@ -101,28 +101,67 @@ def relay(left, right, deadline):
     return "eof",total[left],total[right]
 
 
+# Fixed HTTPS fixture routes; names mirror the native observation categories.
+PAGE = b"""<!doctype html><meta charset=utf-8><title>Bushido TLS origin fixture</title>
+<script src="/script.js"></script><img src="/pixel"><iframe src="/frame"></iframe>
+<script>
+fetch('/fetch').catch(()=>{});
+fetch('/redirect').catch(()=>{});
+try { new Worker('/worker.js'); } catch (_) {}
+</script><p>Opaque TLS tunnel positive controls</p>"""
+ROUTES = {
+    "/": ("document_route",200,"text/html",PAGE),
+    "/script.js": ("script_route",200,"text/javascript",b"window.fixtureScript=true;"),
+    "/pixel": ("image_route",200,"image/svg+xml",b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>'),
+    "/fetch": ("fetch_route",200,"text/plain",b"fixture"),
+    "/frame": ("frame_route",200,"text/html",b"<p>Fixed same-origin frame</p>"),
+    "/worker.js": ("worker_route",200,"text/javascript",b"importScripts('/worker-import.js');"),
+    "/worker-import.js": ("worker_import_route",200,"text/javascript",b"self.fixture=true;"),
+    "/redirect": ("redirect_route",302,"text/plain",b"fixture redirect"),
+    "/redirect-target": ("redirect_target_route",200,"text/plain",b"fixture redirected"),
+}
+REQUIRED_ROUTES = sorted(route[0] for route in ROUTES.values())
+
+
+def origin_route(path, hosts):
+    if hosts != [HOST]:
+        return None
+    return ROUTES.get(path)
+
+
 class OriginHandler(BaseHTTPRequestHandler):
     def log_message(self,*args):
         pass
     def do_GET(self):
-        if self.path != "/" or self.headers.get_all("Host") != [HOST]:
+        route=origin_route(self.path,self.headers.get_all("Host"))
+        if route is None or self.headers.get_all("Transfer-Encoding") or self.headers.get_all("Content-Length"):
             self.send_error(403)
             return
-        self.server.observed += 1
-        body=b"<!doctype html><title>Bushido TLS origin fixture</title><p>Opaque TLS tunnel positive control</p>"
-        self.send_response(200)
+        category,status,mime,body=route
+        self.server.record(category)
+        self.send_response(status)
         self.send_header("Content-Length",str(len(body)))
-        self.send_header("Content-Type","text/html")
+        self.send_header("Content-Type",mime)
         self.send_header("Cache-Control","no-store")
+        self.send_header("Connection","close")
+        if status==302:
+            self.send_header("Location","/redirect-target")
         self.end_headers()
         self.wfile.write(body)
 
 
 class Origin(HTTPServer):
-    observed = 0
     def __init__(self, context):
         self.context=context
+        self.counts=Counter()
+        self.count_lock=threading.Lock()
         super().__init__(("127.0.0.1",0),OriginHandler)
+    def record(self, category):
+        with self.count_lock:
+            self.counts[category]+=1
+    def snapshot(self):
+        with self.count_lock:
+            return dict(self.counts)
     def get_request(self):
         sock,addr=super().get_request()
         sock.settimeout(3)
@@ -148,11 +187,15 @@ class Proxy:
         self.stop=threading.Event()
 
     def snapshot(self):
-        return {"schema":1,"fixture":"fixed_loopback_tls_tunnel_v1",
+        routes=self.origin.snapshot() if self.origin is not None else {}
+        return {"schema":1,"fixture":"fixed_loopback_tls_tunnel_v2",
                 "state":"proposal_only","native_acceptance":"OPEN",
                 "external_forwarding":False,"dns_bound":False,
                 "counts":dict(self.counts),
-                "origin_http_observed":self.origin.observed if self.origin is not None else 0}
+                "origin_http_observed":sum(routes.values()),
+                "origin_routes":routes,
+                "missing_origin_routes":[k for k in REQUIRED_ROUTES if not routes.get(k)],
+                "native_resource_correlation_verified":False}
 
     def write_receipt(self):
         if self.receipt is not None:
@@ -214,6 +257,17 @@ def read_exact(sock, count):
 
 
 class Tests(unittest.TestCase):
+    def test_origin_route_allowlist(self):
+        self.assertEqual(len(REQUIRED_ROUTES),9)
+        for path,route in ROUTES.items():
+            self.assertEqual(origin_route(path,[HOST]),route)
+        for path in ('/?private=1','/unknown','http://'+HOST+'/','/redirect-target?x=1'):
+            self.assertIsNone(origin_route(path,[HOST]))
+        self.assertIsNone(origin_route('/',[HOST,HOST]))
+        self.assertIsNone(origin_route('/',['other.test']))
+        self.assertEqual(origin_route('/redirect',[HOST])[1],302)
+        self.assertEqual(origin_route('/redirect-target',[HOST])[1],200)
+
     def test_exact_authority(self):
         valid=("CONNECT "+AUTHORITY+" HTTP/1.1\r\nHost: "+AUTHORITY+"\r\n\r\n").encode()
         self.assertTrue(connect_request(valid))

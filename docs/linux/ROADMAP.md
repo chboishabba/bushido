@@ -506,3 +506,5 @@ Native vault save dialog polling/read deadline and prior fill callback deadline 
 
 ### P2.4e native resource lifecycle observation
 - v3 preview uses same native document epoch observer, resource-load-started and per-resource URI/failed/TLS/finished callbacks; fixed categories, bounded hooks and omission counts, old epoch excluded. No frame identity, dispatch/redirect proof or CONNECT binding; nullable sent-request argument deferred pending pinned binding verification. Three Rust tests authored, not run. Native coverage, attribution and live scope issuance OPEN.
+
+- P2.4e matching independent HTTPS route matrix: original TLS fixture now has nine exact synthetic fixed routes with aggregate origin arrivals and missing positives; same category names as native resource v3 preview, no identity join asserted. One Python test authored, not run. No dependencies or runner stages added.
