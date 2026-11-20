@@ -55,7 +55,10 @@ def doh_get(domain, qtype=1):
     )
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
-            return parse_dns_response(r.read())
+            data = r.read()
+            if data[:2] != q[:2]:
+                return {"error": "transaction ID mismatch"}
+            return parse_dns_response(data)
     except Exception as e:
         return {'error': str(e)}
 
@@ -87,6 +90,18 @@ def run():
     # health check
     s = stats()
     test("resolver responding", "queries" in s, f"port {PORT}")
+
+    # HTTP cannot alter resolver policy; native trusted control only.
+    before = stats().get("level")
+    req = urllib.request.Request(f"{BASE}/level", data=b'"standard"', method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=3) as r:
+            test("HTTP policy mutation rejected", False, str(r.status))
+    except urllib.error.HTTPError as e:
+        test("HTTP policy mutation rejected", e.code == 404)
+    except Exception as e:
+        test("HTTP policy mutation rejected", False, str(e))
+    test("policy unchanged", before is not None and stats().get("level") == before)
 
     # basic A query via POST
     r = doh_post("example.com")
@@ -164,14 +179,14 @@ def run():
     avg = elapsed / 10
     print(f"  OBSERVED upstream latency: {avg:.1f}ms avg over 10 queries")
 
-    # cached latency
+    # repeat-query latency (not cached)
     doh_post("mozilla.org")
     t0 = time.time()
-    for _ in range(100):
+    for _ in range(10):
         doh_post("mozilla.org")
     elapsed = (time.time() - t0) * 1000
-    avg = elapsed / 100
-    print(f"  OBSERVED repeat query latency: {avg:.2f}ms avg over 100 queries (cache disabled)")
+    avg = elapsed / 10
+    print(f"  OBSERVED repeat query latency: {avg:.2f}ms avg over 10 queries (cache disabled)")
 
     # stats check
     s = stats()

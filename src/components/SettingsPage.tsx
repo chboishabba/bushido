@@ -199,6 +199,12 @@ interface SyncInfo {
 export default memo(function SettingsPage({ workspaceId, workspaceName, settings, onUpdate, onReloadAllTabs, onThemeChange, onOpenUrl, onImportBookmarks, onImportHistory }: Props) {
   const [activeTab, setActiveTab] = useState<TabId>("general");
   const [securityDirty, setSecurityDirty] = useState(false);
+  const [dnsBackend, setDnsBackend] = useState("unknown");
+  useEffect(() => {
+    let alive = true;
+    invoke<string>("dns_backend_status").then(value => { if (alive) setDnsBackend(value); }).catch(() => {});
+    return () => { alive = false; };
+  }, []);
   const [syncInfo, setSyncInfo] = useState<SyncInfo | null>(null);
   const [syncLoading, setSyncLoading] = useState(false);
   const [pairingWizard, setPairingWizard] = useState<{
@@ -728,7 +734,7 @@ export default memo(function SettingsPage({ workspaceId, workspaceName, settings
       <div className="settings-row">
         <div className="settings-label">
           <span>DNS protection</span>
-          <span className="settings-hint">Standard: encrypted DNS. Strict: also detects hidden trackers. Maximum: no fallback, may break some sites.</span>
+          <span className="settings-hint">{dnsBackend === "configured_unverified" ? "Resolver configured; browser routing unverified. Strict checks tracker CNAMEs; Maximum denies alternate upstream." : dnsBackend === "fixture_only" ? "Local resolver fixture only; WebKit browser DNS is not enforced." : "Browser DoH unavailable or unverified. This preference does not establish encrypted browser DNS."}</span>
         </div>
         <Select
           value={settings.dnsLevel || "strict"}

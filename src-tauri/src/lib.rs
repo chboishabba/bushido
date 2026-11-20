@@ -3982,6 +3982,17 @@ async fn set_dns_level(app: tauri::AppHandle, webview: tauri::Webview, level: St
 struct DnsControl(Option<dns_resolver::ResolverControl>);
 
 #[tauri::command]
+fn dns_backend_status(app: tauri::AppHandle, webview: tauri::Webview) -> Result<String, String> {
+    if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
+    let active = app.state::<DnsControl>().0.is_some();
+    Ok(match (cfg!(windows), active) {
+        (true, true) => "configured_unverified",
+        (false, true) => "fixture_only",
+        _ => "unavailable",
+    }.into())
+}
+
+#[tauri::command]
 async fn load_settings(app: tauri::AppHandle) -> Result<String, String> {
     let p = settings_path(&app);
     if p.exists() { fs::read_to_string(&p).map_err(|e| e.to_string()) } else { Ok("{}".into()) }
@@ -4703,6 +4714,7 @@ pub fn run() {
             restore_backup,
             save_settings,
             set_dns_level,
+            dns_backend_status,
             load_settings,
             save_history,
             load_history,

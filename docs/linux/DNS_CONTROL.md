@@ -10,3 +10,5 @@ This changes the original application DoH resolver, not WebKitGTK's network proc
 - HTTP GET/POST and aggregate stats still exist on loopback in enabled runs. Local untrusted request admission, DNS rebinding, rate limits, DNS query metadata exposure and other network producer edges remain OPEN; do not deploy the debug fixture on real profiles.
 
 Next: exact message-aware cache and independent zkperf measurements; determine enforceable native WebKit egress path, test all processes, redirect/frame/worker/DNS failure cases and ground via same-binary zkSEC witnesses. No hosted CI or native testing.
+
+The settings display explicitly distinguishes configured-unverified, fixture-only and unavailable backends. A successful resolver setting is not proof of routing. Test both GET and POST transaction identity and the removed HTTP control route. Persisted unrecognized/absent level currently defaults to Strict; independent Windows restart/failure behavior remains OPEN.
