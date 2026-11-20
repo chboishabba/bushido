@@ -281,3 +281,11 @@ P5.1 local build script syntax PASS and missing-tool fail-fast exit 2 verified o
 On actual Linux, start cold with HTTP(S) URL, then send second launch, empty launch, multiple and malformed links, oversized batch, hostile schemes/userinfo, queue-full and stale socket. Verify one process holds lock prior to DNS/cache writes, secondary never initializes services, peer UID/private mode, crash releases lock, stale socket only removed by owner, no deletion of unrelated file, no fallback on timeout. Confirm actual main-WebView-only command, explicit named-workspace prompt, onboarding delay, rejection, changed workspace cancellation, original URL goes through normal tab policy. Test real GTK window focus/confirm and same-UID threat boundary. Do not register desktop MIME handlers until native cold/warm route and instance acceptance; Windows unaffected. Three Rust tests pending.
 
 Local independent kernel primitive reference 11/11 PASS (separate processes, SIGKILL, O_NOFOLLOW, SO_PEERCRED, framed socket/ack/stale inode); not compiled Rust. Verify explicit authority, backslash/userinfo rejection, same primary/secondary bounds, private socket 0600, poll disabled on Windows, same-workspace updates do not cancel and genuine switch does. No MIME registration until native acceptance.
+
+### Local consolidated P0 receipt
+Run from a clean committed checkout with Python 3.11+:
+```sh
+python3 scripts/linux/accept-local.py --self-test
+python3 scripts/linux/accept-local.py
+```
+The runner creates a private /tmp/bushido-acceptance-* directory; retain it before reboot, review logs for sensitive information before sharing, and report receipt.json plus failing stage logs. Exit 0 means the listed local P0 stages completed, not native GUI/security acceptance; exit 1 indicates a failed stage or changed checkout; exit 2 indicates blocked prerequisites or setup failure. Incomplete receipts must never be considered accepted. The runner invokes npm ci/build/test and locked Cargo check/test on the original checkout; it does not install OS packages, launch Bushido, change defaults, or access its profile. Continue with manual native cases above or external driver once P0 passes. Existing preflight remains available.

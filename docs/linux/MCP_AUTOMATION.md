@@ -36,3 +36,6 @@ A1 acceptance sprint: build pinned app, run external driver with isolated XDG pa
 A2: evaluate existing Rust WebDriver MCP server with Tauri capabilities; adapt or use rmcp/fantoccini thin sidecar if needed. Keep separate lockfile/package and no shipping integration.
 A3: compact batches, snapshots, deterministic receipts, negative security controls and benchmark.
 A4: only after local acceptance, decide CI integration. Do not run hosted CI for the current implementation sprint.
+
+### A0 local receipt seam
+`python3 scripts/linux/accept-local.py` now records the P0 stage outcomes, exact source SHA and lock hashes, host/tool versions, and private per-stage log hashes. This is a build/fixture orchestrator, not an MCP server or WebDriver session. A1 must consume its successful receipt and attach distinct scenario evidence for the actual same-source executable and isolated profile.
