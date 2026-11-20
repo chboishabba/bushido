@@ -1447,7 +1447,7 @@ pub enum WebviewMessage {
   SetAutoResize(bool),
   SetZoom(f64),
   SetBackgroundColor(Option<Color>),
-  ClearAllBrowsingData,
+  ClearAllBrowsingData(Sender<Result<()>>),
   // Getters
   Url(Sender<Result<String>>),
   Bounds(Sender<Result<tauri_runtime::dpi::Rect>>),
@@ -1794,14 +1794,17 @@ impl<T: UserEvent> WebviewDispatch<T> for WryWebviewDispatcher<T> {
   }
 
   fn clear_all_browsing_data(&self) -> Result<()> {
+    let (tx, rx) = channel();
     send_user_message(
       &self.context,
       Message::Webview(
         *self.window_id.lock().unwrap(),
         self.webview_id,
-        WebviewMessage::ClearAllBrowsingData,
+        WebviewMessage::ClearAllBrowsingData(tx),
       ),
-    )
+    )?;
+    // Do not return success for a message that was merely queued.
+    rx.recv().map_err(|_| Error::FailedToSendMessage)?
   }
 
   fn hide(&self) -> Result<()> {
@@ -3749,10 +3752,12 @@ fn handle_user_message<T: UserEvent>(
               log::error!("failed to set webview background color: {e}");
             }
           }
-          WebviewMessage::ClearAllBrowsingData => {
-            if let Err(e) = webview.clear_all_browsing_data() {
+          WebviewMessage::ClearAllBrowsingData(tx) => {
+            let result = webview.clear_all_browsing_data().map_err(|e| {
               log::error!("failed to clear webview browsing data: {e}");
-            }
+              Error::FailedToSendMessage
+            });
+            let _ = tx.send(result);
           }
           // Getters
           WebviewMessage::Url(tx) => {
@@ -4628,6 +4633,7 @@ You may have it installed on another user account, but it is not available for t
     .with_accept_first_mouse(webview_attributes.accept_first_mouse)
     .with_incognito(webview_attributes.incognito)
     .with_profile_name(webview_attributes.profile_name.clone())
+    .with_native_content_filter_enabled(webview_attributes.native_content_filter_enabled)
     .with_clipboard(webview_attributes.clipboard)
     .with_hotkeys_zoom(webview_attributes.zoom_hotkeys_enabled);
 
@@ -4906,6 +4912,10 @@ You may have it installed on another user account, but it is not available for t
   {
     if let Some(path) = &webview_attributes.extensions_path {
       webview_builder = webview_builder.with_extensions_path(path);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(data) = webview_attributes.linux_extension_initialization.as_ref() {
+      webview_builder = webview_builder.with_linux_extension_initialization(data.clone());
     }
   }
 

@@ -6,6 +6,7 @@ interface GlanceState {
   url: string;
   title: string;
   sourceTabId: string;
+  workspaceId: string;
 }
 
 interface ReaderSettings {

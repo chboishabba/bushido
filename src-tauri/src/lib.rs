@@ -2,9 +2,40 @@ mod bench;
 mod blocker;
 mod crash_log;
 pub mod dns_resolver;
+mod dns_positive_cache;
 mod downloads;
+#[cfg(target_os = "linux")]
+mod linux_downloads;
+#[cfg(target_os = "linux")]
+mod native_download_history;
+#[cfg(target_os = "linux")]
+mod linux_instance;
+#[cfg(target_os = "linux")]
+mod linux_find;
+#[cfg(target_os = "linux")]
+mod linux_vault;
+#[cfg(target_os = "linux")]
+mod linux_vault_save;
 mod import;
 mod screenshot;
+#[cfg(target_os = "linux")]
+mod linux_desktop_actions;
+#[cfg(target_os = "linux")]
+mod linux_egress_fixture;
+#[cfg(target_os = "linux")]
+mod linux_extension_fixture;
+#[cfg(target_os = "linux")]
+mod linux_extension_policy;
+#[cfg(target_os = "linux")]
+mod linux_destination_scope;
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod linux_document_epoch;
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod linux_resource_observation;
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod linux_extension_observation;
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod linux_extension_ack;
 mod sync;
 mod vault;
 
@@ -19,16 +50,325 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::fs;
 use std::path::PathBuf;
-use adblock::request::Request;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 struct WebviewState {
     tabs: Mutex<HashMap<String, bool>>,
+    #[cfg(target_os = "linux")]
+    pinned: Mutex<HashSet<String>>,
+}
+
+#[cfg(target_os = "linux")]
+impl WebviewState {
+    // Keep the existing tabs map's boolean semantics. Always lock tabs
+    // before pinned, so registering/closing a tab and reading its pin
+    // state cannot observe a mismatched pair.
+    fn register_linux_tab(&self, id: String, ordinary: bool, pinned: bool) {
+        let mut tabs = self.tabs.lock();
+        let mut pins = self.pinned.lock();
+        if pinned { pins.insert(id.clone()); } else { pins.remove(&id); }
+        tabs.insert(id, ordinary);
+    }
+
+    fn unregister_linux_tab(&self, id: &str) {
+        let mut tabs = self.tabs.lock();
+        let mut pins = self.pinned.lock();
+        tabs.remove(id);
+        pins.remove(id);
+    }
+
+    fn linux_pin(&self, id: &str) -> Option<bool> {
+        let tabs = self.tabs.lock();
+        if !tabs.contains_key(id) { return None; }
+        Some(self.pinned.lock().contains(id))
+    }
+
+    fn set_linux_pin(&self, id: &str, pinned: bool) {
+        let tabs = self.tabs.lock();
+        // Internal or destroyed tabs have no native view. Their persisted
+        // frontend flag is supplied to the next create_tab call.
+        if !tabs.contains_key(id) { return; }
+        let mut pins = self.pinned.lock();
+        if pinned { pins.insert(id.to_owned()); } else { pins.remove(id); }
+    }
 }
 
 struct PanelState {
     ids: Mutex<HashSet<String>>,
+}
+
+// Serializes native preview construction, closure and promotion. Map entries
+// represent only successfully constructed previews, not promoted tabs.
+#[derive(Default)]
+struct GlanceLifecycle {
+    previews: tokio::sync::Mutex<HashMap<String, GlanceRecord>>,
+}
+
+// The workspace comes from the native tab constructor, not a page message.
+// A fresh generation distinguishes close/recreate of an identical tab ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NativeTabOwner {
+    workspace: String,
+    generation: uuid::Uuid,
+}
+
+#[derive(Default)]
+struct NativeTabOwners {
+    entries: Mutex<HashMap<String, NativeTabOwner>>,
+}
+
+impl NativeTabOwners {
+    fn register(&self, id: &str, workspace: &str) {
+        self.entries.lock().insert(id.to_owned(), NativeTabOwner {
+            workspace: workspace.to_owned(), generation: uuid::Uuid::new_v4(),
+        });
+    }
+
+    fn remove(&self, id: &str) {
+        self.entries.lock().remove(id);
+    }
+
+    fn get(&self, id: &str) -> Option<NativeTabOwner> {
+        self.entries.lock().get(id).cloned()
+    }
+
+    fn matches(&self, id: &str, owner: &NativeTabOwner) -> bool {
+        self.entries.lock().get(id) == Some(owner)
+    }
+}
+
+fn valid_workspace_identity(workspace: &str) -> bool {
+    !workspace.is_empty() && workspace.len() <= 256
+        && workspace.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn live_native_tab_owner(app: &tauri::AppHandle, id: &str) -> Option<NativeTabOwner> {
+    if !app.state::<WebviewState>().tabs.lock().contains_key(id)
+        || app.state::<PanelState>().ids.lock().contains(id)
+        || app.get_webview(id).is_none() {
+        return None;
+    }
+    app.state::<NativeTabOwners>().get(id)
+}
+
+#[cfg(target_os = "linux")]
+fn native_tab_matches_owner(app: &tauri::AppHandle, id: &str, owner: &NativeTabOwner) -> bool {
+    live_native_tab_owner(app, id).as_ref() == Some(owner)
+}
+
+struct GlanceRecord {
+    source_tab: String,
+    source_owner: NativeTabOwner,
+    source_url: url::Url,
+    workspace: String,
+    disable_autofill: bool,
+    disable_password_save: bool,
+}
+
+// Each asynchronous WebKitGTK filter compilation carries a monotonically
+// increasing ticket. Only the most recently requested ticket for a tab may
+// mutate that tab's content manager. Tickets never reset when tab IDs reuse.
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[derive(Default)]
+struct NativeFilterUpdateState {
+    counter: std::sync::atomic::AtomicU64,
+    latest: Mutex<HashMap<String, u64>>,
+    // Applied state, distinct from the requested/compiling filter state.
+    applied: Mutex<HashMap<String, bool>>,
+    // Current user preference, independent of tab creation-time captures.
+    adblock: Mutex<HashMap<String, bool>>,
+    // Only the most recent destination may be retried after an async
+    // filter update; replacing the URL cancels an older pending retry.
+    pending_navigation: Mutex<HashMap<String, (u64, String)>>,
+    // Independent sequence: two requests for the same URL must not share
+    // retry authority, even when both need the same filter transition.
+    navigation_counter: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+impl NativeFilterUpdateState {
+    fn issue(&self, id: &str) -> u64 {
+        let ticket = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
+        self.latest.lock().insert(id.to_owned(), ticket);
+        ticket
+    }
+
+    fn current(&self, id: &str, ticket: u64) -> bool {
+        self.latest.lock().get(id).copied() == Some(ticket)
+    }
+
+    fn invalidate(&self, id: &str, ticket: u64) {
+        let mut latest = self.latest.lock();
+        if latest.get(id).copied() == Some(ticket) {
+            latest.remove(id);
+        }
+    }
+
+    fn forget(&self, id: &str) {
+        self.latest.lock().remove(id);
+        self.applied.lock().remove(id);
+        self.adblock.lock().remove(id);
+        self.pending_navigation.lock().remove(id);
+    }
+
+    fn register(&self, id: &str, enabled: bool, adblock: bool) {
+        self.applied.lock().insert(id.to_owned(), enabled);
+        self.adblock.lock().insert(id.to_owned(), adblock);
+    }
+
+    fn set_preference(&self, id: &str, adblock: bool) {
+        self.adblock.lock().insert(id.to_owned(), adblock);
+    }
+
+    // The document navigation callback must use the same live preference as
+    // the native WebKit content-filter manager. Never use the capture from
+    // when a Glance/tab WebView was created if native mode is configured.
+    fn preference_for(&self, id: &str) -> bool {
+        self.adblock.lock().get(id).copied().unwrap_or(false)
+    }
+
+    fn desired_for(&self, id: &str, whitelisted: bool) -> bool {
+        self.adblock.lock().get(id).copied().unwrap_or(false) && !whitelisted
+    }
+
+    fn applied_for(&self, id: &str) -> bool {
+        self.applied.lock().get(id).copied().unwrap_or(false)
+    }
+
+    fn begin_navigation(&self, id: &str) -> u64 {
+        // Every candidate navigation invalidates any previously pending
+        // retry, including denied schemes and same-URL requests.
+        let sequence = self.navigation_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        self.pending_navigation.lock().remove(id);
+        sequence
+    }
+
+    fn reserve_navigation(&self, id: &str, sequence: u64, url: &str) {
+        self.pending_navigation.lock().insert(id.to_owned(), (sequence, url.to_owned()));
+    }
+
+    fn cancel_navigation(&self, id: &str) {
+        self.pending_navigation.lock().remove(id);
+    }
+
+    fn take_latest_navigation(&self, id: &str, sequence: u64, url: &str) -> bool {
+        let mut pending = self.pending_navigation.lock();
+        if pending.get(id).is_some_and(|current|
+            current.0 == sequence && current.1 == url
+        ) {
+            pending.remove(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn mark_applied(&self, id: &str, ticket: u64, enabled: bool) {
+        if self.current(id, ticket) {
+            self.applied.lock().insert(id.to_owned(), enabled);
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux", debug_assertions))]
+mod native_filter_generation_tests {
+    use super::*;
+
+    #[test]
+    fn preference_and_applied_state_are_separate() {
+        let state = NativeFilterUpdateState::default();
+        state.register("tab", true, true);
+        assert!(state.preference_for("tab"));
+        assert!(state.applied_for("tab"));
+        assert!(!state.desired_for("tab", true)); // whitelisted host
+        state.set_preference("tab", false);
+        assert!(!state.preference_for("tab"));
+        assert!(!state.desired_for("tab", false));
+        assert!(state.applied_for("tab")); // asynchronous removal pending
+        let ticket = state.issue("tab");
+        state.mark_applied("tab", ticket, false);
+        assert!(!state.applied_for("tab"));
+    }
+
+    #[test]
+    fn failed_constructor_cleanup_prevents_reusing_stale_state() {
+        let state = NativeFilterUpdateState::default();
+        state.register("tab", true, true);
+        let ticket = state.issue("tab");
+        state.forget("tab"); // failed WebView creation
+        assert!(!state.current("tab", ticket));
+        assert!(!state.preference_for("tab"));
+        assert!(!state.applied_for("tab"));
+        state.register("tab", false, false);
+        assert!(!state.preference_for("tab"));
+        assert!(!state.desired_for("tab", false));
+    }
+
+    #[test]
+    fn older_completion_cannot_restore_filter() {
+        let updates = NativeFilterUpdateState::default();
+        let old = updates.issue("tab-a");
+        let new = updates.issue("tab-a");
+        assert!(!updates.current("tab-a", old));
+        assert!(updates.current("tab-a", new));
+        updates.invalidate("tab-a", old);
+        assert!(updates.current("tab-a", new));
+    }
+
+    #[test]
+    fn closing_tab_invalidates_inflight_update_even_after_id_reuse() {
+        let updates = NativeFilterUpdateState::default();
+        let old = updates.issue("tab-a");
+        updates.forget("tab-a");
+        let new = updates.issue("tab-a");
+        assert_ne!(old, new);
+        assert!(!updates.current("tab-a", old));
+        assert!(updates.current("tab-a", new));
+    }
+
+    #[test]
+    fn repeated_same_url_navigation_only_latest_may_retry() {
+        let state = NativeFilterUpdateState::default();
+        let old = state.begin_navigation("tab-a");
+        state.reserve_navigation("tab-a", old, "https://site.test/");
+        let next = state.begin_navigation("tab-a");
+        state.reserve_navigation("tab-a", next, "https://site.test/");
+        assert!(!state.take_latest_navigation("tab-a", old, "https://site.test/"));
+        assert!(state.take_latest_navigation("tab-a", next, "https://site.test/"));
+        assert!(!state.take_latest_navigation("tab-a", next, "https://site.test/"));
+    }
+
+    #[test]
+    fn denied_navigation_also_cancels_prior_pending_retry() {
+        let state = NativeFilterUpdateState::default();
+        let previous = state.begin_navigation("tab-a");
+        state.reserve_navigation("tab-a", previous, "https://old.test/");
+        state.begin_navigation("tab-a"); // hypothetical rejected scheme
+        assert!(!state.take_latest_navigation("tab-a", previous, "https://old.test/"));
+    }
+
+    #[test]
+    fn closing_tab_revokes_retry_even_if_id_is_reused() {
+        let state = NativeFilterUpdateState::default();
+        let previous = state.begin_navigation("tab-a");
+        state.reserve_navigation("tab-a", previous, "https://old.test/");
+        state.forget("tab-a");
+        let next = state.begin_navigation("tab-a");
+        state.reserve_navigation("tab-a", next, "https://old.test/");
+        assert!(!state.take_latest_navigation("tab-a", previous, "https://old.test/"));
+        assert!(state.take_latest_navigation("tab-a", next, "https://old.test/"));
+    }
+
+    #[test]
+    fn updates_to_distinct_tabs_are_independent() {
+        let updates = NativeFilterUpdateState::default();
+        let a = updates.issue("a");
+        let b = updates.issue("b");
+        updates.invalidate("a", a);
+        assert!(!updates.current("a", a));
+        assert!(updates.current("b", b));
+    }
 }
 
 
@@ -45,17 +385,10 @@ struct BlockerState {
     fingerprint_verify_script: String,
     vault_script: String,
     glance_script: String,
-    preload_script: String,
 }
 
 struct WhitelistState {
     sites: Mutex<HashSet<String>>,
-}
-
-struct PreloadState {
-    url: Mutex<Option<String>>,
-    webview_id: Mutex<Option<String>>,
-    source_tab: Mutex<Option<String>>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -158,6 +491,279 @@ fn normalize_combo(combo: &str) -> String {
     if has_alt { result.push_str("alt+"); }
     result.push_str(&key_code);
     result
+}
+
+// Linux shortcuts are application-focused. No website script is allowed to
+// dispatch these actions, and the existing configurable action map is reused.
+#[cfg(target_os = "linux")]
+fn linux_key_combo(name: &str, ctrl: bool, shift: bool, alt: bool) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let key = match lower.as_str() {
+        "equal" | "plus" => "=",
+        "minus" | "underscore" => "-",
+        "backslash" | "bar" => "\\",
+        "slash" | "question" => "/",
+        "period" | "greater" => ".",
+        "comma" | "less" => ",",
+        "semicolon" | "colon" => ";",
+        "apostrophe" | "quotedbl" => "'",
+        "grave" | "asciitilde" => "`",
+        "bracketleft" | "braceleft" => "[",
+        "bracketright" | "braceright" => "]",
+        s if s.len() == 1 && s.as_bytes()[0].is_ascii_alphanumeric() => s,
+        s if matches!(s, "f1"|"f2"|"f3"|"f4"|"f5"|"f6"|"f7"|"f8"|"f9"|"f10"|"f11"|"f12") => s,
+        _ => return None,
+    };
+    // Do not steal unmodified text entry.
+    if !ctrl && !alt && !matches!(key, "f1"|"f2"|"f3"|"f4"|"f5"|"f6"|"f7"|"f8"|"f9"|"f10"|"f11"|"f12") { return None; }
+    let combo = format!("{}{}{}{}", if ctrl {"Ctrl+"} else {""},
+        if shift {"Shift+"} else {""}, if alt {"Alt+"} else {""}, key);
+    Some(normalize_combo(&combo))
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_shortcuts(app: &tauri::AppHandle, webview: &tauri::Webview) -> Result<(), String> {
+    let handle = app.clone();
+    webview.with_webview(move |platform| {
+        use gtk::{gdk::ModifierType, prelude::*};
+        let view = platform.inner();
+        let pressed = std::rc::Rc::new(std::cell::RefCell::new(HashSet::<u16>::new()));
+        let held = pressed.clone();
+        view.connect_key_press_event(move |widget, event| {
+            // GTK supplies the event, not a page-controlled IPC message.
+            if !widget.has_focus() { return false.into(); }
+            let modifiers = event.state();
+            if modifiers.intersects(ModifierType::SUPER_MASK | ModifierType::META_MASK | ModifierType::HYPER_MASK) {
+                return false.into();
+            }
+            let Some(name) = event.keyval().name() else { return false.into(); };
+            let Some(combo) = linux_key_combo(name.as_str(),
+                modifiers.contains(ModifierType::CONTROL_MASK),
+                modifiers.contains(ModifierType::SHIFT_MASK),
+                modifiers.contains(ModifierType::MOD1_MASK)) else { return false.into(); };
+            let action = handle.state::<KeybindingState>().map.lock().get(&combo).cloned();
+            let Some(action) = action else { return false.into(); };
+            if !DEFAULT_KEYBINDINGS.iter().any(|(known, _)| *known == action.as_str()) {
+                return false.into();
+            }
+            if held.borrow_mut().insert(event.hardware_keycode()) {
+                let _ = handle.emit_to("main", "global-shortcut", action);
+            }
+            true.into()
+        });
+        let released = pressed.clone();
+        view.connect_key_release_event(move |_, event| {
+            released.borrow_mut().remove(&event.hardware_keycode());
+            false.into()
+        });
+        view.connect_focus_out_event(move |_, _| {
+            pressed.borrow_mut().clear();
+            false.into()
+        });
+    }).map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_glance_url(raw: &str) -> Option<url::Url> {
+    let target = url::Url::parse(raw).ok()?;
+    (matches!(target.scheme(), "http" | "https")
+        && target.host_str().is_some()
+        && target.username().is_empty() && target.password().is_none()).then_some(target)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_glance_alt_click(link_clicked: bool, user_gesture: bool, redirect: bool,
+    button: u32, modifiers: u32) -> bool {
+    use gtk::gdk::ModifierType as M;
+    linux_glance_direct_click(link_clicked, user_gesture, redirect, button, modifiers)
+        && modifiers & M::MOD1_MASK.bits() != 0
+}
+
+#[cfg(target_os = "linux")]
+fn linux_glance_direct_click(link_clicked: bool, user_gesture: bool, redirect: bool,
+    button: u32, modifiers: u32) -> bool {
+    use gtk::gdk::ModifierType as M;
+    let conflicting = (M::CONTROL_MASK | M::SHIFT_MASK | M::SUPER_MASK | M::META_MASK | M::HYPER_MASK).bits();
+    link_clicked && user_gesture && !redirect && button == 1 && modifiers & conflicting == 0
+}
+
+#[cfg(target_os = "linux")]
+fn linux_glance_preview(link_clicked: bool, user_gesture: bool, redirect: bool,
+    button: u32, modifiers: u32, pinned: bool, source: &url::Url, target: &url::Url) -> bool {
+    // Exactly the original Glance listener's hostname comparison, not an
+    // origin comparison: different ports/schemes on one host do not auto-preview.
+    linux_glance_alt_click(link_clicked, user_gesture, redirect, button, modifiers)
+        || (pinned && source.host_str() != target.host_str()
+            && linux_glance_direct_click(link_clicked, user_gesture, redirect, button, modifiers))
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_glance_input(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str) -> Result<(), String> {
+    let owner = live_native_tab_owner(app, id).ok_or("Missing native Glance source ownership")?;
+    let handle = app.clone();
+    let source_id = id.to_owned();
+    webview.with_webview(move |platform| {
+        use gtk::{glib::translate::ToGlibPtr, prelude::*};
+        use webkit2gtk::{ffi, WebViewExt};
+        let view = platform.inner();
+        wry::set_native_navigation_preview(&view, move |view, action, raw_target| {
+            if !view.has_focus() || !native_tab_matches_owner(&handle, &source_id, &owner) {
+                return false;
+            }
+            let Some(pinned) = handle.state::<WebviewState>().linux_pin(&source_id) else { return false; };
+            let Some(target) = linux_glance_url(raw_target) else { return false; };
+            let Some(source) = view.uri().and_then(|uri| linux_glance_url(uri.as_str())) else { return false; };
+            // Read the native action metadata synchronously; never retain its pointer.
+            let ptr: *mut ffi::WebKitNavigationAction = action.to_glib_none().0;
+            let preview = unsafe {
+                linux_glance_preview(
+                    ffi::webkit_navigation_action_get_navigation_type(ptr) == ffi::WEBKIT_NAVIGATION_TYPE_LINK_CLICKED,
+                    ffi::webkit_navigation_action_is_user_gesture(ptr) != 0,
+                    ffi::webkit_navigation_action_is_redirect(ptr) != 0,
+                    ffi::webkit_navigation_action_get_mouse_button(ptr),
+                    ffi::webkit_navigation_action_get_modifiers(ptr),
+                    pinned, &source, &target,
+                )
+            };
+            if !preview { return false; }
+            // No ordinary source-tab navigation or URL/history mutation.
+            // Invalidate a previous source retry; the existing Glance
+            // constructor enforces its own destination policy.
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            handle.state::<Arc<NativeFilterUpdateState>>().begin_navigation(&source_id);
+            handle.emit_to("main", "glance-request", serde_json::json!({
+                "url": target.as_str(), "sourceTabId": source_id, "sourceUrl": source.as_str(),
+                "sourceGeneration": owner.generation.to_string()
+            })).is_ok()
+        });
+    }).map_err(|e| e.to_string())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_glance_input_tests {
+    use super::*;
+    use gtk::gdk::ModifierType as M;
+    #[test]
+    fn only_direct_alt_left_link_gestures_preview() {
+        let alt = M::MOD1_MASK.bits();
+        assert!(linux_glance_alt_click(true, true, false, 1, alt));
+        assert!(linux_glance_alt_click(true, true, false, 1, alt | M::LOCK_MASK.bits()));
+        for (link, gesture, redirect, button, mods) in [
+            (false, true, false, 1, alt), (true, false, false, 1, alt),
+            (true, true, true, 1, alt), (true, true, false, 0, alt),
+            (true, true, false, 2, alt), (true, true, false, 1, 0),
+            (true, true, false, 1, alt | M::CONTROL_MASK.bits()),
+            (true, true, false, 1, alt | M::SHIFT_MASK.bits()),
+            (true, true, false, 1, alt | M::SUPER_MASK.bits()),
+        ] { assert!(!linux_glance_alt_click(link, gesture, redirect, button, mods)); }
+    }
+    #[test]
+    fn pinned_preview_preserves_hostname_semantics_and_native_gesture() {
+        let source = linux_glance_url("https://example.org/a").unwrap();
+        let same = linux_glance_url("http://EXAMPLE.org:8080/b").unwrap();
+        let cross = linux_glance_url("https://other.example/b").unwrap();
+        let sub = linux_glance_url("https://sub.example.org/b").unwrap();
+        let check = |target: &url::Url, pinned, modifiers| {
+            linux_glance_preview(true, true, false, 1, modifiers, pinned, &source, target)
+        };
+        assert!(check(&cross, true, 0));
+        assert!(check(&sub, true, 0));
+        assert!(!check(&same, true, 0));
+        assert!(!check(&cross, false, 0));
+        assert!(check(&same, false, M::MOD1_MASK.bits()));
+        assert!(!check(&cross, true, M::CONTROL_MASK.bits()));
+        assert!(!check(&cross, true, M::SHIFT_MASK.bits()));
+        assert!(!linux_glance_preview(true, false, false, 1, 0, true, &source, &cross));
+        assert!(!linux_glance_preview(true, true, true, 1, 0, true, &source, &cross));
+        assert!(!linux_glance_preview(true, true, false, 2, 0, true, &source, &cross));
+    }
+
+    #[test]
+    fn native_pin_state_tracks_live_tab_lifetime() {
+        let state = WebviewState { tabs: Mutex::new(HashMap::new()), pinned: Mutex::new(HashSet::new()) };
+        assert_eq!(state.linux_pin("tab"), None);
+        state.set_linux_pin("tab", true);
+        assert_eq!(state.linux_pin("tab"), None);
+        state.register_linux_tab("tab".into(), true, true);
+        assert_eq!(state.linux_pin("tab"), Some(true));
+        state.set_linux_pin("tab", false);
+        assert_eq!(state.linux_pin("tab"), Some(false));
+        state.set_linux_pin("tab", true);
+        assert_eq!(state.linux_pin("tab"), Some(true));
+        state.unregister_linux_tab("tab");
+        assert_eq!(state.linux_pin("tab"), None);
+        state.register_linux_tab("tab".into(), false, false);
+        assert_eq!(state.linux_pin("tab"), Some(false));
+        state.unregister_linux_tab("tab");
+        state.register_linux_tab("tab".into(), true, true);
+        assert_eq!(state.linux_pin("tab"), Some(true));
+        assert_eq!(state.linux_pin("other"), None);
+    }
+
+    #[test]
+    fn preview_url_requires_http_host_and_no_credentials() {
+        assert!(linux_glance_url("https://example.org/path").is_some());
+        assert!(linux_glance_url("http://localhost:8080/").is_some());
+        for raw in ["javascript:alert(1)", "file:///etc/passwd", "data:text/plain,a",
+            "https://user@example.org/", "https://user:pass@example.org/", "/relative"] {
+            assert!(linux_glance_url(raw).is_none());
+        }
+    }
+}
+
+// Glance is a browser action, not a remote-page IPC capability.
+// Use WebKit's link hit-test and a user-selected native menu action.
+#[cfg(target_os = "linux")]
+fn install_linux_glance_menu(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str) -> Result<(), String> {
+    let owner = live_native_tab_owner(app, id).ok_or("Missing native Glance source ownership")?;
+    let handle = app.clone();
+    let source_id = id.to_owned();
+    webview.with_webview(move |platform| {
+        use gtk::prelude::*;
+        use webkit2gtk::{ContextMenuExt, ContextMenuItem, HitTestResultExt, WebViewExt};
+        let view = platform.inner();
+        view.connect_context_menu(move |view, menu, _, hit| {
+            if !native_tab_matches_owner(&handle, &source_id, &owner) {
+                return false;
+            }
+            let Some(link) = hit.link_uri() else { return false; };
+            let Some(target) = linux_glance_url(link.as_str()) else { return false; };
+            let Some(source) = view.uri() else { return false; };
+            if linux_glance_url(source.as_str()).is_none() { return false; }
+            let action = gtk::gio::SimpleAction::new("bushido-open-glance", None);
+            let weak_view = view.downgrade();
+            let app = handle.clone();
+            let id = source_id.clone();
+            let owner = owner.clone();
+            action.connect_activate(move |_, _| {
+                let Some(view) = weak_view.upgrade() else { return; };
+                if view.uri().as_ref() != Some(&source) { return; }
+                if !native_tab_matches_owner(&app, &id, &owner) { return; }
+                let _ = app.emit_to("main", "glance-request", serde_json::json!({
+                    "url": target.as_str(), "sourceTabId": id, "sourceUrl": source.as_str(),
+                    "sourceGeneration": owner.generation.to_string()
+                }));
+            });
+            let item = ContextMenuItem::from_gaction(&action, "Open in Glance", None);
+            menu.append(&item);
+            false // retain the normal WebKit menu
+        });
+    }).map_err(|e| e.to_string())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_shortcut_tests {
+    use super::*;
+    #[test]
+    fn gtk_names_match_existing_shortcut_map() {
+        assert_eq!(linux_key_combo("T", true, true, false), Some(normalize_combo("Ctrl+Shift+T")));
+        assert_eq!(linux_key_combo("equal", true, false, false), Some(normalize_combo("Ctrl+=")));
+        assert_eq!(linux_key_combo("F11", false, false, false), Some(normalize_combo("F11")));
+        assert_eq!(linux_key_combo("x", false, false, false), None);
+        assert_eq!(linux_key_combo("f", false, false, false), None);
+        assert_eq!(linux_key_combo("T", false, true, false), None);
+        assert_eq!(linux_key_combo("Control_L", true, false, false), None);
+    }
 }
 
 #[cfg(windows)]
@@ -273,6 +879,11 @@ async fn get_perf_metrics(app: tauri::AppHandle) -> Result<serde_json::Value, St
 
 #[tauri::command]
 async fn preconnect_url(url: String) -> Result<(), String> {
+    // Raw TCP preconnect bypasses the browser resolver/policy. Disable on Linux.
+    #[cfg(target_os = "linux")]
+    { let _ = url; return Err("Speculative TCP preconnect disabled on Linux".into()); }
+    #[cfg(not(target_os = "linux"))]
+    {
     let parsed = url::Url::parse(&url).map_err(|e| e.to_string())?;
     let host = parsed.host_str().ok_or("no host")?;
     let port = parsed.port_or_known_default().unwrap_or(443);
@@ -284,6 +895,7 @@ async fn preconnect_url(url: String) -> Result<(), String> {
         ).await;
     });
     Ok(())
+    }
 }
 
 #[tauri::command]
@@ -374,11 +986,53 @@ async fn run_benchmarks(app: tauri::AppHandle) -> Result<Vec<bench::BenchResult>
 
 #[tauri::command]
 async fn update_filter_lists(app: tauri::AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    if app.state::<linux_egress_fixture::EgressFixture>().extension_configured() {
+        return Err("Synthetic extension policy is frozen; restart fixture to change it".into());
+    }
     let bs = app.state::<BlockerState>();
     let engine = bs.engine.clone();
     let data_dir = bs.data_dir.clone();
     blocker::update_filter_lists(data_dir, engine).await?;
     Ok("Filter lists updated".into())
+}
+
+fn document_security_script(block_service_workers: bool, block_font_enum: bool) -> String {
+    // build security hardening JS (only enabled features)
+    let mut sec_parts: Vec<&str> = Vec::new();
+    if block_service_workers {
+        sec_parts.push("try{if(navigator.serviceWorker){Object.defineProperty(navigator,'serviceWorker',{get:function(){return{register:function(){return Promise.reject(new DOMException('blocked','SecurityError'))},getRegistration:function(){return Promise.resolve(undefined)},getRegistrations:function(){return Promise.resolve([])},ready:new Promise(function(){}),controller:null}},configurable:false});}}catch(e){}");
+    }
+    if block_font_enum {
+        sec_parts.push(concat!(
+            "try{if(document.fonts){",
+            "var _origFonts=document.fonts;",
+            "var _safeList=['Arial','Helvetica','Times New Roman','Times','Courier New','Courier','Verdana','Georgia','Palatino','Garamond','Comic Sans MS','Trebuchet MS','Arial Black','Impact','Tahoma','Segoe UI'];",
+            "var fakeSet={",
+              "size:0,",
+              "status:'loaded',",
+              "ready:Promise.resolve(),",
+              "check:function(f){try{var m=f.match(/['\"]([^'\"]+)['\"]/);if(m){for(var i=0;i<_safeList.length;i++)if(_safeList[i].toLowerCase()===m[1].toLowerCase())return true}return false}catch(e){return false}},",
+              "load:function(){return Promise.resolve([])},",
+              "forEach:function(){},",
+              "entries:function(){return[][Symbol.iterator]()},",
+              "keys:function(){return[][Symbol.iterator]()},",
+              "values:function(){return[][Symbol.iterator]()},",
+              "has:function(){return false},",
+              "add:function(){},",
+              "delete:function(){return false},",
+              "clear:function(){},",
+              "addEventListener:function(){},",
+              "removeEventListener:function(){},",
+              "dispatchEvent:function(){return true},",
+              "onloading:null,onloadingdone:null,onloadingerror:null",
+            "};",
+            "fakeSet[Symbol.iterator]=function(){return[][Symbol.iterator]()};",
+            "Object.defineProperty(document,'fonts',{get:function(){return fakeSet},configurable:false});",
+            "}}catch(e){}"
+        ));
+    }
+    if sec_parts.is_empty() { String::new() } else { format!("(function(){{{}}})();", sec_parts.join("")) }
 }
 
 fn is_blocked_scheme(url: &str) -> bool {
@@ -393,8 +1047,59 @@ fn is_blocked_scheme(url: &str) -> bool {
         || lower.starts_with("ms-cxh:") || lower.starts_with("ms-cxh-full:")
 }
 
+// Linux's WebKitGTK does not support WebView2 profile_name. Tauri's
+// data_directory is supported and keys separate Wry WebContext instances.
+// Always use a relative, deterministic, traversal-proof directory: Tauri
+// resolves relative paths under its application-owned data root.
+#[cfg(target_os = "linux")]
+fn linux_workspace_data_directory(profile_name: Option<&str>) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let identity = profile_name.filter(|name| !name.is_empty()).unwrap_or("default");
+    let digest = Sha256::digest(identity.as_bytes());
+    let name: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    PathBuf::from("linux-workspaces").join(format!("profile-{name}"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_workspace_directory_tests {
+    use super::*;
+
+    #[test]
+    fn same_workspace_reuses_one_web_context_directory() {
+        assert_eq!(
+            linux_workspace_data_directory(Some("ws-1")),
+            linux_workspace_data_directory(Some("ws-1"))
+        );
+        assert_eq!(
+            linux_workspace_data_directory(None),
+            linux_workspace_data_directory(Some(""))
+        );
+    }
+
+    #[test]
+    fn distinct_workspaces_do_not_share_storage() {
+        assert_ne!(
+            linux_workspace_data_directory(Some("ws-1")),
+            linux_workspace_data_directory(Some("ws-2"))
+        );
+        assert_ne!(
+            linux_workspace_data_directory(Some("ws-1")),
+            linux_workspace_data_directory(None)
+        );
+    }
+
+    #[test]
+    fn profile_name_cannot_escape_tauri_app_data_root() {
+        let escaped = linux_workspace_data_directory(Some("../../../../home/user"));
+        assert!(escaped.is_relative());
+        assert_eq!(escaped.components().count(), 2);
+        assert!(escaped.components().all(|part| matches!(part, std::path::Component::Normal(_))));
+        assert!(!escaped.to_string_lossy().contains("home/user"));
+    }
+}
+
 #[tauri::command]
-async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f64, top_offset: f64, https_only: bool, ad_blocker: bool, cookie_auto_reject: bool, is_panel: bool, profile_name: Option<String>, disable_dev_tools: Option<bool>, disable_status_bar: Option<bool>, disable_autofill: Option<bool>, disable_password_save: Option<bool>, block_service_workers: Option<bool>, block_font_enum: Option<bool>, spoof_hw_concurrency: Option<bool>, block_popups: Option<bool>, default_zoom: Option<f64>, max_tabs: Option<u32>) -> Result<(), String> {
+async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f64, top_offset: f64, https_only: bool, ad_blocker: bool, cookie_auto_reject: bool, is_panel: bool, profile_name: Option<String>, disable_dev_tools: Option<bool>, disable_status_bar: Option<bool>, disable_autofill: Option<bool>, disable_password_save: Option<bool>, block_service_workers: Option<bool>, block_font_enum: Option<bool>, spoof_hw_concurrency: Option<bool>, block_popups: Option<bool>, default_zoom: Option<f64>, max_tabs: Option<u32>, pinned: Option<bool>) -> Result<(), String> {
     crash_log::log_info("create_tab", &format!("id={} url={}", id, url));
     let disable_dev_tools = disable_dev_tools.unwrap_or(false);
     let disable_status_bar = disable_status_bar.unwrap_or(false);
@@ -428,6 +1133,17 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     if url.starts_with("bushido://") {
         return Ok(());
     }
+
+    // Remote ordinary tabs require an explicit, valid storage identity.
+    // Internal pages have already returned above; side panels remain separate.
+    if !is_panel && !profile_name.as_deref().is_some_and(valid_workspace_identity) {
+        return Err("Ordinary tab requires an explicit workspace".into());
+    }
+
+    // Serialize native ordinary construction/close against preview lifecycle
+    // admission. This does not acknowledge asynchronous engine destruction.
+    let lifecycle = app.state::<GlanceLifecycle>();
+    let _construction = lifecycle.previews.lock().await;
 
     // https upgrade (conditional on https_only setting)
     let final_url = if url.starts_with("https://") {
@@ -471,7 +1187,6 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     let app_title = app.clone();
     let app_load = app.clone();
     let engine_for_nav = engine.clone();
-    let inject_cosmetic = cosmetic_script.clone();
     let inject_cosmetic_observer = cosmetic_observer_script.clone();
     let inject_cookie = cookie_script.clone();
     let inject_shortcut = shortcut_script.clone();
@@ -480,43 +1195,8 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     let inject_fp_verify = fingerprint_verify_script.clone();
     let inject_vault = vault_script.clone();
     let inject_glance = glance_script.clone();
-    let inject_preload = bs.preload_script.clone();
 
-    // build security hardening JS (only enabled features)
-    let mut sec_parts: Vec<&str> = Vec::new();
-    if block_service_workers {
-        sec_parts.push("try{if(navigator.serviceWorker){Object.defineProperty(navigator,'serviceWorker',{get:function(){return{register:function(){return Promise.reject(new DOMException('blocked','SecurityError'))},getRegistration:function(){return Promise.resolve(undefined)},getRegistrations:function(){return Promise.resolve([])},ready:new Promise(function(){}),controller:null}},configurable:false});}}catch(e){}");
-    }
-    if block_font_enum {
-        sec_parts.push(concat!(
-            "try{if(document.fonts){",
-            "var _origFonts=document.fonts;",
-            "var _safeList=['Arial','Helvetica','Times New Roman','Times','Courier New','Courier','Verdana','Georgia','Palatino','Garamond','Comic Sans MS','Trebuchet MS','Arial Black','Impact','Tahoma','Segoe UI'];",
-            "var fakeSet={",
-              "size:0,",
-              "status:'loaded',",
-              "ready:Promise.resolve(),",
-              "check:function(f){try{var m=f.match(/['\"]([^'\"]+)['\"]/);if(m){for(var i=0;i<_safeList.length;i++)if(_safeList[i].toLowerCase()===m[1].toLowerCase())return true}return false}catch(e){return false}},",
-              "load:function(){return Promise.resolve([])},",
-              "forEach:function(){},",
-              "entries:function(){return[][Symbol.iterator]()},",
-              "keys:function(){return[][Symbol.iterator]()},",
-              "values:function(){return[][Symbol.iterator]()},",
-              "has:function(){return false},",
-              "add:function(){},",
-              "delete:function(){return false},",
-              "clear:function(){},",
-              "addEventListener:function(){},",
-              "removeEventListener:function(){},",
-              "dispatchEvent:function(){return true},",
-              "onloading:null,onloadingdone:null,onloadingerror:null",
-            "};",
-            "fakeSet[Symbol.iterator]=function(){return[][Symbol.iterator]()};",
-            "Object.defineProperty(document,'fonts',{get:function(){return fakeSet},configurable:false});",
-            "}}catch(e){}"
-        ));
-    }
-    let security_js = if sec_parts.is_empty() { String::new() } else { format!("(function(){{{}}})();", sec_parts.join("")) };
+    let security_js = document_security_script(block_service_workers, block_font_enum);
     let inject_security = security_js.clone();
 
     // per-tab cosmetic state: computed in on_navigation, injected in on_page_load
@@ -535,8 +1215,8 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     // shared state for dynamic AddScriptToExecuteOnDocumentCreated script ID
     let dynamic_script_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    let whitelisted_for_nav = site_whitelisted;
-    let whitelisted_for_load = site_whitelisted;
+    // Consult live whitelist state on each destination and page load.
+    // Creation-time captures become stale after an explicit toggle.
     let nav_https_only = https_only;
     let nav_ad_blocker = ad_blocker;
     let load_ad_blocker = ad_blocker;
@@ -546,8 +1226,37 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     let source_for_nav = current_source_url.clone();
 
     let mut builder = WebviewBuilder::new(&id, webview_url)
-        .auto_resize()
-        .with_profile_name(profile_name);
+        .with_profile_name(profile_name.clone());
+    // Native content filters are strictly opt-in on Linux, tied to Bushido's
+    // actual ad-blocking toggle and source-domain whitelist. The global
+    // native subset remains an experimental, incomplete rule translator.
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.native_content_filter_enabled(ad_blocker && !site_whitelisted)
+            .devtools(linux_desktop_actions::inspector_allowed(cfg!(debug_assertions), disable_dev_tools, is_panel));
+    }
+    // Register the initially installed native filter and the current
+    // adblock preference before navigation callbacks are invoked.
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+        app.state::<Arc<NativeFilterUpdateState>>().register(
+            &id, ad_blocker && !site_whitelisted, ad_blocker
+        );
+    }
+    // On Linux profile_name is ignored by Wry. Separate WebContext data
+    // directories are the supported isolation mechanism.
+    #[cfg(target_os = "linux")]
+    {
+        let fixture = app.state::<linux_egress_fixture::EgressFixture>();
+        builder = builder.data_directory(fixture.profile_directory(
+            linux_workspace_data_directory(profile_name.as_deref())
+        ));
+        if let Some(proxy) = fixture.proxy() { builder = builder.proxy_url(proxy); }
+        if let Some(path) = fixture.extension_path()? {
+            let data=fixture.extension_policy().ok_or("Extension policy snapshot missing")?;
+            builder=builder.extensions_path(path).linux_extension_initialization(data.to_owned());
+        }
+    }
 
     if is_panel {
         builder = builder.user_agent("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36");
@@ -557,6 +1266,14 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
 
     builder = builder.on_navigation(move |url| {
             let url_str = url.to_string();
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            let native_navigation_sequence =
+                if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+                    Some(app_nav.state::<Arc<NativeFilterUpdateState>>()
+                        .begin_navigation(&tab_id_nav))
+                } else {
+                    None
+                };
 
             // block dangerous URL schemes (javascript:, data:, file:, etc.)
             if is_blocked_scheme(&url_str) {
@@ -568,14 +1285,83 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 return false;
             }
 
+            let destination_whitelisted = url.host_str()
+                .is_some_and(|host|
+                    app_nav.state::<WhitelistState>().sites.lock().contains(&host.to_lowercase()));
+            // Native Linux policy must be in place BEFORE WebKitGTK is
+            // allowed to start the destination request. A filter update is
+            // asynchronous: deny this attempt, update, then retry.
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+                let updates = app_nav.state::<Arc<NativeFilterUpdateState>>().inner().clone();
+                let desired = updates.desired_for(&tab_id_nav, destination_whitelisted);
+                if desired != updates.applied_for(&tab_id_nav) {
+                    let sequence = native_navigation_sequence.expect("native sequence enabled");
+                    updates.reserve_navigation(&tab_id_nav, sequence, &url_str);
+                    let retry_app = app_nav.clone();
+                    let retry_id = tab_id_nav.clone();
+                    let retry_url = url.clone();
+                    let retry_string = url_str.clone();
+                    let retry_state = updates.clone();
+                    let retry_sequence = sequence;
+                    // Reject immediately; never approve a request with an
+                    // outdated native filter. A failed compile stays denied.
+                    tauri::async_runtime::spawn(async move {
+                        match change_linux_webview_filter(&retry_app, &retry_id, desired).await {
+                            Ok(_) => {
+                                // A more recent user navigation (including
+                                // one needing no filter switch) supersedes
+                                // this retry. Never restore an old URL.
+                                if retry_state.take_latest_navigation(
+                                    &retry_id, retry_sequence, &retry_string
+                                ) && retry_state.desired_for(
+                                    &retry_id,
+                                    retry_app.state::<WhitelistState>().sites.lock()
+                                        .contains(&retry_url.host_str().unwrap_or_default().to_lowercase()),
+                                ) == desired {
+                                    if let Some(view) = retry_app.get_webview(&retry_id) {
+                                        if let Err(err) = view.navigate(retry_url) {
+                                            crash_log::log_error("native-filter-retry",
+                                                &format!("Navigation retry failed: {err}"));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => crash_log::log_error("native-filter-retry",
+                                &format!("Navigation denied; filter update failed: {err}")),
+                        }
+                    });
+                    return false;
+                } else {
+                    // An ordinary accepted navigation supersedes any old
+                    // destination waiting on native filter compilation.
+                    updates.cancel_navigation(&tab_id_nav);
+                }
+            }
+
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            let nav_ad_blocker = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+                app_nav.state::<Arc<NativeFilterUpdateState>>().preference_for(&tab_id_nav)
+            } else {
+                nav_ad_blocker
+            };
+            // Pending cosmetic resources belong to the previous origin.
+            // Clear them for *every* navigation, including transitions
+            // where adblocking has been disabled without a whitelist.
+            {
+                let mut pending = pending_for_nav.lock();
+                pending.css.clear();
+                pending.script.clear();
+                pending.exceptions.clear();
+                pending.generichide = false;
+            }
             // adblock-rust engine check for document-level navigations
-            if nav_ad_blocker && !whitelisted_for_nav {
+            if nav_ad_blocker && !destination_whitelisted {
                 let guard = engine_for_nav.read();
-                if let Ok(req) = Request::new(&url_str, &url_str, "document") {
-                    let result = guard.check_network_request(&req);
-                    if result.matched {
-                        return false;
-                    }
+                if blocker::evaluate_request(&guard, &url_str, &url_str, "document")
+                    .is_some_and(|decision| decision.blocked)
+                {
+                    return false;
                 }
                 // compute cosmetic resources for this URL (injected in on_page_load)
                 let cosmetic = blocker::get_cosmetic_resources(&guard, &url_str);
@@ -585,31 +1371,6 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                     pc.script = cosmetic.script;
                     pc.exceptions = cosmetic.exceptions;
                     pc.generichide = cosmetic.generichide;
-                }
-            }
-
-            // check for speculative preload match
-            {
-                let ps = app_nav.state::<PreloadState>();
-                let preload_url = ps.url.lock().clone();
-                if let Some(ref purl) = preload_url {
-                    if *purl == url_str {
-                        let preload_id = ps.webview_id.lock().take();
-                        let source_tab = ps.source_tab.lock().take();
-                        *ps.url.lock() = None;
-                        if let (Some(pid), Some(stab)) = (preload_id, source_tab) {
-                            let panel_s = app_nav.state::<PanelState>();
-                            panel_s.ids.lock().remove(&pid);
-                            let ws = app_nav.state::<WebviewState>();
-                            ws.tabs.lock().insert(pid.clone(), false);
-                            let _ = app_nav.emit_to("main", "preload-promoted", serde_json::json!({
-                                "preloadId": pid,
-                                "url": url_str,
-                                "sourceTabId": stab
-                            }));
-                            return false;
-                        }
-                    }
                 }
             }
 
@@ -638,18 +1399,34 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
             }));
             // re-inject on every page load
             if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
+                #[cfg(not(target_os = "linux"))]
                 let _ = wv.eval(&inject_shortcut);
                 let _ = wv.eval(&inject_media);
                 let _ = wv.eval(&inject_fingerprint);
                 #[cfg(debug_assertions)]
                 { let _ = wv.eval(&inject_fp_verify); }
+                #[cfg(not(target_os = "linux"))]
                 let _ = wv.eval(&inject_vault);
+                #[cfg(not(target_os = "linux"))]
                 let _ = wv.eval(&inject_glance);
-                let _ = wv.eval(&inject_preload);
+                let active_host_whitelisted = wv.url().ok()
+                    .and_then(|url| url.host_str().map(|host| host.to_lowercase()))
+                    .is_some_and(|host|
+                        app_load.state::<WhitelistState>().sites.lock().contains(&host));
+                // The native Linux debug policy and the content-filter
+                // toggle share the same current adblock state. Avoid the
+                // stale creation-time flag for subsequent page loads.
+                #[cfg(all(target_os = "linux", debug_assertions))]
+                let load_ad_blocker = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+                    app_load.state::<Arc<NativeFilterUpdateState>>()
+                        .preference_for(&tab_id_load)
+                } else {
+                    load_ad_blocker
+                };
                 // blockers only if enabled and not whitelisted
-                if load_ad_blocker && !whitelisted_for_load {
-                    let _ = wv.eval(&inject_cosmetic);
-
+                if load_ad_blocker && !active_host_whitelisted {
+                    // WebRTC privacy is installed at document start for every
+                    // tab; only cosmetic data/observers are adblock-scoped.
                     // inject dynamic cosmetic resources (computed in on_navigation)
                     let (css, script, generichide) = {
                         let guard = pending_for_load.lock();
@@ -674,7 +1451,7 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                         let _ = wv.eval(&inject_cosmetic_observer);
                     }
                 }
-                if load_cookie_reject && !whitelisted_for_load {
+                if load_cookie_reject && !active_host_whitelisted {
                     let _ = wv.eval(&inject_cookie);
                 }
                 if !inject_security.is_empty() {
@@ -684,20 +1461,24 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
         });
 
     builder = builder.initialization_script(&scriptlet_preamble);
-    builder = builder.initialization_script(&shortcut_script);
+    #[cfg(not(target_os = "linux"))]
+    { builder = builder.initialization_script(&shortcut_script); }
     builder = builder.initialization_script(&media_script);
     builder = builder.initialization_script(&fingerprint_script);
     // fingerprint_verify.js is injected ONLY via on_page_load (not initialization_script)
     // because window.chrome.webview may not be available at initialization_script time
-    builder = builder.initialization_script(&vault_script);
-    builder = builder.initialization_script(&glance_script);
-    builder = builder.initialization_script(&bs.preload_script);
+    #[cfg(not(target_os = "linux"))]
+    { builder = builder.initialization_script(&vault_script); }
+    #[cfg(not(target_os = "linux"))]
+    { builder = builder.initialization_script(&glance_script); }
 
-    // only inject cosmetic scripts if enabled and not whitelisted
-    if ad_blocker && !site_whitelisted {
-        builder = builder.initialization_script(&cosmetic_script);
-        builder = builder.initialization_script(&cosmetic_observer_script);
-    }
+    // WebRTC ICE/STUN restriction in content_blocker.js is transport-level
+    // privacy hardening, NOT cosmetic ad blocking. Register it independently
+    // of the adblock toggle and per-site cosmetic whitelist.
+    builder = builder.initialization_script(&cosmetic_script);
+    // Never install the DOM cosmetic observer permanently at document start:
+    // the live page-load path below injects it only when enabled, the origin
+    // is not whitelisted, and the engine has not requested $generichide.
     if cookie_auto_reject && !site_whitelisted {
         builder = builder.initialization_script(&cookie_script);
     }
@@ -705,14 +1486,67 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
         builder = builder.initialization_script(&security_js);
     }
 
-    let webview = window.add_child(
+    let webview = match window.add_child(
         builder,
         tauri::LogicalPosition::new(sidebar_w, top_offset),
         tauri::LogicalSize::new(content_w, content_h),
-    ).map_err(|e| e.to_string())?;
+    ) {
+        Ok(webview) => webview,
+        Err(e) => {
+            // Filter state was registered before first navigation. Remove it
+            // on a failed constructor, just as the Glance path already does.
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            app.state::<Arc<NativeFilterUpdateState>>().forget(&id);
+            return Err(e.to_string());
+        }
+    };
 
     let state = app.state::<WebviewState>();
+    #[cfg(target_os = "linux")]
+    state.register_linux_tab(tab_id_track, true, !is_panel && pinned.unwrap_or(false));
+    #[cfg(not(target_os = "linux"))]
     state.tabs.lock().insert(tab_id_track, true);
+    if !is_panel {
+        if let Some(workspace) = profile_name.as_deref() {
+            app.state::<NativeTabOwners>().register(&id, workspace);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    if !is_panel && profile_name.is_some() {
+        if let Err(e) = linux_document_epoch::install(&app,&webview,&id) {
+            crash_log::log_error("linux-document-epoch",&e);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Err(e) = install_linux_shortcuts(&app, &webview) {
+        crash_log::log_error("linux-shortcuts", &e);
+    }
+
+    #[cfg(target_os = "linux")]
+    if !is_panel {
+        if let Err(e) = install_linux_glance_menu(&app, &webview, &id) {
+            crash_log::log_error("linux-glance", &e);
+        }
+        if let Err(e) = install_linux_glance_input(&app, &webview, &id) {
+            crash_log::log_error("linux-glance-input", &e);
+        }
+        if let Some(workspace) = profile_name.as_deref().filter(|s| !s.is_empty()) {
+            install_linux_vault_hooks(&app, &webview, &id, workspace, disable_autofill, disable_password_save);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Err(e) = linux_downloads::install(&app, &webview) {
+        crash_log::log_error("linux-download", &e);
+    }
+
+    #[cfg(target_os = "linux")]
+    install_linux_cosmetic_receiver(&app, &webview, &id, engine.clone(), ad_blocker)?;
+
+    #[cfg(target_os = "linux")]
+    install_linux_media_receiver(&app, &webview, &id)?;
 
     // intercept downloads + ad blocking via WebView2 COM API
     #[cfg(windows)]
@@ -957,56 +1791,50 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                                         let _ = args.ResourceContext(&mut ctx);
                                         let rtype = blocker::resource_type_str(ctx.0 as u32);
 
-                                        // strip tracking params from ALL requests (research/18 B.2)
-                                        // not just documents — sub-resources (images, scripts, XHR) also carry
-                                        // tracking params like ?fbclid=, ?_ga=, etc.
-                                        if let Some(clean) = blocker::strip_tracking_params(&url) {
-                                            let new_url: Vec<u16> = format!("{}\0", clean).encode_utf16().collect();
-                                            let _ = request.SetUri(windows::core::PCWSTR::from_raw(new_url.as_ptr()));
-                                        }
-
-                                        let current_source = source_ref.lock().clone();
-                                        if let Ok(req) = Request::new(&url, &current_source, rtype) {
-                                            let result = engine_ref.read().check_network_request(&req);
-
-                                            // network log — only when enabled
-                                            {
-                                                let nl = app_ref.state::<NetworkLog>();
-                                                if nl.enabled.load(Ordering::Relaxed) {
-                                                    let entry = NetworkLogEntry {
+                                        let source_url = source_ref.lock().clone();
+                                        if let Some(decision) = blocker::evaluate_request(
+                                            &engine_ref.read(), &url, &source_url, rtype,
+                                        ) {
+                                            // Log the exact same policy result that the
+                                            // browser callback enforces on this platform.
+                                            let nl = app_ref.state::<NetworkLog>();
+                                            if nl.enabled.load(Ordering::Relaxed) {
+                                                nl.pending.lock()
+                                                    .entry(tab_ref.clone())
+                                                    .or_insert_with(Vec::new)
+                                                    .push(NetworkLogEntry {
                                                         url: url.clone(),
                                                         resource_type: rtype.to_string(),
-                                                        blocked: result.matched,
-                                                        filter_rule: if result.matched { result.filter.clone() } else { None },
+                                                        blocked: decision.blocked,
+                                                        filter_rule: if decision.blocked {
+                                                            decision.filter_rule.clone()
+                                                        } else {
+                                                            None
+                                                        },
                                                         timestamp_ms: std::time::SystemTime::now()
                                                             .duration_since(std::time::UNIX_EPOCH)
                                                             .unwrap_or_default()
                                                             .as_millis() as u64,
-                                                    };
-                                                    nl.pending.lock()
-                                                        .entry(tab_ref.clone())
-                                                        .or_insert_with(Vec::new)
-                                                        .push(entry);
-                                                }
+                                                    });
                                             }
 
-                                            if !result.matched {
-                                                // handle $removeparam (rewritten URL)
-                                                if let Some(ref rewritten) = result.rewritten_url {
-                                                    let new_url: Vec<u16> = format!("{}\0", rewritten).encode_utf16().collect();
-                                                    let _ = request.SetUri(windows::core::PCWSTR::from_raw(new_url.as_ptr()));
-                                                }
-                                            } else {
-                                                // request is blocked — use redirect surrogate or about:blank
-                                                if let Some(ref data_uri) = result.redirect {
-                                                    let redir_url: Vec<u16> = format!("{}\0", data_uri).encode_utf16().collect();
-                                                    let _ = request.SetUri(windows::core::PCWSTR::from_raw(redir_url.as_ptr()));
-                                                } else {
-                                                    let blank: Vec<u16> = "about:blank\0".encode_utf16().collect();
-                                                    let _ = request.SetUri(windows::core::PCWSTR::from_raw(blank.as_ptr()));
-                                                }
+                                            // No network request may be made for a
+                                            // blocked URI. WebView2's about:blank and
+                                            // filter-provided redirects are preserved.
+                                            if let Some(ref new_uri) = decision.redirect_url
+                                                .as_ref().or(decision.rewrite_url.as_ref())
+                                            {
+                                                let wide: Vec<u16> = new_uri.encode_utf16()
+                                                    .chain(std::iter::once(0)).collect();
+                                                let _ = request.SetUri(
+                                                    windows::core::PCWSTR::from_raw(wide.as_ptr())
+                                                );
+                                            }
 
-                                                let count = count_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                            if decision.blocked {
+                                                let count = count_ref.fetch_add(
+                                                    1, std::sync::atomic::Ordering::Relaxed
+                                                ) + 1;
                                                 if count <= 3 || count % 5 == 0 {
                                                     let _ = app_ref.emit_to("main", "tab-blocked-count", serde_json::json!({
                                                         "id": *tab_ref,
@@ -1090,13 +1918,16 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                                     Some("video") => {
                                         let has = msg.get("hasVideo").and_then(|v| v.as_bool()).unwrap_or(false);
                                         let _ = app_ref.emit_to("main", "tab-has-video", serde_json::json!({
-                                            "id": *tab_ref, "hasVideo": has
+                                            "id": *tab_ref, "hasVideo": has,
+                                            "pipSupported": msg.get("pipSupported").and_then(|v| v.as_bool()),
+                                            "pipActive": msg.get("pipActive").and_then(|v| v.as_bool())
                                         }));
                                     }
                                     Some("match-count") => {
                                         let count = msg.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
                                         let _ = app_ref.emit_to("main", "match-count", serde_json::json!({
-                                            "id": *tab_ref, "count": count
+                                            "id": *tab_ref, "count": count.min(100000),
+                                            "requestId": msg.get("requestId").and_then(|v| v.as_u64())
                                         }));
                                     }
                                     Some("vault-check") => {
@@ -1180,82 +2011,6 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                                                 );
                                             }
                                         }
-                                    }
-                                    Some("preload") => {
-                                        if let Some(url) = msg.get("url").and_then(|v| v.as_str()) {
-                                            let url = url.to_string();
-                                            let tab_id = tab_ref.to_string();
-                                            let app_clone = (*app_ref).clone();
-                                            std::thread::spawn(move || {
-                                                let old_id = {
-                                                    let ps = app_clone.state::<PreloadState>();
-                                                    let val = ps.webview_id.lock().take();
-                                                    val
-                                                };
-                                                if let Some(old_id) = old_id {
-                                                    let panel_s = app_clone.state::<PanelState>();
-                                                    panel_s.ids.lock().remove(&old_id);
-                                                    if let Some(wv) = app_clone.get_webview(&old_id) {
-                                                        let _ = wv.close();
-                                                    }
-                                                }
-                                                let preload_id = format!("preload-{}", std::time::SystemTime::now()
-                                                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
-                                                let window = match app_clone.get_window("main") {
-                                                    Some(w) => w,
-                                                    None => return,
-                                                };
-                                                let webview_url = match url.parse::<url::Url>() {
-                                                    Ok(u) => tauri::WebviewUrl::External(u),
-                                                    Err(_) => return,
-                                                };
-                                                {
-                                                    let bs = app_clone.state::<BlockerState>();
-                                                    let mut builder = tauri::WebviewBuilder::new(&preload_id, webview_url);
-                                                    builder = builder.initialization_script(&bs.shortcut_script);
-                                                    builder = builder.initialization_script(&bs.fingerprint_script);
-                                                    match window.add_child(
-                                                        builder,
-                                                        tauri::LogicalPosition::new(-9999.0, -9999.0),
-                                                        tauri::LogicalSize::new(800.0, 600.0),
-                                                    ) {
-                                                        Ok(_) => {
-                                                            let panel_s = app_clone.state::<PanelState>();
-                                                            panel_s.ids.lock().insert(preload_id.clone());
-                                                            let ps = app_clone.state::<PreloadState>();
-                                                            *ps.url.lock() = Some(url);
-                                                            *ps.webview_id.lock() = Some(preload_id);
-                                                            *ps.source_tab.lock() = Some(tab_id);
-                                                        }
-                                                        Err(e) => {
-                                                            crash_log::log_error("preload", &format!("failed to create preload webview: {}", e));
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                        }
-                                    }
-                                    Some("preload-cancel") => {
-                                        let app_clone = (*app_ref).clone();
-                                        std::thread::spawn(move || {
-                                            std::thread::sleep(std::time::Duration::from_secs(2));
-                                            let old_id = {
-                                                let ps = app_clone.state::<PreloadState>();
-                                                let id = ps.webview_id.lock().take();
-                                                if id.is_some() {
-                                                    *ps.url.lock() = None;
-                                                    *ps.source_tab.lock() = None;
-                                                }
-                                                id
-                                            };
-                                            if let Some(old_id) = old_id {
-                                                let panel_s = app_clone.state::<PanelState>();
-                                                panel_s.ids.lock().remove(&old_id);
-                                                if let Some(wv) = app_clone.get_webview(&old_id) {
-                                                    let _ = wv.close();
-                                                }
-                                            }
-                                        });
                                     }
                                     Some("fingerprint-verify") => {
                                         if let Some(report) = msg.get("report") {
@@ -1800,10 +2555,21 @@ async fn resume_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let lifecycle = app.state::<GlanceLifecycle>();
+    let _closure = lifecycle.previews.lock().await;
     crash_log::log_info("close_tab", &format!("id={}", id));
+    // Invalidate source ownership before closing/recreating the native view.
+    app.state::<NativeTabOwners>().remove(&id);
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    app.state::<linux_document_epoch::DocumentEpochs>().remove(&id);
     // remove from state FIRST so layout_webviews won't try to position a dying webview
     let state = app.state::<WebviewState>();
+    #[cfg(target_os = "linux")]
+    state.unregister_linux_tab(&id);
+    #[cfg(not(target_os = "linux"))]
     state.tabs.lock().remove(&id);
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    app.state::<Arc<NativeFilterUpdateState>>().forget(&id);
     if let Some(wv) = app.get_webview(&id) {
         if let Err(e) = wv.close() {
             crash_log::log_error("close_tab", &format!("wv.close() failed for {}: {}", id, e));
@@ -1836,8 +2602,255 @@ async fn clear_network_log(app: tauri::AppHandle, tab_id: String) -> Result<(), 
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn install_linux_vault_hooks(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str, workspace: &str,
+    disable_autofill: bool, disable_password_save: bool) {
+    if !disable_autofill {
+        if let Err(e) = linux_vault::install(app, webview, id, workspace) {
+            crash_log::log_error("linux-vault", &e);
+        }
+    }
+    if !disable_password_save {
+        if let Err(e) = linux_vault_save::install(app, webview, id, workspace) {
+            crash_log::log_error("linux-vault-save", &e);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_cosmetic_receiver(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str,
+    engine: Arc<RwLock<adblock::engine::Engine>>, ad_blocker: bool) -> Result<(), String> {
+        use webkit2gtk::{UserContentManagerExt, WebViewExt};
+        use javascriptcore::ValueExt;
+        let cosmetic_app = app.clone();
+        let cosmetic_id = id.to_owned();
+        let cosmetic_engine = engine;
+        webview.with_webview(move |platform| {
+            let view = platform.inner();
+            let Some(manager) = view.user_content_manager() else { return; };
+            let weak_view = gtk::prelude::ObjectExt::downgrade(&view);
+            let last_probe = std::cell::Cell::new(None::<std::time::Instant>);
+            manager.connect_script_message_received(Some("bushidoCosmetic"), move |_, message| {
+                let Some(view) = weak_view.upgrade() else { return; };
+                let Some(uri) = view.uri() else { return; };
+                let Ok(url) = url::Url::parse(uri.as_str()) else { return; };
+                if !matches!(url.scheme(), "http" | "https") { return; }
+                let Some(host) = url.host_str() else { return; };
+                if cosmetic_app.state::<WhitelistState>().sites.lock().contains(&host.to_lowercase()) {
+                    return;
+                }
+                #[cfg(debug_assertions)]
+                let ad_blocker = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+                    cosmetic_app.state::<Arc<NativeFilterUpdateState>>().preference_for(&cosmetic_id)
+                } else { ad_blocker };
+                if !ad_blocker { return; }
+                let now = std::time::Instant::now();
+                if last_probe.get().is_some_and(|last| now.duration_since(last).as_millis() < 200) {
+                    return;
+                }
+                let Some(value) = message.js_value() else { return; };
+                let raw = value.to_string();
+                if raw.len() > 32768 { return; }
+                let Ok(probe) = serde_json::from_str::<serde_json::Value>(&raw) else { return; };
+                if probe.get("__bushido").and_then(|v| v.as_str()) != Some("cosmetic-probe") { return; }
+                // Reject delayed messages from a previous URL. This is a consistency
+                // check, not authentication of the sending frame.
+                if probe.get("url").and_then(|v| v.as_str()) != Some(uri.as_str()) { return; }
+                let tokens = |key: &str| -> Vec<String> {
+                    probe.get(key).and_then(|v| v.as_array()).into_iter().flatten()
+                        .take(256).filter_map(|v| v.as_str())
+                        .filter(|s| !s.is_empty() && s.len() <= 128)
+                        .map(str::to_owned).collect()
+                };
+                let classes = tokens("classes");
+                let ids = tokens("ids");
+                if classes.is_empty() && ids.is_empty() { return; }
+                last_probe.set(Some(now));
+                let guard = cosmetic_engine.read();
+                // Recompute for the actual current document, not a pending
+                // navigation's cached exception set.
+                let cosmetic = blocker::get_cosmetic_resources(&guard, uri.as_str());
+                if cosmetic.generichide { return; }
+                let selectors = blocker::get_hidden_selectors(&guard, &classes, &ids, &cosmetic.exceptions);
+                drop(guard);
+                if selectors.is_empty() { return; }
+                if let Ok(json) = serde_json::to_string(&selectors) {
+                    let script = format!("if(window.__bushidoApplyCosmetic)window.__bushidoApplyCosmetic({});", json);
+                    view.run_javascript(&script, None::<&gtk::gio::Cancellable>, |_| {});
+                }
+            });
+            if !manager.register_script_message_handler("bushidoCosmetic") {
+                crash_log::log_error("cosmetic-ipc", "Unable to register Linux cosmetic channel");
+            }
+
+
+        }).map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_media_receiver(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str) -> Result<(), String> {
+    let media_app = app.clone();
+    let media_id = id.to_owned();
+    webview.with_webview(move |platform| {
+        use webkit2gtk::{UserContentManagerExt, WebViewExt};
+        use javascriptcore::ValueExt;
+        let view = platform.inner();
+        let Some(manager) = view.user_content_manager() else { return; };
+        // Media telemetry is deliberately separate from privileged
+        // shortcuts, vault access, navigation and general Tauri IPC.
+        let weak_media_view = gtk::prelude::ObjectExt::downgrade(&view);
+        let last_media = std::cell::Cell::new(None::<std::time::Instant>);
+        let last_video = std::cell::Cell::new(None::<std::time::Instant>);
+        manager.connect_script_message_received(Some("bushidoMedia"), move |_, message| {
+            let Some(view) = weak_media_view.upgrade() else { return; };
+            let Some(uri) = view.uri() else { return; };
+            let Ok(url) = url::Url::parse(uri.as_str()) else { return; };
+            if !matches!(url.scheme(), "http" | "https") { return; }
+            let now = std::time::Instant::now();
+            let Some(value) = message.js_value() else { return; };
+            let raw = value.to_string();
+            if raw.len() > 8192 { return; }
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(&raw) else { return; };
+            if msg.get("url").and_then(|v| v.as_str()) != Some(uri.as_str()) { return; }
+            let kind = msg.get("__bushido").and_then(|v| v.as_str());
+            if kind == Some("video") {
+                if last_video.get().is_some_and(|last| now.duration_since(last).as_millis() < 200) {
+                    return;
+                }
+                let (Some(has), Some(supported), Some(active)) = (
+                    msg.get("hasVideo").and_then(|v| v.as_bool()),
+                    msg.get("pipSupported").and_then(|v| v.as_bool()),
+                    msg.get("pipActive").and_then(|v| v.as_bool()),
+                ) else { return; };
+                last_video.set(Some(now));
+                let _ = media_app.emit_to("main", "tab-has-video", serde_json::json!({
+                    "id": media_id, "hasVideo": has, "pipSupported": supported, "pipActive": active
+                }));
+                return;
+            }
+            if kind != Some("media") { return; }
+            if last_media.get().is_some_and(|last| now.duration_since(last).as_millis() < 200) {
+                return;
+            }
+            let Some(state) = msg.get("state").and_then(|v| v.as_str()) else { return; };
+            if !matches!(state, "playing" | "paused" | "ended") { return; }
+            let clean = |s: &str| -> String {
+                s.chars().filter(|c| !c.is_control() && *c != '<' && *c != '>')
+                    .take(256).collect()
+            };
+            let mut payload = serde_json::json!({
+                "id": media_id, "state": state,
+                "title": clean(msg.get("title").and_then(|v| v.as_str()).unwrap_or(""))
+            });
+            for key in ["artist", "metaTitle"] {
+                if let Some(value) = msg.get(key).and_then(|v| v.as_str()) {
+                    payload[key] = serde_json::json!(clean(value));
+                }
+            }
+            for key in ["currentTime", "duration", "playbackRate"] {
+                if let Some(value) = msg.get(key).and_then(|v| v.as_f64()) {
+                    if value.is_finite() && value >= 0.0 {
+                        payload[key] = serde_json::json!(value);
+                    }
+                }
+            }
+            last_media.set(Some(now));
+            let _ = media_app.emit_to("main", "tab-media-state", payload);
+        });
+        if !manager.register_script_message_handler("bushidoMedia") {
+            crash_log::log_error("media-ipc", "Unable to register Linux media channel");
+        }
+    }).map_err(|e| e.to_string())
+}
+
+fn glance_navigation_allowed(destination: &url::Url, https_only: bool) -> bool {
+    matches!(destination.scheme(), "http" | "https")
+        && destination.host_str().is_some()
+        && destination.username().is_empty() && destination.password().is_none()
+        && (!https_only || destination.scheme() == "https")
+}
+
+fn glance_initial_url(raw: &str, https_only: bool) -> Result<url::Url, String> {
+    let mut requested = url::Url::parse(raw).map_err(|_| "Invalid Glance URL")?;
+    if !glance_navigation_allowed(&requested, false) {
+        return Err("Glance requires an HTTP(S) destination without embedded credentials".into());
+    }
+    if https_only && requested.scheme() == "http" {
+        requested.set_scheme("https").map_err(|_| "HTTPS upgrade failed")?;
+    }
+    Ok(requested)
+}
+
+#[cfg(test)]
+mod glance_policy_tests {
+    use super::*;
+
+    #[test]
+    fn initial_destination_upgrades_and_navigation_refuses_http() {
+        let initial = glance_initial_url("http://example.test/a?q=1", true).unwrap();
+        assert_eq!(initial.as_str(), "https://example.test/a?q=1");
+        let http = url::Url::parse("http://example.test/").unwrap();
+        assert!(glance_navigation_allowed(&http, false));
+        assert!(!glance_navigation_allowed(&http, true));
+        assert!(glance_navigation_allowed(&initial, true));
+        assert_eq!(glance_initial_url("http://example.test/", false).unwrap(), http);
+    }
+
+    #[test]
+    fn unsafe_destinations_rejected_at_both_boundaries() {
+        for raw in ["javascript:alert(1)", "file:///tmp/example", "data:text/plain,example",
+            "ftp://example.test/", "https://alice:secret@example.test/", "https://alice@example.test/"] {
+            let url = url::Url::parse(raw).unwrap();
+            assert!(!glance_navigation_allowed(&url, false));
+            assert!(glance_initial_url(raw, false).is_err());
+        }
+    }
+
+    #[test]
+    fn shared_hardening_respects_independent_policy_flags() {
+        assert!(document_security_script(false, false).is_empty());
+        let sw = document_security_script(true, false);
+        assert!(sw.contains("navigator.serviceWorker"));
+        assert!(!sw.contains("document.fonts"));
+        let fonts = document_security_script(false, true);
+        assert!(!fonts.contains("navigator.serviceWorker"));
+        assert!(fonts.contains("document.fonts"));
+        let both = document_security_script(true, true);
+        assert!(both.contains("navigator.serviceWorker") && both.contains("document.fonts"));
+    }
+}
+
 #[tauri::command]
-async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, sidebar_w: f64, top_offset: f64, profile_name: Option<String>) -> Result<(), String> {
+async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, sidebar_w: f64, top_offset: f64, profile_name: Option<String>, source_tab_id: String, source_url: Option<String>, source_generation: Option<String>, ad_blocker: bool,
+    https_only: Option<bool>, cookie_auto_reject: Option<bool>, block_service_workers: Option<bool>, block_font_enum: Option<bool>,
+    disable_autofill: Option<bool>, disable_password_save: Option<bool>) -> Result<(), String> {
+    let https_only = https_only.unwrap_or(true);
+    let cookie_auto_reject = cookie_auto_reject.unwrap_or(false);
+    let disable_autofill = disable_autofill.unwrap_or(true);
+    let disable_password_save = disable_password_save.unwrap_or(true);
+    let url = glance_initial_url(&url, https_only)?.to_string();
+    let security_js = document_security_script(block_service_workers.unwrap_or(false), block_font_enum.unwrap_or(false));
+    let lifecycle = app.state::<GlanceLifecycle>();
+    let mut previews = lifecycle.previews.lock().await;
+    let source_owner = live_native_tab_owner(&app, &source_tab_id)
+        .ok_or("Glance requires a live ordinary source tab")?;
+    #[cfg(target_os = "linux")]
+    if source_generation.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok()) != Some(source_owner.generation) {
+        return Err("Stale Glance source generation".into());
+    }
+    let workspace = source_owner.workspace.clone();
+    if profile_name.as_deref() != Some(workspace.as_str()) {
+        return Err("Glance source workspace does not match native ownership".into());
+    }
+    let committed_source = app.get_webview(&source_tab_id).ok_or("Glance source missing")?
+        .url().map_err(|_| "Cannot read Glance source URL")?;
+    if !glance_navigation_allowed(&committed_source, false)
+        || source_url.as_deref().is_some_and(|raw| url::Url::parse(raw).ok().as_ref() != Some(&committed_source)) {
+        return Err("Glance source document changed or is not HTTP(S)".into());
+    }
+    if previews.contains_key(&glance_id) || app.get_webview(&glance_id).is_some() {
+        return Err("Glance ID is already in use".into());
+    }
     let window = app.get_window("main").ok_or("no main window")?;
     let size = window.inner_size().map_err(|e| e.to_string())?;
     let scale = window.scale_factor().map_err(|e| e.to_string())?;
@@ -1871,50 +2884,292 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
     let glance_s = bs.glance_script.clone();
 
     let mut builder = tauri::WebviewBuilder::new(&glance_id, webview_url)
-        .with_profile_name(profile_name);
-    builder = builder.initialization_script(&shortcut_s);
+        .with_profile_name(Some(workspace.clone()));
+    // The Glance view inherits the real global adblock preference, but
+    // computes its own destination whitelist instead of inheriting the
+    // source tab's whitelist (which may be a different origin).
+    #[cfg(target_os = "linux")]
+    {
+        let destination_host = url::Url::parse(&url).ok()
+            .and_then(|u| u.host_str().map(|host| host.to_lowercase()))
+            .unwrap_or_default();
+        let whitelisted = app.state::<WhitelistState>()
+            .sites.lock().contains(&destination_host);
+        let enabled = ad_blocker && !whitelisted;
+        builder = builder.native_content_filter_enabled(enabled).devtools(false);
+        #[cfg(debug_assertions)]
+        if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+            app.state::<Arc<NativeFilterUpdateState>>()
+                .register(&glance_id, enabled, ad_blocker);
+        }
+    }
+    // Glance must share only its originating workspace's storage.
+    #[cfg(target_os = "linux")]
+    {
+        let fixture = app.state::<linux_egress_fixture::EgressFixture>();
+        builder = builder.data_directory(fixture.profile_directory(
+            linux_workspace_data_directory(Some(&workspace))
+        ));
+        if let Some(proxy) = fixture.proxy() { builder = builder.proxy_url(proxy); }
+        if let Some(path) = fixture.extension_path()? {
+            let data=fixture.extension_policy().ok_or("Extension policy snapshot missing")?;
+            builder=builder.extensions_path(path).linux_extension_initialization(data.to_owned());
+        }
+    }
+    // Glance can navigate independently after creation. Keep its native
+    // filter aligned with each destination BEFORE approving the request.
+    // The same per-tab generation/attempt guards prevent stale retries.
+    let glance_app_nav = app.clone();
+    let glance_id_nav = glance_id.clone();
+    let glance_engine = bs.engine.clone();
+    let glance_load_engine = bs.engine.clone();
+    builder = builder.on_navigation(move |destination| {
+        let destination_url = destination.to_string();
+        // Invalidate any pending native filter retry even for a denied navigation.
+        #[cfg(all(target_os = "linux", debug_assertions))]
+        let sequence = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+            Some(glance_app_nav.state::<Arc<NativeFilterUpdateState>>().begin_navigation(&glance_id_nav))
+        } else { None };
+        if !glance_navigation_allowed(destination, https_only) {
+            return false;
+        }
+
+        let whitelisted = destination.host_str().is_some_and(|host|
+            glance_app_nav.state::<WhitelistState>()
+                .sites.lock().contains(&host.to_lowercase()));
+
+        #[cfg(all(target_os = "linux", debug_assertions))]
+        if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+            let state = glance_app_nav.state::<Arc<NativeFilterUpdateState>>().inner().clone();
+            let attempt = sequence.expect("native sequence enabled");
+            let desired = state.desired_for(&glance_id_nav, whitelisted);
+            if desired != state.applied_for(&glance_id_nav) {
+                state.reserve_navigation(&glance_id_nav, attempt, &destination_url);
+                let app_retry = glance_app_nav.clone();
+                let id_retry = glance_id_nav.clone();
+                let url_retry = destination.clone();
+                let text_retry = destination_url.clone();
+                let retry_state = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    match change_linux_webview_filter(&app_retry, &id_retry, desired).await {
+                        Ok(_) => {
+                            let current_whitelisted = url_retry.host_str().is_some_and(|host|
+                                app_retry.state::<WhitelistState>()
+                                    .sites.lock().contains(&host.to_lowercase()));
+                            if retry_state.desired_for(&id_retry, current_whitelisted) == desired
+                                && retry_state.take_latest_navigation(&id_retry, attempt, &text_retry)
+                            {
+                                if let Some(view) = app_retry.get_webview(&id_retry) {
+                                    if let Err(e) = view.navigate(url_retry) {
+                                        crash_log::log_error("glance-filter-retry", &e.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => crash_log::log_error("glance-filter-retry", &e),
+                    }
+                });
+                return false;
+            }
+            state.cancel_navigation(&glance_id_nav);
+        }
+
+        // Match the ordinary tab's live document-blocking decision, not the
+        // preference captured when Glance was constructed.
+        #[cfg(all(target_os = "linux", debug_assertions))]
+        let ad_blocker = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+            glance_app_nav.state::<Arc<NativeFilterUpdateState>>()
+                .preference_for(&glance_id_nav)
+        } else {
+            ad_blocker
+        };
+        if ad_blocker && !whitelisted {
+            let engine = glance_engine.read();
+            if blocker::evaluate_request(&engine, &destination_url, &destination_url, "document")
+                .is_some_and(|decision| decision.blocked)
+            {
+                return false;
+            }
+        }
+        let _ = glance_app_nav.emit_to("main", "tab-url-changed", serde_json::json!({
+            "id": glance_id_nav, "url": destination_url
+        }));
+        true
+    });
+
+    let glance_title_app = app.clone();
+    let glance_title_id = glance_id.clone();
+    let glance_load_app = app.clone();
+    let glance_load_id = glance_id.clone();
+    builder = builder.on_document_title_changed(move |_, title| {
+        let clean = title.replace(|c: char| c == '<' || c == '>', "");
+        let _ = glance_title_app.emit_to("main", "tab-title-changed", serde_json::json!({
+            "id": glance_title_id, "title": clean
+        }));
+    }).on_page_load({
+        let observer = bs.cosmetic_observer_script.clone();
+        let cookie = bs.cookie_script.clone();
+        move |wv, payload| {
+            let loading = matches!(payload.event(), tauri::webview::PageLoadEvent::Started);
+            let _ = glance_load_app.emit_to("main", "tab-loading", serde_json::json!({
+                "id": glance_load_id, "loading": loading
+            }));
+            // Derive cosmetic resources from the actual committed URL,
+            // not from the source tab or an earlier preview navigation.
+            if !loading {
+                let Ok(uri) = wv.url() else { return; };
+                if !matches!(uri.scheme(), "http" | "https") { return; }
+                let whitelisted = uri.host_str().is_some_and(|host|
+                    glance_load_app.state::<WhitelistState>().sites.lock().contains(&host.to_lowercase()));
+                #[cfg(all(target_os = "linux", debug_assertions))]
+                let ad_blocker = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+                    glance_load_app.state::<Arc<NativeFilterUpdateState>>().preference_for(&glance_load_id)
+                } else { ad_blocker };
+                if ad_blocker && !whitelisted {
+                    let resources = blocker::get_cosmetic_resources(&glance_load_engine.read(), uri.as_str());
+                    if !resources.css.is_empty() {
+                        let js = format!("(function(){{var s=document.createElement('style');s.id='bushido-cosmetic';s.textContent={};(document.head||document.documentElement).appendChild(s)}})();",
+                            serde_json::to_string(&resources.css).unwrap_or_default());
+                        let _ = wv.eval(&js);
+                    }
+                    if !resources.script.is_empty() {
+                        let _ = wv.eval(&format!("(function(){{if(window.__bushidoSL)return;window.__bushidoSL=true;{}}})();", resources.script));
+                    }
+                    if !resources.generichide { let _ = wv.eval(&observer); }
+                }
+                if cookie_auto_reject && !whitelisted { let _ = wv.eval(&cookie); }
+            }
+        }
+    });
+
+    #[cfg(not(target_os = "linux"))]
+    { builder = builder.initialization_script(&shortcut_s); }
     builder = builder.initialization_script(&media_s);
     builder = builder.initialization_script(&fingerprint_s);
-    builder = builder.initialization_script(&vault_s);
-    builder = builder.initialization_script(&glance_s);
+    builder = builder.initialization_script(&bs.scriptlet_preamble);
+    // The ordinary tab's privacy script includes WebRTC restrictions.
+    // Keep it independent of the cosmetic whitelist.
+    builder = builder.initialization_script(&bs.cosmetic_script);
+    if !security_js.is_empty() {
+        builder = builder.initialization_script(&security_js);
+    }
+    #[cfg(not(target_os = "linux"))]
+    { builder = builder.initialization_script(&vault_s); }
+    #[cfg(not(target_os = "linux"))]
+    { builder = builder.initialization_script(&glance_s); }
 
-    let _webview = window.add_child(
+    let _webview = match window.add_child(
         builder,
         tauri::LogicalPosition::new(wv_x, wv_y),
         tauri::LogicalSize::new(wv_w, wv_h),
-    ).map_err(|e| e.to_string())?;
+    ) {
+        Ok(view) => view,
+        Err(e) => {
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            app.state::<Arc<NativeFilterUpdateState>>().forget(&glance_id);
+            return Err(e.to_string());
+        }
+    };
 
-    // register as panel so layout_webviews skips it
+    // Construction may re-enter the event loop. Reject if source ownership
+    // or its committed URL changed before the new preview became live.
+    if !app.state::<NativeTabOwners>().matches(&source_tab_id, &source_owner)
+        || app.get_webview(&source_tab_id).and_then(|v| v.url().ok()).as_ref() != Some(&committed_source) {
+        let _ = _webview.close();
+        #[cfg(all(target_os = "linux", debug_assertions))]
+        app.state::<Arc<NativeFilterUpdateState>>().forget(&glance_id);
+        return Err("Glance source changed during creation".into());
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(e) = install_linux_shortcuts(&app, &_webview) {
+        crash_log::log_error("linux-shortcuts", &e);
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Err(e) = linux_downloads::install(&app, &_webview) {
+        crash_log::log_error("linux-download", &e);
+    }
+
+    // Preview receives only non-credential media/cosmetic receivers.
+    // Ordinary navigation preview hooks acquire their owner on promotion.
     let ps = app.state::<PanelState>();
-    ps.ids.lock().insert(glance_id);
+    ps.ids.lock().insert(glance_id.clone());
+    #[cfg(target_os = "linux")]
+    {
+        for (kind, result) in [
+            ("linux-media", install_linux_media_receiver(&app, &_webview, &glance_id)),
+            ("linux-cosmetic", install_linux_cosmetic_receiver(&app, &_webview, &glance_id, bs.engine.clone(), ad_blocker)),
+        ] {
+            if let Err(e) = result { crash_log::log_error(kind, &e); }
+        }
+    }
+    previews.insert(glance_id, GlanceRecord {
+        source_tab: source_tab_id, source_owner, source_url: committed_source,
+        workspace, disable_autofill, disable_password_save,
+    });
 
     Ok(())
 }
 
 #[tauri::command]
 async fn close_glance(app: tauri::AppHandle, glance_id: String) -> Result<(), String> {
-    // unregister from panels
-    let ps = app.state::<PanelState>();
-    ps.ids.lock().remove(&glance_id);
-
-    // destroy webview
+    let lifecycle = app.state::<GlanceLifecycle>();
+    let mut previews = lifecycle.previews.lock().await;
+    // A stale preview close must never destroy a promoted ordinary tab.
+    if !previews.contains_key(&glance_id) { return Ok(()); }
     if let Some(wv) = app.get_webview(&glance_id) {
-        let _ = wv.close();
+        wv.close().map_err(|e| e.to_string())?;
     }
+    previews.remove(&glance_id);
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    app.state::<Arc<NativeFilterUpdateState>>().forget(&glance_id);
+    app.state::<PanelState>().ids.lock().remove(&glance_id);
     Ok(())
 }
 
 #[tauri::command]
-async fn promote_glance(app: tauri::AppHandle, glance_id: String) -> Result<(), String> {
-    // unregister from panels
+async fn promote_glance(app: tauri::AppHandle, glance_id: String, workspace_id: String) -> Result<(), String> {
+    let lifecycle = app.state::<GlanceLifecycle>();
+    let mut previews = lifecycle.previews.lock().await;
+    let record = previews.get(&glance_id).filter(|record| record.workspace == workspace_id)
+        .ok_or("Glance is not a live preview in this workspace")?;
+    if live_native_tab_owner(&app, &record.source_tab).as_ref() != Some(&record.source_owner)
+        || app.get_webview(&record.source_tab).and_then(|v| v.url().ok()).as_ref() != Some(&record.source_url) {
+        return Err("Glance source changed; close and reopen the preview".into());
+    }
+    let view = app.get_webview(&glance_id).ok_or("Glance WebView is missing")?;
     let ps = app.state::<PanelState>();
-    ps.ids.lock().remove(&glance_id);
+    if !ps.ids.lock().contains(&glance_id) {
+        return Err("Glance panel is missing".into());
+    }
 
-    // register as a normal tab in WebviewState using the glance_id as tab id
-    // (the webview label IS the glance_id, so layout_webviews can find it)
+    // Same native WebView, same workspace context, no request replay and
+    // no duplicate download/media/filter handler registration.
     let ws = app.state::<WebviewState>();
-    ws.tabs.lock().insert(glance_id, false);
-
+    #[cfg(target_os = "linux")]
+    ws.register_linux_tab(glance_id.clone(), false, false);
+    #[cfg(not(target_os = "linux"))]
+    ws.tabs.lock().insert(glance_id.clone(), false);
+    ps.ids.lock().remove(&glance_id);
+    app.state::<NativeTabOwners>().register(&glance_id, &record.workspace);
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    if let Err(e) = linux_document_epoch::install(&app,&view,&glance_id) {
+        crash_log::log_error("linux-document-epoch",&e);
+    }
+    // Only promotion acquires credential handlers: a preview must not even
+    // arm a password capture candidate. The record is consumed exactly once.
+    #[cfg(target_os = "linux")]
+    {
+        for (kind, result) in [
+            ("linux-glance", install_linux_glance_menu(&app, &view, &glance_id)),
+            ("linux-glance-input", install_linux_glance_input(&app, &view, &glance_id)),
+        ] {
+            if let Err(e) = result { crash_log::log_error(kind, &e); }
+        }
+        install_linux_vault_hooks(&app, &view, &glance_id, &record.workspace,
+            record.disable_autofill, record.disable_password_save);
+    }
+    previews.remove(&glance_id);
     Ok(())
 }
 
@@ -1945,6 +3200,15 @@ async fn clear_workspace_data(app: tauri::AppHandle, tab_id: String) -> Result<(
             }
         });
     }
+    #[cfg(not(windows))]
+    {
+        // Wry's Linux backend now waits for WebKitGTK's completed clear.
+        // Because this Webview uses a workspace-specific data_directory,
+        // sibling tabs within the workspace share this context, but other
+        // workspaces' data managers are independent.
+        return wv.clear_all_browsing_data().map_err(|e| e.to_string());
+    }
+    #[cfg(windows)]
     Ok(())
 }
 
@@ -1961,6 +3225,11 @@ struct PaneRectArg {
 
 #[tauri::command]
 async fn vault_retry_autofill(app: tauri::AppHandle) -> Result<(), String> {
+    // Linux never broadcasts credentials or auto-fills on vault unlock.
+    #[cfg(target_os = "linux")]
+    { let _ = app; return Ok(()); }
+    #[cfg(not(target_os = "linux"))]
+    {
     let vs = app.state::<crate::vault::VaultState>();
     if vs.derived_key.lock().is_none() {
         return Ok(());
@@ -1976,6 +3245,7 @@ async fn vault_retry_autofill(app: tauri::AppHandle) -> Result<(), String> {
         }
     }
     Ok(())
+    }
 }
 
 #[tauri::command]
@@ -2096,35 +3366,67 @@ async fn toggle_fullscreen(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn zoom_tab(app: tauri::AppHandle, id: String, factor: f64) -> Result<(), String> {
-    if let Some(wv) = app.get_webview(&id) {
-        let _ = wv.with_webview(move |wv| {
-            #[cfg(windows)]
-            unsafe { let _ = wv.controller().SetZoomFactor(factor); }
-        });
+    if !factor.is_finite() || factor <= 0.0 {
+        return Err("Zoom factor must be finite and positive".into());
     }
-    Ok(())
+    let wv = app.get_webview(&id).ok_or("webview not found")?;
+    // The vendored Tauri API dispatches zoom to the platform backend.
+    // Avoid a Windows-specific controller call or a false-success Linux stub.
+    wv.set_zoom(factor).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn print_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    if let Some(wv) = app.get_webview(&id) {
+async fn print_tab(app: tauri::AppHandle, webview: tauri::Webview, id: String) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
+        return linux_desktop_actions::print(&app, &id).await;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = webview;
+        let wv = app.get_webview(&id).ok_or("Webview not found")?;
         wv.eval("window.print()").map_err(|e| e.to_string())?;
+        Ok("requested".into())
     }
-    Ok(())
 }
 
 #[tauri::command]
-async fn toggle_devtools(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    if let Some(wv) = app.get_webview(&id) {
-        wv.with_webview(|webview| {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                if let Ok(core) = webview.controller().CoreWebView2() {
-                    let _ = core.OpenDevToolsWindow();
-                }
-            }));
-        }).map_err(|e| e.to_string())?;
+async fn toggle_devtools(app: tauri::AppHandle, webview: tauri::Webview, id: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
+        return linux_desktop_actions::inspect(&app, &id).await;
     }
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = webview;
+        let wv = app.get_webview(&id).ok_or("webview not found")?;
+        #[cfg(windows)]
+        {
+            // Preserve upstream PR #4's guarded WebView2 path.
+            wv.with_webview(|webview| {
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    unsafe {
+                        if let Ok(core) = webview.controller().CoreWebView2() {
+                            let _ = core.OpenDevToolsWindow();
+                        }
+                    }
+                }));
+            }).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        #[cfg(all(not(windows), debug_assertions))]
+        {
+            wv.open_devtools();
+            Ok(())
+        }
+        #[cfg(all(not(windows), not(debug_assertions)))]
+        {
+            let _ = wv;
+            Err("Developer tools are disabled in this release build".into())
+        }
+    }
 }
 
 #[tauri::command]
@@ -2140,6 +3442,9 @@ async fn copy_text_to_clipboard(text: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn set_tab_pinned(app: tauri::AppHandle, id: String, pinned: bool) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    app.state::<WebviewState>().set_linux_pin(&id, pinned);
+    #[cfg(not(target_os = "linux"))]
     if let Some(wv) = app.get_webview(&id) {
         let js = format!("window.__bushidoPinned = {};", pinned);
         let _ = wv.eval(&js);
@@ -2148,35 +3453,54 @@ async fn set_tab_pinned(app: tauri::AppHandle, id: String, pinned: bool) -> Resu
 }
 
 #[tauri::command]
-async fn find_in_page(app: tauri::AppHandle, id: String, query: String, forward: bool) -> Result<(), String> {
-    if let Some(wv) = app.get_webview(&id) {
-        if query.is_empty() {
-            wv.eval("window.getSelection().removeAllRanges()").map_err(|e| e.to_string())?;
-        } else {
-            let dir = if forward { "false" } else { "true" };
-            let escaped = query.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n").replace('\r', "\\r");
-            let js = format!(
-                "window.find('{}', false, {}, true, false, false, false)",
-                escaped, dir
-            );
-            wv.eval(&js).map_err(|e| e.to_string())?;
-            let count_js = format!(
-                "(function(){{var q='{}';var t=(document.body.innerText||'').toLowerCase();var c=t.split(q.toLowerCase()).length-1;window.chrome.webview.postMessage(JSON.stringify({{__bushido:'match-count',count:c}}))}})()",
-                escaped
-            );
-            let _ = wv.eval(&count_js);
-        }
+async fn find_in_page(
+    app: tauri::AppHandle, id: String, query: String, forward: bool,
+    request_id: Option<u32>,
+) -> Result<Option<u32>, String> {
+    let wv = app.get_webview(&id).ok_or("Unknown WebView")?;
+    if query.len() > 4096 { return Err("Search query too long".into()); }
+    #[cfg(target_os = "linux")]
+    {
+        return linux_find::find(&wv, query, forward, request_id.ok_or("Missing find request ID")?).await.map(Some);
     }
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        if query.is_empty() {
+            wv.eval("window.getSelection()?.removeAllRanges()").map_err(|e| e.to_string())?;
+            return Ok(Some(0));
+        }
+        let escaped = serde_json::to_string(&query).map_err(|e| e.to_string())?;
+        // Retain the existing window.find behavior and visible-text estimate.
+        // Count without allocating an array proportional to document length.
+        let search = format!(r#"(function(){{
+            const q = {};
+            window.find(q, false, {}, true, false, false, false);
+            const text = (document.body?.innerText || '').toLowerCase();
+            const needle = q.toLowerCase();
+            let count = 0, offset = 0;
+            while (count < 100000) {{
+                const next = text.indexOf(needle, offset);
+                if (next < 0) break;
+                count++;
+                offset = next + needle.length;
+            }}
+            return count;
+        }})()"#, escaped, !forward);
+        // Preserve the existing WebView2 result event, correlated to the
+        // initiating trusted FindBar request.
+        let request = request_id.unwrap_or(0);
+        let js = format!("(function(){{const count={};if(window.chrome&&window.chrome.webview)window.chrome.webview.postMessage(JSON.stringify({{__bushido:'match-count',count:count,requestId:{}}}));}})()", search, request);
+        wv.eval(&js).map_err(|e| e.to_string())?;
+        Ok(None)
+    }
+
 }
 
 #[tauri::command]
 async fn detect_video(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    if let Some(wv) = app.get_webview(&id) {
-        let js = r#"(function(){var videos=document.querySelectorAll('video');var has=false;videos.forEach(function(v){if(v.readyState>=2||v.src||v.querySelector('source'))has=true});if(window.chrome&&window.chrome.webview){window.chrome.webview.postMessage(JSON.stringify({__bushido:'video',hasVideo:has}))}})()"#;
-        wv.eval(js).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    let wv = app.get_webview(&id).ok_or("Unknown WebView")?;
+    wv.eval("if(typeof window.__bushidoReportVideo === 'function') window.__bushidoReportVideo();")
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2207,8 +3531,37 @@ async fn toggle_reader(app: tauri::AppHandle, id: String, font_size: u32, font: 
 
 #[tauri::command]
 async fn toggle_pip(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use webkit2gtk::WebViewExt;
+        use javascriptcore::ValueExt;
+        let wv = app.get_webview(&id).ok_or("Unknown WebView")?;
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+        wv.with_webview(move |platform| {
+            platform.inner().run_javascript(include_str!("linux_pip.js"),
+                None::<&gtk::gio::Cancellable>, move |result| {
+                    let status = result.map_err(|e| e.to_string()).and_then(|r|
+                        r.js_value().and_then(|v| v.to_json(0))
+                            .ok_or_else(|| "Missing PiP capability result".to_owned())
+                            .and_then(|json| serde_json::from_str::<String>(json.as_str())
+                                .map_err(|e| e.to_string())));
+                    let _ = tx.send(status);
+                });
+        }).map_err(|e| e.to_string())?;
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await
+            .map_err(|_| "PiP capability request timed out".to_owned())?
+            .map_err(|_| "PiP callback lost".to_owned())??;
+        // These are request/availability states, not proof of a detached window.
+        return match status.as_str() {
+            "awaiting-gesture" | "dismissed" | "exit-requested" | "request-pending" => Ok(()),
+            "unsupported" => Err("This WebKitGTK engine does not expose picture-in-picture".into()),
+            "no-eligible-video" => Err("No eligible loaded video supports picture-in-picture".into()),
+            _ => Err("Picture-in-picture request failed".into()),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
     if let Some(wv) = app.get_webview(&id) {
-        let js = r#"(function(){if(document.pictureInPictureElement){document.exitPictureInPicture();return}var existing=document.getElementById('__bushido_pip_host');if(existing){existing.remove();return}var v=document.querySelector('video');if(!v)return;v.removeAttribute('disablePictureInPicture');v.removeAttribute('disablepictureinpicture');var host=document.createElement('div');host.id='__bushido_pip_host';host.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483647;pointer-events:none';var shadow=host.attachShadow({mode:'closed'});var btn=document.createElement('div');btn.innerHTML='<svg width="18" height="18" viewBox="0 0 16 16" fill="none" style="vertical-align:middle;margin-right:6px"><rect x="1" y="2.5" width="14" height="11" rx="1.5" stroke="white" stroke-width="1.3"/><rect x="8" y="7" width="6" height="5" rx="1" fill="white" opacity="0.4" stroke="white" stroke-width="1"/></svg>Picture in Picture';btn.style.cssText='position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.9);color:#fff;padding:14px 24px;border-radius:10px;cursor:pointer;font:600 15px system-ui;box-shadow:0 8px 32px rgba(0,0,0,0.6);pointer-events:auto;display:flex;align-items:center;border:1px solid rgba(255,255,255,0.15);backdrop-filter:blur(12px);transition:background 0.15s';btn.onmouseenter=function(){btn.style.background='rgba(99,102,241,0.9)'};btn.onmouseleave=function(){btn.style.background='rgba(0,0,0,0.9)'};btn.onclick=function(e){e.stopPropagation();v.requestPictureInPicture().then(function(){host.remove()}).catch(function(){btn.innerHTML='PiP not available';btn.style.background='rgba(239,68,68,0.9)';setTimeout(function(){host.remove()},2000)})};shadow.appendChild(btn);document.documentElement.appendChild(host)})()"#;
+        let js = r#"(function(){if(document.pictureInPictureElement){if(typeof document.exitPictureInPicture==='function')document.exitPictureInPicture().catch(function(){});return}var existing=document.getElementById('__bushido_pip_host');if(existing){existing.remove();return}var v=Array.from(document.querySelectorAll('video')).find(function(v){return typeof v.requestPictureInPicture==='function'&&!v.disablePictureInPicture});if(!v||document.pictureInPictureEnabled!==true)return;var host=document.createElement('div');host.id='__bushido_pip_host';host.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483647;pointer-events:none';var shadow=host.attachShadow({mode:'closed'});var btn=document.createElement('div');btn.innerHTML='<svg width="18" height="18" viewBox="0 0 16 16" fill="none" style="vertical-align:middle;margin-right:6px"><rect x="1" y="2.5" width="14" height="11" rx="1.5" stroke="white" stroke-width="1.3"/><rect x="8" y="7" width="6" height="5" rx="1" fill="white" opacity="0.4" stroke="white" stroke-width="1"/></svg>Picture in Picture';btn.style.cssText='position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.9);color:#fff;padding:14px 24px;border-radius:10px;cursor:pointer;font:600 15px system-ui;box-shadow:0 8px 32px rgba(0,0,0,0.6);pointer-events:auto;display:flex;align-items:center;border:1px solid rgba(255,255,255,0.15);backdrop-filter:blur(12px);transition:background 0.15s';btn.onmouseenter=function(){btn.style.background='rgba(99,102,241,0.9)'};btn.onmouseleave=function(){btn.style.background='rgba(0,0,0,0.9)'};btn.onclick=function(e){e.stopPropagation();if(!e.isTrusted)return;v.requestPictureInPicture().then(function(){host.remove()}).catch(function(){btn.innerHTML='PiP not available';btn.style.background='rgba(239,68,68,0.9)';setTimeout(function(){host.remove()},2000)})};shadow.appendChild(btn);document.documentElement.appendChild(host)})()"#;
         wv.eval(js).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -2318,6 +3671,131 @@ fn save_permissions(app: &tauri::AppHandle, perms: &HashMap<String, bool>) {
     }
 }
 
+// Explicit dynamic native-filter operation for an existing Linux WebView.
+// A successful return means the real WebKit UserContentManager was updated,
+// not merely that the GTK main-thread task was queued.
+#[cfg(all(target_os = "linux", debug_assertions))]
+async fn change_linux_webview_filter(
+    app: &tauri::AppHandle,
+    id: &str,
+    enabled: bool,
+) -> Result<bool, String> {
+    use webkit2gtk::{UserContentFilterStore, UserContentFilterStoreExt, UserContentManagerExt, WebViewExt};
+    let view = app.get_webview(id).ok_or_else(|| format!("Unknown WebView: {id}"))?;
+    let updates = app.state::<Arc<NativeFilterUpdateState>>().inner().clone();
+    let ticket = updates.issue(id);
+    let tab_id = id.to_owned();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<bool, String>>();
+    let rule_bytes = if enabled {
+        let rule_path = std::env::var_os("BUSHIDO_LINUX_FILTER_JSON")
+            .ok_or("No experimental native content-filter rules configured")?;
+        let bytes = std::fs::read(rule_path)
+            .map_err(|e| format!("Cannot read configured native filter: {e}"))?;
+        if bytes.is_empty() {
+            return Err("Empty native filter rule set".into());
+        }
+        Some(bytes)
+    } else {
+        None
+    };
+    let updates_for_callback = updates.clone();
+    let id_for_callback = tab_id.clone();
+    let dispatched = view.with_webview(move |view| {
+        let Some(manager) = view.inner().user_content_manager() else {
+            let _ = tx.send(Err("Missing native WebKitGTK content manager".into()));
+            return;
+        };
+        if !updates_for_callback.current(&id_for_callback, ticket) {
+            let _ = tx.send(Err("Native filter update was superseded".into()));
+            return;
+        }
+        if !enabled {
+            manager.remove_all_filters();
+            updates_for_callback.mark_applied(&id_for_callback, ticket, false);
+            let _ = tx.send(Ok(true)); // removal is an applied change
+            return;
+        }
+        let cache = dirs::cache_dir().map(|p|
+            p.join("bushido-browser").join("webkit-content-filter-probe"));
+        let Some(cache) = cache else {
+            let _ = tx.send(Err("WebKitGTK filter cache directory missing".into()));
+            return;
+        };
+        let store = UserContentFilterStore::new(&cache.to_string_lossy());
+        // Compile on first enable as well: an initially unfiltered tab may
+        // be the first WebView to require this rule set. Never assume that
+        // the Wry initial-create hook has already saved it.
+        let bytes = gtk::glib::Bytes::from_owned(rule_bytes.unwrap_or_default());
+        store.save("bushido-development-probe", &bytes,
+                   None::<&gtk::gio::Cancellable>,
+                   move |result| {
+            // A subsequent toggle may have completed while this compilation
+            // was still in flight. Never apply stale compiled rule sets.
+            if !updates_for_callback.current(&id_for_callback, ticket) {
+                let _ = tx.send(Err("Native filter update was superseded".into()));
+                return;
+            }
+            match result {
+                Ok(filter) => {
+                    manager.remove_all_filters();
+                    manager.add_filter(&filter);
+                    updates_for_callback.mark_applied(&id_for_callback, ticket, true);
+                    let _ = tx.send(Ok(true));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(format!("Native filter compilation failed: {e}")));
+                }
+            }
+        });
+    });
+    let outcome = match dispatched {
+        Err(e) => Err(format!("Failed to dispatch native filter change: {e}")),
+        Ok(()) => match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
+            Err(_) => Err("Timed out applying native WebKitGTK filter".to_string()),
+            Ok(Err(_)) => Err("Native WebKitGTK filter callback was lost".to_string()),
+            Ok(Ok(outcome)) => outcome,
+        },
+    };
+    // A timed-out or failed update must not later mutate the live WebView.
+    if outcome.is_err() {
+        updates.invalidate(&tab_id, ticket);
+    }
+    outcome
+}
+
+#[tauri::command]
+async fn set_tab_native_filter(
+    app: tauri::AppHandle,
+    id: String,
+    ad_blocker: bool,
+) -> Result<bool, String> {
+    let view = app.get_webview(&id).ok_or_else(|| format!("Unknown WebView: {id}"))?;
+    let domain = view.url().ok().and_then(|url|
+        url.host_str().map(|host| host.to_lowercase())).unwrap_or_default();
+    let whitelisted = app.state::<WhitelistState>().sites.lock().contains(&domain);
+    let enabled = ad_blocker && !whitelisted;
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    app.state::<Arc<NativeFilterUpdateState>>().set_preference(&id, ad_blocker);
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    {
+        // This capability is a developer opt-in, not enabled in ordinary
+        // Linux sessions. Returning false is truthful and avoids spurious
+        // "filter update failed" messages on normal page navigation.
+        if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_none() {
+            return Ok(false);
+        }
+        return change_linux_webview_filter(&app, &id, enabled).await;
+    }
+    #[cfg(not(all(target_os = "linux", debug_assertions)))]
+    {
+        let _ = (view, enabled);
+        // Not implemented on Windows/release Linux. Never claim filtering.
+        Ok(false)
+    }
+}
+
 #[tauri::command]
 async fn toggle_whitelist(app: tauri::AppHandle, domain: String) -> Result<bool, String> {
     let ws = app.state::<WhitelistState>();
@@ -2393,6 +3871,12 @@ async fn respond_permission(app: tauri::AppHandle, request_id: String, allow: bo
         }
     }
 
+    #[cfg(not(windows))]
+    {
+        let _ = (app, request_id, allow, remember);
+        return Err("Permission-response backend is not implemented on Linux".into());
+    }
+    #[cfg(windows)]
     Ok(())
 }
 
@@ -2431,17 +3915,20 @@ async fn revoke_permission(app: tauri::AppHandle, domain: String, permission: St
 
 #[tauri::command]
 fn rebind_shortcut(app: tauri::AppHandle, action: String, old_combo: String, new_combo: String) -> Result<(), String> {
-    use tauri_plugin_global_shortcut::GlobalShortcutExt;
-    let gs = app.global_shortcut();
-
-    // Unregister old (ignore error if it wasn't registered)
-    if !old_combo.is_empty() {
-        let _ = gs.unregister(old_combo.as_str());
+    #[cfg(not(target_os = "linux"))]
+    {
+        use tauri_plugin_global_shortcut::GlobalShortcutExt;
+        let gs = app.global_shortcut();
+        if !old_combo.is_empty() {
+            let _ = gs.unregister(old_combo.as_str());
+        }
+        gs.register(new_combo.as_str())
+            .map_err(|e| format!("Failed to register {}: {}", new_combo, e))?;
     }
-
-    // Register new
-    gs.register(new_combo.as_str())
-        .map_err(|e| format!("Failed to register {}: {}", new_combo, e))?;
+    #[cfg(target_os = "linux")]
+    if !DEFAULT_KEYBINDINGS.iter().any(|(known, _)| *known == action.as_str()) {
+        return Err("Unsupported Linux shortcut action".into());
+    }
 
     // Update the keybinding map
     let kb = app.state::<KeybindingState>();
@@ -2532,17 +4019,36 @@ async fn save_settings(app: tauri::AppHandle, data: String) -> Result<(), String
 }
 
 #[tauri::command]
-async fn set_dns_level(app: tauri::AppHandle, level: String) -> Result<(), String> {
-    let port = app.state::<DnsPort>().0;
-    if port == 0 { return Err("dns resolver not running".into()); }
-    let client = reqwest::Client::new();
-    client.post(format!("http://127.0.0.1:{}/level", port))
-        .body(format!("\"{}\"", level))
-        .send().await.map_err(|e| e.to_string())?;
-    Ok(())
+async fn set_dns_level(app: tauri::AppHandle, webview: tauri::Webview, level: String) -> Result<(), String> {
+    if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
+    let state = app.state::<DnsControl>();
+    state.0.as_ref().ok_or("Browser DoH resolver not active on this platform")?.set_level(&level)
 }
 
-struct DnsPort(u16);
+struct DnsControl(Option<dns_resolver::ResolverControl>);
+
+#[tauri::command]
+async fn linux_egress_scope_preview(app: tauri::AppHandle, webview: tauri::Webview, tab_id: String)
+    -> Result<serde_json::Value,String> {
+    if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
+    #[cfg(all(target_os = "linux",debug_assertions))]
+    {
+        return linux_destination_scope::preview(&app,&tab_id).await;
+    }
+    #[cfg(not(all(target_os = "linux",debug_assertions)))]
+    { let _ = (app,tab_id); Err("Local debug scope preview unavailable".into()) }
+}
+
+#[tauri::command]
+fn dns_backend_status(app: tauri::AppHandle, webview: tauri::Webview) -> Result<String, String> {
+    if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
+    let active = app.state::<DnsControl>().0.is_some();
+    Ok(match (cfg!(windows), active) {
+        (true, true) => "configured_unverified",
+        (false, true) => "fixture_only",
+        _ => "unavailable",
+    }.into())
+}
 
 #[tauri::command]
 async fn load_settings(app: tauri::AppHandle) -> Result<String, String> {
@@ -2658,12 +4164,20 @@ async fn start_download(app: tauri::AppHandle, url: String, filename: String, do
 
 #[tauri::command]
 async fn pause_download(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if linux_downloads::is_native(&app, &id) {
+        return Err("Native WebKit downloads cannot be paused".into());
+    }
     downloads::pause(&app, &id)
 }
 
 #[tauri::command]
 async fn resume_download(app: tauri::AppHandle, id: String) -> Result<(), String> {
     let rl = app.state::<std::sync::Arc<downloads::RateLimiter>>();
+    #[cfg(target_os = "linux")]
+    if linux_downloads::is_native(&app, &id) {
+        return Err("Native WebKit downloads cannot be resumed".into());
+    }
     downloads::resume(app.clone(), id, rl.inner().clone()).await
 }
 
@@ -2681,7 +4195,29 @@ async fn set_bandwidth_limit(app: tauri::AppHandle, limit: u64) -> Result<(), St
 
 #[tauri::command]
 async fn cancel_download(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if linux_downloads::is_native(&app, &id) {
+        return linux_downloads::cancel(&app, id).await;
+    }
     downloads::cancel(&app, &id)
+}
+
+#[tauri::command]
+async fn clear_completed_downloads(app: tauri::AppHandle) -> Result<(), String> {
+    let dm = app.state::<downloads::DownloadManager>();
+    let mut items = dm.downloads.lock();
+    let completed: Vec<_> = items.values().filter(|i| i.state == downloads::DlState::Completed)
+        .map(|i| (i.id.clone(), i.native)).collect();
+    let mut failed = false;
+    for (id, native) in completed {
+        #[cfg(target_os = "linux")]
+        if native && native_download_history::forget(&app, &id).is_err() {
+            failed = true; continue;
+        }
+        items.remove(&id);
+        let _ = app.emit_to("main", "download-cancelled", serde_json::json!({"id": id}));
+    }
+    if failed { Err("Some download history could not be cleared".into()) } else { Ok(()) }
 }
 
 #[tauri::command]
@@ -2697,6 +4233,11 @@ async fn open_download(app: tauri::AppHandle, id: String) -> Result<(), String> 
     let path = {
         let downloads = dm.downloads.lock();
         let item = downloads.get(&id).ok_or("not found")?;
+        if item.state != downloads::DlState::Completed { return Err("Download not completed".into()); }
+        #[cfg(target_os = "linux")]
+        if item.native && !std::fs::symlink_metadata(&item.file_path).is_ok_and(|m| m.file_type().is_file() && Some(m.len()) == item.total_bytes) {
+            return Err("Completed download missing or changed".into());
+        }
         item.file_path.clone()
     };
     tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| e.to_string())
@@ -2708,27 +4249,104 @@ async fn open_download_folder(app: tauri::AppHandle, id: String) -> Result<(), S
     let path = {
         let downloads = dm.downloads.lock();
         let item = downloads.get(&id).ok_or("not found")?;
+        #[cfg(target_os = "linux")]
+        if item.native && (item.state != downloads::DlState::Completed || !std::path::Path::new(&item.file_path).is_absolute()) {
+            return Err("No completed native download location".into());
+        }
         item.file_path.clone()
     };
     let parent = std::path::Path::new(&path).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or(path);
     tauri_plugin_opener::open_path(&parent, None::<&str>).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn binary_updater_enabled() -> bool {
+    cfg!(target_os = "windows")
+}
+
+#[derive(serde::Serialize)]
+struct ExternalActivation { url: Option<String> }
+
+#[tauri::command]
+fn external_activation_enabled() -> bool { cfg!(target_os = "linux") }
+
+#[tauri::command]
+fn take_external_activation(app: tauri::AppHandle, webview: tauri::Webview) -> Result<Option<ExternalActivation>, String> {
+    // Child remote documents share the main window, but not its webview label.
+    if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
+    #[cfg(target_os = "linux")]
+    if let Some(url) = app.state::<linux_instance::ActivationQueue>().take() {
+        if let Some(window) = app.get_window("main") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+        return Ok(Some(ExternalActivation { url }));
+    }
+    Ok(None)
+}
+
+// Explicit local acceptance observation; never an authorization or a grant.
+#[tauri::command]
+fn linux_permission_observation(webview: tauri::Webview) -> Result<serde_json::Value, String> {
+    if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    if let Some(count) = wry::permission_denial_count() {
+        // Decimal text preserves the full u64 through JavaScript JSON.
+        return Ok(serde_json::json!({
+            "schema": 1, "state": "proposal_only",
+            "scope": "process_aggregate", "reason_code": "request_origin_unresolved",
+            "native_deny_calls": count.to_string()
+        }));
+    }
+    Err("Local debug permission observation unavailable".into())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    let mut egress_fixture = match linux_egress_fixture::EgressFixture::from_environment() {
+        Ok(f) => f,
+        Err(e) => { eprintln!("Bushido egress fixture: {e}"); std::process::exit(2); }
+    };
+    #[cfg(target_os = "linux")]
+    let instance = {
+        // Match the existing early startup data root. No fallback to cwd:
+        // the same XDG data root must have one process before any services.
+        let Some(root) = dirs::data_dir() else {
+            eprintln!("Bushido: no application data directory");
+            std::process::exit(2);
+        };
+        match linux_instance::enter(&root.join("com.bushido.browser")) {
+            Ok(Some(instance)) => instance,
+            Ok(None) => return,
+            Err(e) => { eprintln!("Bushido: {e}"); std::process::exit(2); }
+        }
+    };
     // start local DoH resolver before any webview creation
-    let (dns_flags, dns_port) = {
+    let (dns_flags, dns_control) = {
+        let settings = dirs::data_dir().and_then(|p| fs::read_to_string(p.join("com.bushido.browser/settings.json")).ok())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        let level = settings.as_ref().and_then(|s| s.get("dnsLevel")).and_then(|v| v.as_str())
+            .and_then(|v| dns_resolver::parse_level(v).ok()).unwrap_or_default();
+        // Chromium flags do not configure WebKitGTK. Do not open an unused local resolver.
+        #[cfg(target_os = "linux")]
+        let enabled = cfg!(debug_assertions) && std::env::var("BUSHIDO_LINUX_DOH_FIXTURE").as_deref() == Ok("1");
+        #[cfg(not(target_os = "linux"))]
+        let enabled = true;
+        if !enabled { (String::new(), None) } else {
         let rt = tokio::runtime::Runtime::new().expect("tokio rt for dns");
-        match rt.block_on(dns_resolver::start()) {
-            Ok(port) => {
+        match rt.block_on(dns_resolver::start_controlled(level)) {
+            Ok((port, control)) => {
                 println!("DoH resolver on port {}", port);
                 std::thread::spawn(move || { rt.block_on(std::future::pending::<()>()); });
-                (dns_resolver::flags(port), port)
+                (dns_resolver::flags(port), Some(control))
             }
             Err(e) => {
                 eprintln!("dns resolver failed: {}", e);
-                (String::new(), 0)
+                (String::new(), None)
             }
+        }
         }
     };
 
@@ -2778,7 +4396,29 @@ pub fn run() {
     crash_log::log_info("startup", &format!("Bushido Browser v0.9.2 starting, pid={}", std::process::id()));
 
     // init adblock-rust engine (cached binary or cold compile)
+    #[cfg(target_os = "linux")]
+    let engine = if egress_fixture.extension_configured() {
+        let engine=blocker::extension_fixture_engine(&data_dir);
+        egress_fixture.bind_extension_policy(&engine.read());
+        engine
+    } else { blocker::init_engine(&data_dir) };
+    #[cfg(not(target_os = "linux"))]
     let engine = blocker::init_engine(&data_dir);
+
+    // Native Linux filter integration reuses the original downloaded/bundled
+    // source material. It is debug-only and explicitly opt-in because the
+    // strict single-list subset is not equivalent to adblock-rust's global
+    // exceptions, per-tab toggle, cosmetic or redirect semantics.
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    if std::env::var("BUSHIDO_LINUX_NATIVE_SOURCE_SUBSET").as_deref() == Ok("peter-lowe")
+        && std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_none()
+    {
+        let path = blocker::write_native_webkit_subset(&data_dir)
+            .unwrap_or_else(|e| panic!("Opted-in native WebKit subset failed: {e}"));
+        std::env::set_var("BUSHIDO_LINUX_FILTER_JSON", &path);
+        crash_log::log_warn("native-filter",
+            "Experimental Peter Lowe-only WebKit content filter enabled; not ABP parity");
+    }
 
     let scriptlet_preamble = include_str!("scriptlet_preamble.js").to_string();
     let cosmetic_script = include_str!("content_blocker.js").to_string();
@@ -2790,7 +4430,6 @@ pub fn run() {
     let fingerprint_verify_script = include_str!("fingerprint_verify.js").to_string();
     let vault_script = include_str!("vault_autofill.js").to_string();
     let glance_script = include_str!("glance_listener.js").to_string();
-    let preload_script = include_str!("link_preload.js").to_string();
 
     let sync_data_dir = data_dir.clone();
 
@@ -2831,20 +4470,25 @@ pub fn run() {
         map: Mutex::new(keybinding_map),
     };
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .manage(WebviewState {
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init());
+    #[cfg(target_os = "linux")]
+    let builder = builder.manage(instance.queue.clone());
+    // Linux packages are distributed by the package manager or rebuilt
+    // locally. Never install binaries from the upstream Windows channel.
+    #[cfg(target_os = "windows")]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+
+    builder.manage(WebviewState {
             tabs: Mutex::new(HashMap::new()),
+            #[cfg(target_os = "linux")]
+            pinned: Mutex::new(HashSet::new()),
         })
         .manage(PanelState {
             ids: Mutex::new(HashSet::new()),
         })
-        .manage(PreloadState {
-            url: Mutex::new(None),
-            webview_id: Mutex::new(None),
-            source_tab: Mutex::new(None),
-        })
+        .manage(GlanceLifecycle::default())
+        .manage(NativeTabOwners::default())
         .manage(NetworkLog {
             entries: Mutex::new(HashMap::new()),
             enabled: AtomicBool::new(false),
@@ -2866,7 +4510,6 @@ pub fn run() {
             fingerprint_verify_script,
             vault_script,
             glance_script,
-            preload_script,
         })
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -2889,7 +4532,15 @@ pub fn run() {
             .build()
         )
         .setup(move |app| {
-            app.manage(DnsPort(dns_port));
+            // Register the per-tab ordering guard before any browser views
+            // are created. Avoid cfg attributes inside a builder method chain.
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            app.manage(Arc::new(NativeFilterUpdateState::default()));
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            app.manage(linux_document_epoch::DocumentEpochs::default());
+            app.manage(DnsControl(dns_control.clone()));
+            #[cfg(target_os = "linux")]
+            app.manage(egress_fixture);
 
             #[cfg(windows)]
             {
@@ -2897,7 +4548,15 @@ pub fn run() {
                 unsafe { let _ = SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS); }
             }
 
-            // Register global shortcuts one-by-one, skipping any that fail (e.g., already registered by another app)
+            // Linux uses focused GTK events, not desktop-wide hotkeys.
+            #[cfg(target_os = "linux")]
+            if let Some(main) = app.get_webview("main") {
+                if let Err(e) = install_linux_shortcuts(app.handle(), &main) {
+                    crash_log::log_error("linux-shortcuts", &e);
+                }
+            }
+            // Register global shortcuts one-by-one on other platforms.
+            #[cfg(not(target_os = "linux"))]
             {
                 use tauri_plugin_global_shortcut::GlobalShortcutExt;
                 for combo in &shortcut_combos {
@@ -3002,8 +4661,24 @@ pub fn run() {
                 }
             }
 
+            #[cfg(target_os = "linux")]
+            match native_download_history::load(app.handle()) {
+                Ok(items) => {
+                    let dm = app.state::<downloads::DownloadManager>();
+                    let mut downloads = dm.downloads.lock();
+                    for item in items { downloads.entry(item.id.clone()).or_insert(item); }
+                }
+                Err(e) => crash_log::log_error("native-download-history", &e),
+            }
+
             // filter list auto-update (startup check + every 24h)
-            {
+            let freeze_fixture_policy = {
+                #[cfg(target_os = "linux")]
+                { app.state::<linux_egress_fixture::EgressFixture>().extension_configured() }
+                #[cfg(not(target_os = "linux"))]
+                { false }
+            };
+            if !freeze_fixture_policy {
                 let bs = app.state::<BlockerState>();
                 let engine_update = bs.engine.clone();
                 let data_dir_update = bs.data_dir.clone();
@@ -3085,6 +4760,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            binary_updater_enabled,
+            external_activation_enabled,
+            take_external_activation,
             create_tab,
             suspend_tab,
             resume_tab,
@@ -3116,6 +4794,8 @@ pub fn run() {
             restore_backup,
             save_settings,
             set_dns_level,
+            dns_backend_status,
+            linux_egress_scope_preview,
             load_settings,
             save_history,
             load_history,
@@ -3124,6 +4804,8 @@ pub fn run() {
             save_bookmarks,
             load_bookmarks,
             toggle_whitelist,
+            set_tab_native_filter,
+            linux_permission_observation,
             get_whitelist,
             is_whitelisted,
             respond_permission,
@@ -3135,6 +4817,7 @@ pub fn run() {
             resume_download,
             cancel_download,
             get_downloads,
+            clear_completed_downloads,
             open_download,
             open_download_folder,
             reorder_download,
@@ -3149,6 +4832,7 @@ pub fn run() {
             screenshot::capture_preview_for_select,
             screenshot::capture_area,
             screenshot::capture_fullpage,
+            screenshot::screenshot_fullpage_available,
             screenshot::save_screenshot,
             screenshot::copy_image_to_clipboard,
             screenshot::generate_qr_code,
@@ -3183,8 +4867,13 @@ pub fn run() {
             vault::vault_unlock,
             vault::vault_lock,
             vault::vault_is_unlocked,
+            vault::vault_state_snapshot,
+            vault::vault_scoped_mode,
             vault::vault_save_entry,
+            vault::vault_save_manual_entry,
             vault::vault_get_entries,
+            vault::vault_reveal_entry,
+            vault::vault_copy_entry,
             vault::vault_delete_entry,
             vault::vault_update_entry,
             vault::vault_generate_password,
@@ -3208,4 +4897,36 @@ pub fn run() {
             crash_log::log_error("startup", &format!("Tauri run() failed: {}", e));
             eprintln!("FATAL: Bushido failed to start: {}", e);
         });
+}
+
+#[cfg(test)]
+mod native_tab_owner_tests {
+    use super::*;
+
+    #[test]
+    fn owner_does_not_survive_id_reuse_or_workspace_change() {
+        let owners = NativeTabOwners::default();
+        owners.register("tab", "workspace-a");
+        let a = owners.get("tab").unwrap();
+        assert!(owners.matches("tab", &a));
+        owners.remove("tab");
+        assert!(!owners.matches("tab", &a));
+        owners.register("tab", "workspace-a");
+        assert!(!owners.matches("tab", &a));
+        let b = owners.get("tab").unwrap();
+        owners.register("tab", "workspace-b");
+        assert!(!owners.matches("tab", &b));
+        assert_eq!(owners.get("tab").unwrap().workspace, "workspace-b");
+    }
+
+    #[test]
+    fn explicit_workspace_identity_is_bounded_and_not_a_path() {
+        for raw in ["ws-1", "ws_2", "ws-aaaa-bbbb"] {
+            assert!(valid_workspace_identity(raw));
+        }
+        for raw in ["", "../default", "/tmp/workspace", "a b", "界"] {
+            assert!(!valid_workspace_identity(raw));
+        }
+        assert!(!valid_workspace_identity(&"a".repeat(257)));
+    }
 }

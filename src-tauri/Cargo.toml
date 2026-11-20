@@ -39,6 +39,7 @@ tracing-subscriber = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 qrcode = "0.14"
 chrono = "0.4"
+arboard = { version = "3", features = ["image-data"] }
 
 # LAN Sync — Phase A: Discovery + Identity
 mdns-sd = "0.13"
@@ -63,12 +64,18 @@ hmac = "0.12"
 loro = "1.10"
 lz4_flex = "0.11"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.180"
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+gtk = "=0.18.2"
+javascriptcore-rs = "=1.1.2"
+wry = { version = "=0.54.1", default-features = false, features = ["os-webview"] }
+
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"
 windows-core = "0.61"
 windows = { version = "0.61", features = ["Win32_System_Com", "Win32_System_Threading", "Win32_System_Com_StructuredStorage", "Win32_System_ProcessStatus"] }
 windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_Memory"] }
-arboard = { version = "3", features = ["image-data"] }
 
 # Workspace cookie isolation — forked crates for WebView2 profile support
 [patch.crates-io]

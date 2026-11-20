@@ -79,17 +79,43 @@ pub fn generate_identity(app_data: &Path) -> Result<DeviceIdentity, String> {
     Ok(identity)
 }
 
+// A failed or interrupted write must not destroy an existing encrypted
+// identity. Restrict Linux files to the current user from creation time.
+#[cfg(target_os = "linux")]
+fn write_linux_secret_atomically(path: &Path, ciphertext: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path.parent().ok_or("Secret file has no parent directory")?;
+    let mut random = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random);
+    let name = format!(".keys-{}.tmp", hex_encode(&random));
+    let temporary = parent.join(name);
+    let write_result = (|| -> Result<(), String> {
+        let mut file = fs::OpenOptions::new()
+            .write(true).create_new(true).mode(0o600)
+            .open(&temporary)
+            .map_err(|e| format!("Cannot create private temporary key file: {e}"))?;
+        file.write_all(ciphertext)
+            .map_err(|e| format!("Cannot write encrypted identity: {e}"))?;
+        file.sync_all().map_err(|e| format!("Cannot sync encrypted identity: {e}"))?;
+        drop(file);
+        fs::rename(&temporary, path)
+            .map_err(|e| format!("Cannot atomically replace encrypted identity: {e}"))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
 pub fn save_identity(app_data: &Path, identity: &DeviceIdentity) -> Result<(), String> {
     let dir = sync_dir(app_data);
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create sync dir: {}", e))?;
 
-    // Write plaintext device_id and peer_id
-    fs::write(dir.join("device_id"), &identity.device_id)
-        .map_err(|e| format!("Failed to write device_id: {}", e))?;
-    fs::write(dir.join("peer_id"), identity.peer_id.to_string())
-        .map_err(|e| format!("Failed to write peer_id: {}", e))?;
-
-    // Bundle secrets for DPAPI encryption
+    // Do not publish metadata if secure encryption or persistence fails.
+    // Bundle secrets for DPAPI/Secret Service encryption
     let bundle = KeyBundle {
         noise_private_key: identity.noise_private_key.clone(),
         noise_public_key: identity.noise_public_key.clone(),
@@ -102,9 +128,18 @@ pub fn save_identity(app_data: &Path, identity: &DeviceIdentity) -> Result<(), S
         .map_err(|e| format!("Failed to serialize key bundle: {}", e))?;
 
     let encrypted = dpapi_encrypt(&plaintext)?;
-    fs::write(dir.join("keys.dat"), encrypted)
-        .map_err(|e| format!("Failed to write keys.dat: {}", e))?;
 
+    #[cfg(target_os = "linux")]
+    write_linux_secret_atomically(&dir.join("keys.dat"), &encrypted)?;
+    #[cfg(not(target_os = "linux"))]
+    fs::write(dir.join("keys.dat"), &encrypted)
+        .map_err(|e| format!("Failed to write keys.dat: {e}"))?;
+
+    // Public identity metadata is written only after ciphertext is durable.
+    fs::write(dir.join("device_id"), &identity.device_id)
+        .map_err(|e| format!("Failed to write device_id: {e}"))?;
+    fs::write(dir.join("peer_id"), identity.peer_id.to_string())
+        .map_err(|e| format!("Failed to write peer_id: {e}"))?;
     Ok(())
 }
 
@@ -220,12 +255,194 @@ pub(crate) fn dpapi_decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-#[cfg(not(windows))]
-pub(crate) fn dpapi_encrypt(plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    Ok(plaintext.to_vec())
+// Versioned, authenticated at-rest encryption. The 256-bit wrapping key is
+// stored by the user's desktop Secret Service, not alongside keys.dat/vault.db.
+// This backend needs libsecret's secret-tool and an unlocked user keyring.
+// There is deliberately no plaintext or passwordless filesystem fallback.
+#[cfg(target_os = "linux")]
+const LINUX_ENVELOPE: &[u8] = b"BSH-LINUX-V1\0";
+
+#[cfg(target_os = "linux")]
+fn linux_seal_with_key(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Nonce};
+    use rand::RngCore;
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| "Invalid encryption key length".to_string())?;
+    let mut nonce = [0_u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let ciphertext = cipher.encrypt(Nonce::from_slice(&nonce), plaintext)
+        .map_err(|_| "Linux secret encryption failed".to_string())?;
+    let mut envelope = Vec::with_capacity(LINUX_ENVELOPE.len() + 12 + ciphertext.len());
+    envelope.extend_from_slice(LINUX_ENVELOPE);
+    envelope.extend_from_slice(&nonce);
+    envelope.extend_from_slice(&ciphertext);
+    Ok(envelope)
 }
 
-#[cfg(not(windows))]
-pub(crate) fn dpapi_decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
-    Ok(encrypted.to_vec())
+#[cfg(target_os = "linux")]
+fn linux_open_with_key(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
+    use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Nonce};
+    if !blob.starts_with(LINUX_ENVELOPE) || blob.len() < LINUX_ENVELOPE.len() + 12 + 16 {
+        // This also rejects historical non-Windows plaintext keys.dat blobs.
+        return Err("Unknown or unauthenticated Linux secret envelope".into());
+    }
+    let rest = &blob[LINUX_ENVELOPE.len()..];
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| "Invalid decryption key length".to_string())?;
+    cipher.decrypt(Nonce::from_slice(&rest[..12]), &rest[12..])
+        .map_err(|_| "Linux secret authentication failed".into())
 }
+
+#[cfg(target_os = "linux")]
+fn linux_keyring_lookup() -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, String> {
+    use std::process::{Command, Stdio};
+    let output = Command::new("secret-tool")
+        .args(["lookup", "application", "bushido-browser", "purpose", "linux-wrap-v1"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|_| "Cannot access secret-tool; install libsecret-tools and unlock the desktop keyring".to_string())?;
+    // A failed invocation is NOT equivalent to an empty keyring. In
+    // particular, locked/unavailable Secret Service instances may return
+    // no stdout. Refuse to generate a replacement key in those cases.
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err("Desktop Secret Service lookup failed or keyring is locked; refusing key rotation".into());
+    }
+    if output.stdout.is_empty() {
+        return Ok(None);
+    }
+    let hex = zeroize::Zeroizing::new(
+        String::from_utf8(output.stdout)
+            .map_err(|_| "Secret Service key is not UTF-8".to_string())?
+    );
+    let hex = hex.trim_end_matches(&['\r', '\n'][..]);
+    if hex.len() != 64 || !hex.is_ascii() {
+        return Err("Desktop Secret Service key has invalid encoding".into());
+    }
+    let mut key = zeroize::Zeroizing::new([0_u8; 32]);
+    for (i, dest) in key.iter_mut().enumerate() {
+        *dest = u8::from_str_radix(&hex[i*2..i*2+2], 16)
+            .map_err(|_| "Desktop Secret Service key is not hexadecimal".to_string())?;
+    }
+    Ok(Some(key))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_keyring_key(create: bool) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
+    use std::process::{Command, Stdio};
+    use std::io::Write;
+    if let Some(key) = linux_keyring_lookup()? { return Ok(key); }
+    if !create {
+        return Err("Linux Secret Service wrapping key is missing; refusing decryption".into());
+    }
+    let mut candidate = zeroize::Zeroizing::new([0_u8; 32]);
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut candidate[..]);
+    let value = zeroize::Zeroizing::new(hex_encode(&candidate[..]));
+    let mut child = Command::new("secret-tool")
+        .args(["store", "--label=Bushido local encryption key",
+               "application", "bushido-browser", "purpose", "linux-wrap-v1"])
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "Unable to start Secret Service key storage".to_string())?;
+    {
+        let mut stdin = child.stdin.take().ok_or("Cannot open Secret Service input")?;
+        stdin.write_all(value.as_bytes())
+            .map_err(|_| "Secret Service refused encryption key input".to_string())?;
+    }
+    if !child.wait().map_err(|_| "Secret Service storage did not complete")?.success() {
+        return Err("Secret Service could not save a wrapping key".into());
+    }
+    // Re-read the authoritative stored key to avoid first-use races across
+    // independent Bushido processes. Never use an unconfirmed candidate key.
+    linux_keyring_lookup()?.ok_or_else(|| "Secret Service did not retain the wrapping key".into())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn dpapi_encrypt(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let key = linux_keyring_key(true)?;
+    linux_seal_with_key(&key, plaintext)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn dpapi_decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
+    // Reject invalid/legacy blobs before opening or prompting for a keyring.
+    if !encrypted.starts_with(LINUX_ENVELOPE) {
+        return Err("Unknown or unauthenticated Linux secret envelope".into());
+    }
+    let key = linux_keyring_key(false)?;
+    linux_open_with_key(&key, encrypted)
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+pub(crate) fn dpapi_encrypt(_plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    Err("Secure key wrapping is not implemented on this platform".into())
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+pub(crate) fn dpapi_decrypt(_encrypted: &[u8]) -> Result<Vec<u8>, String> {
+    Err("Secure key unwrapping is not implemented on this platform".into())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_key_storage_tests {
+    use super::*;
+
+    #[test]
+    fn envelope_roundtrip_requires_correct_key() {
+        let key = [0x35_u8; 32];
+        let plain = b"noise-private-key-and-vault-entry";
+        let ciphertext = linux_seal_with_key(&key, plain).expect("seal");
+        assert!(ciphertext.starts_with(LINUX_ENVELOPE));
+        assert!(!ciphertext.windows(plain.len()).any(|part| part == plain));
+        assert_eq!(linux_open_with_key(&key, &ciphertext).expect("open"), plain);
+        assert!(linux_open_with_key(&[0x36_u8; 32], &ciphertext).is_err());
+    }
+
+    #[test]
+    fn tampering_and_legacy_plaintext_are_rejected() {
+        let key = [0x55_u8; 32];
+        let mut ciphertext = linux_seal_with_key(&key, b"important").expect("seal");
+        *ciphertext.last_mut().unwrap() ^= 0x01;
+        assert!(linux_open_with_key(&key, &ciphertext).is_err());
+        assert!(linux_open_with_key(&key, b"important").is_err());
+        assert!(linux_open_with_key(&key, LINUX_ENVELOPE).is_err());
+        assert!(linux_open_with_key(&key, b"BSH-LINUX-V0\0bad").is_err());
+    }
+
+    #[test]
+    fn linux_atomic_write_replaces_existing_ciphertext_without_world_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let name = format!("bushido-key-test-{}", uuid::Uuid::new_v4());
+        let dir = std::env::temp_dir().join(name);
+        std::fs::create_dir(&dir).expect("create isolated temporary directory");
+        let path = dir.join("keys.dat");
+        let result = (|| {
+            write_linux_secret_atomically(&path, b"sealed-one").expect("first");
+            assert_eq!(std::fs::read(&path).expect("read"), b"sealed-one");
+            write_linux_secret_atomically(&path, b"sealed-two").expect("replacement");
+            assert_eq!(std::fs::read(&path).expect("read"), b"sealed-two");
+            assert_eq!(std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o077, 0);
+            assert_eq!(std::fs::read_dir(&dir).expect("list").count(), 1);
+        })();
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    #[test]
+    fn nonce_is_unique_for_repeated_encryption() {
+        let key = [0x77_u8; 32];
+        let left = linux_seal_with_key(&key, b"same").expect("seal");
+        let right = linux_seal_with_key(&key, b"same").expect("seal");
+        assert_ne!(left, right);
+    }
+}
+
+#[cfg(all(test, not(windows), not(target_os = "linux")))]
+mod unsupported_platform_tests {
+    use super::*;
+    #[test]
+    fn unsupported_platform_cannot_write_plaintext() {
+        assert!(dpapi_encrypt(b"secret").is_err());
+        assert!(dpapi_decrypt(b"secret").is_err());
+    }
+}
+

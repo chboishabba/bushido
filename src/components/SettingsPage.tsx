@@ -1,4 +1,4 @@
-import { memo, useCallback, useState, useEffect } from "react";
+import { memo, useCallback, useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -11,6 +11,8 @@ interface ImportedHistory { title: string; url: string; visit_count: number; las
 interface BrowserInfo { name: string; has_bookmarks: boolean; has_history: boolean; }
 
 interface Props {
+  workspaceId: string;
+  workspaceName: string;
   settings: BushidoSettings;
   onUpdate: (patch: Partial<BushidoSettings>) => void;
   onReloadAllTabs: () => void;
@@ -194,9 +196,15 @@ interface SyncInfo {
   paired_devices: { device_id: string; name: string; fingerprint: string; paired_at: number }[];
 }
 
-export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs, onThemeChange, onOpenUrl, onImportBookmarks, onImportHistory }: Props) {
+export default memo(function SettingsPage({ workspaceId, workspaceName, settings, onUpdate, onReloadAllTabs, onThemeChange, onOpenUrl, onImportBookmarks, onImportHistory }: Props) {
   const [activeTab, setActiveTab] = useState<TabId>("general");
   const [securityDirty, setSecurityDirty] = useState(false);
+  const [dnsBackend, setDnsBackend] = useState("unknown");
+  useEffect(() => {
+    let alive = true;
+    invoke<string>("dns_backend_status").then(value => { if (alive) setDnsBackend(value); }).catch(() => {});
+    return () => { alive = false; };
+  }, []);
   const [syncInfo, setSyncInfo] = useState<SyncInfo | null>(null);
   const [syncLoading, setSyncLoading] = useState(false);
   const [pairingWizard, setPairingWizard] = useState<{
@@ -209,10 +217,46 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
   const syncTypes = settings.syncDataTypes || { bookmarks: true, history: true, settings: true, tabs: true };
   const setSyncTypes = (next: typeof syncTypes) => set("syncDataTypes", next);
   const [recordingAction, setRecordingAction] = useState<string | null>(null);
-  const [vaultEntries, setVaultEntries] = useState<VaultEntry[]>([]);
+  const [vaultEntries, setVaultEntries] = useState<Pick<VaultEntry, "id" | "domain" | "username">[]>([]);
   const [vaultUnlocked, setVaultUnlocked] = useState(false);
   const [vaultSearch, setVaultSearch] = useState("");
-  const [vaultRevealId, setVaultRevealId] = useState<string | null>(null);
+  const [vaultReveal, setVaultReveal] = useState<{ id: string; password: string } | null>(null);
+  const vaultRevealRequest = useRef(0);
+  const vaultListRequest = useRef(0);
+  const vaultStateEpoch = useRef(-1);
+  const [scopedMode, setScopedMode] = useState<boolean | null>(null);
+  const [legacyView, setLegacyView] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    invoke<boolean>("vault_scoped_mode").then(value => { if (alive) setScopedMode(value); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+  const vaultScope = { workspaceId, legacy: legacyView };
+  // Scope generation changes even when switching away and back to the
+  // same scope. A late operation from an earlier render cannot refresh it.
+  const vaultScopeKey = JSON.stringify([workspaceId, legacyView, activeTab]);
+  const vaultScopeGeneration = useRef({ key: vaultScopeKey, generation: 0 });
+  if (vaultScopeGeneration.current.key !== vaultScopeKey) {
+    vaultScopeGeneration.current = { key: vaultScopeKey, generation: vaultScopeGeneration.current.generation + 1 };
+  }
+  const scopeGeneration = vaultScopeGeneration.current.generation;
+  const invalidateVaultReveal = useCallback(() => {
+    vaultRevealRequest.current++;
+    setVaultReveal(null);
+  }, []);
+  const refreshVaultList = useCallback(async () => {
+    if (activeTab !== "passwords" || scopeGeneration !== vaultScopeGeneration.current.generation) return;
+    const request = ++vaultListRequest.current;
+    const entries = await invoke<Pick<VaultEntry, "id" | "domain" | "username">[]>("vault_get_entries", { workspaceId, legacy: legacyView });
+    if (request === vaultListRequest.current && scopeGeneration === vaultScopeGeneration.current.generation) setVaultEntries(entries);
+  }, [workspaceId, legacyView, activeTab, scopeGeneration]);
+  const clearVaultUi = useCallback(() => {
+    vaultListRequest.current++;
+    invalidateVaultReveal();
+    setVaultUnlocked(false);
+    setVaultEntries([]);
+  }, [invalidateVaultReveal]);
   const [vaultGenLen, setVaultGenLen] = useState(20);
   const [vaultGenResult, setVaultGenResult] = useState("");
   const [vaultHasMaster, setVaultHasMaster] = useState(false);
@@ -690,7 +734,7 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
       <div className="settings-row">
         <div className="settings-label">
           <span>DNS protection</span>
-          <span className="settings-hint">Standard: encrypted DNS. Strict: also detects hidden trackers. Maximum: no fallback, may break some sites.</span>
+          <span className="settings-hint">{dnsBackend === "configured_unverified" ? "Resolver configured; browser routing unverified. Strict checks tracker CNAMEs; Maximum denies alternate upstream." : dnsBackend === "fixture_only" ? "Local resolver fixture only; WebKit browser DNS is not enforced." : "Browser DoH unavailable or unverified. This preference does not establish encrypted browser DNS."}</span>
         </div>
         <Select
           value={settings.dnsLevel || "strict"}
@@ -774,14 +818,43 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
   }, [activeTab, permsLoaded, loadPerms]);
 
   useEffect(() => {
+    let alive = true;
+    const listener = listen<{ epoch: number; unlocked: boolean }>("vault-state-changed", e => {
+      if (!alive || e.payload.epoch <= vaultStateEpoch.current) return;
+      vaultStateEpoch.current = e.payload.epoch;
+      // Any new session invalidates a previous plaintext reveal/list reply.
+      clearVaultUi();
+      setVaultUnlocked(e.payload.unlocked);
+      if (e.payload.unlocked && activeTab === "passwords") refreshVaultList().catch(() => {});
+    });
+    return () => { alive = false; listener.then(unlisten => unlisten()); };
+  }, [clearVaultUi, activeTab, refreshVaultList]);
+
+  useEffect(() => {
+    let alive = true;
     if (activeTab === "passwords") {
-      invoke<boolean>("vault_has_master_password").then(setVaultHasMaster).catch(e => console.warn("[bushido]", e));
-      invoke<boolean>("vault_is_unlocked").then(u => {
-        setVaultUnlocked(u);
-        if (u) invoke<VaultEntry[]>("vault_get_entries", {}).then(setVaultEntries).catch(e => console.warn("[bushido]", e));
-      }).catch(e => console.warn("[bushido]", e));
+      invoke<boolean>("vault_has_master_password").then(value => { if (alive) setVaultHasMaster(value); }).catch(() => {});
+      const request = ++vaultListRequest.current;
+      invoke<{ epoch: number; unlocked: boolean }>("vault_state_snapshot").then(status => {
+        if (!alive || request !== vaultListRequest.current || status.epoch < vaultStateEpoch.current) return;
+        vaultStateEpoch.current = status.epoch;
+        setVaultUnlocked(status.unlocked);
+        if (status.unlocked) refreshVaultList().catch(() => {});
+      }).catch(() => {});
     }
-  }, [activeTab]);
+    return () => {
+      alive = false;
+      vaultListRequest.current++;
+      invalidateVaultReveal();
+      setVaultEntries([]);
+    };
+  }, [activeTab, refreshVaultList, invalidateVaultReveal]);
+
+  useEffect(() => {
+    if (!vaultReveal) return;
+    const timer = setTimeout(invalidateVaultReveal, 15000);
+    return () => clearTimeout(timer);
+  }, [vaultReveal, invalidateVaultReveal]);
 
   const revokePermission = useCallback((domain: string, permission: string) => {
     invoke("revoke_permission", { domain, permission }).then(() => {
@@ -1210,16 +1283,23 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
   const vaultUnlock = async (pw: string) => {
     try {
       await invoke("vault_unlock", { masterPassword: pw });
-      setVaultUnlocked(true);
-      invoke<VaultEntry[]>("vault_get_entries", {}).then(setVaultEntries).catch(e => console.warn("[bushido]", e));
+      const status = await invoke<{ epoch: number; unlocked: boolean }>("vault_state_snapshot");
+      if (status.epoch < vaultStateEpoch.current) return;
+      vaultStateEpoch.current = status.epoch;
+      setVaultUnlocked(status.unlocked);
+      if (status.unlocked) await refreshVaultList();
     } catch (e) { useUiStore.getState().showError(String(e)); }
   };
 
   const vaultSetup = async (pw: string) => {
     try {
       await invoke("vault_setup", { masterPassword: pw });
-      setVaultUnlocked(true);
+      const status = await invoke<{ epoch: number; unlocked: boolean }>("vault_state_snapshot");
+      if (status.epoch < vaultStateEpoch.current) return;
+      vaultStateEpoch.current = status.epoch;
+      setVaultUnlocked(status.unlocked);
       setVaultHasMaster(true);
+      if (status.unlocked) await refreshVaultList();
     } catch (e) { useUiStore.getState().showError(String(e)); }
   };
 
@@ -1232,6 +1312,17 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
     return (
       <section className="settings-section">
         <h2 className="settings-section-title">Passwords</h2>
+        {scopedMode === true && (
+          <div className="settings-row" style={{ gap: 10, flexWrap: "wrap" }}>
+            <span>{legacyView ? "Legacy, unassigned entries — manual recovery only" : `Workspace: ${workspaceName}`}</span>
+            <button className="settings-about-btn" onClick={() => {
+              // Invalidate immediately, before the new scope renders.
+              vaultScopeGeneration.current.generation++;
+              clearVaultUi();
+              setLegacyView(v => !v);
+            }}>{legacyView ? "Back to workspace" : "View legacy entries"}</button>
+          </div>
+        )}
 
         {!vaultHasMaster ? (
           <div className="settings-row" style={{ flexDirection: "column", gap: 8, alignItems: "flex-start" }}>
@@ -1261,11 +1352,45 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
                 className="settings-input"
                 style={{ maxWidth: 300 }}
               />
-              <button className="settings-about-btn" onClick={() => { invoke("vault_lock").catch(() => {}); setVaultUnlocked(false); setVaultEntries([]); }}>
+              <button className="settings-about-btn" onClick={() => {
+                clearVaultUi();
+                invoke("vault_lock").catch(() => useUiStore.getState().showError("Vault lock failed"));
+              }}>
                 Lock Vault
               </button>
             </div>
 
+            {!legacyView && <form autoComplete="off" onSubmit={async e => {
+              e.preventDefault();
+              const form = e.currentTarget;
+              const values = new FormData(form);
+              const submit = form.querySelector<HTMLButtonElement>('button[type="submit"]');
+              if (!submit || submit.disabled) return;
+              submit.disabled = true;
+              try {
+                await invoke("vault_save_manual_entry", {
+                  workspaceId,
+                  site: String(values.get("site") ?? ""),
+                  username: String(values.get("username") ?? ""),
+                  password: String(values.get("password") ?? ""),
+                });
+                form.reset();
+                await refreshVaultList();
+              } catch (error) {
+                // Do not log form data or password-containing errors.
+                useUiStore.getState().showError(typeof error === "string" ? error : "Unable to save login");
+              } finally {
+                form.reset();
+                submit.disabled = false;
+              }
+            }} style={{ display: "flex", flexDirection: "column", gap: 8, maxWidth: 420, margin: "12px 0" }}>
+              <span style={{ fontSize: 13, fontWeight: 600 }}>Add saved login</span>
+              <span className="settings-hint">Enter the full HTTPS site, including a non-default port if needed. Linux matches this workspace and exact origin; use the native page context menu to fill.</span>
+              <input name="site" type="url" placeholder="https://example.com" aria-label="HTTPS site" required maxLength={4096} className="settings-input" />
+              <input name="username" type="text" placeholder="Username" aria-label="Username" autoComplete="off" required maxLength={4096} className="settings-input" />
+              <input name="password" type="password" placeholder="Password" aria-label="Password" autoComplete="new-password" required maxLength={65536} className="settings-input" />
+              <button type="submit" className="settings-about-btn">Add saved login</button>
+            </form>}
             <div className="vault-entries">
               {filtered.length === 0 && <p style={{ opacity: 0.5, fontSize: 13, padding: "12px 0" }}>No saved passwords{vaultSearch ? " matching search" : ""}.</p>}
               {filtered.map(entry => (
@@ -1273,16 +1398,37 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
                   <div className="vault-entry-domain">{entry.domain}</div>
                   <div className="vault-entry-user">{entry.username}</div>
                   <div className="vault-entry-pass">
-                    <span>{vaultRevealId === entry.id ? entry.password : "\u2022".repeat(12)}</span>
-                    <button className="vault-entry-btn" onClick={() => setVaultRevealId(vaultRevealId === entry.id ? null : entry.id)}>
-                      {vaultRevealId === entry.id ? "Hide" : "Show"}
+                    <span>{vaultReveal?.id === entry.id ? vaultReveal.password : "\u2022".repeat(12)}</span>
+                    <button className="vault-entry-btn" onClick={async () => {
+                      const wasVisible = vaultReveal?.id === entry.id;
+                      invalidateVaultReveal();
+                      if (wasVisible) return;
+                      const request = vaultRevealRequest.current;
+                      try {
+                        const password = await invoke<string>("vault_reveal_entry", { id: entry.id, ...vaultScope });
+                        if (request === vaultRevealRequest.current && scopeGeneration === vaultScopeGeneration.current.generation
+                            && await invoke<boolean>("vault_is_unlocked")
+                            && request === vaultRevealRequest.current && scopeGeneration === vaultScopeGeneration.current.generation) {
+                          setVaultReveal({ id: entry.id, password });
+                        }
+                      } catch {
+                        if (request === vaultRevealRequest.current) useUiStore.getState().showError("Unable to reveal login");
+                      }
+                    }}>
+                      {vaultReveal?.id === entry.id ? "Hide" : "Show"}
                     </button>
-                    <button className="vault-entry-btn" onClick={() => navigator.clipboard.writeText(entry.password)}>Copy</button>
+                    <button className="vault-entry-btn" onClick={() => {
+                      invalidateVaultReveal();
+                      invoke("vault_copy_entry", { id: entry.id, ...vaultScope }).catch(() => useUiStore.getState().showError("Unable to copy login"));
+                    }}>Copy</button>
                   </div>
                   <button className="vault-entry-btn danger" onClick={async () => {
                     try {
-                      await invoke("vault_delete_entry", { id: entry.id });
-                      setVaultEntries(prev => prev.filter(e => e.id !== entry.id));
+                      invalidateVaultReveal();
+                      await invoke("vault_delete_entry", { id: entry.id, ...vaultScope });
+                      if (scopeGeneration === vaultScopeGeneration.current.generation) {
+                        setVaultEntries(prev => prev.filter(e => e.id !== entry.id));
+                      }
                     } catch { useUiStore.getState().showError("Failed to delete password"); }
                   }}>Delete</button>
                 </div>
