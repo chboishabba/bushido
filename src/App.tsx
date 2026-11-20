@@ -742,9 +742,12 @@ export default function App() {
         ));
       }),
       listen<{ id: string; hasVideo: boolean; pipSupported?: boolean; pipActive?: boolean }>("tab-has-video", (e) => {
+        const previous = videoByTab.current.get(e.payload.id);
+        if (previous && previous.hasVideo === e.payload.hasVideo &&
+            previous.pipSupported === e.payload.pipSupported &&
+            previous.pipActive === e.payload.pipActive) return;
         videoByTab.current.set(e.payload.id, e.payload);
-        // Current-tab projection is refreshed by the effect below and
-        // by snapshots; background views never change the toolbar.
+        // Unchanged polling snapshots do not trigger a React render.
         setVideoSnapshotVersion(v => v + 1);
       }),
       listen<{ id: string; state: string; title: string; artist?: string; currentTime?: number; duration?: number; playbackRate?: number; metaTitle?: string }>("tab-media-state", (e) => {
@@ -2056,14 +2059,18 @@ export default function App() {
   }, [activeTab, pipSupported]);
 
   useEffect(() => {
-    const snapshot = videoByTab.current.get(activeTab);
+    const tab = tabs.find(t => t.id === activeTab);
+    const eligible = tab && !tab.url.startsWith("bushido://") &&
+      !tab.suspended && tab.memoryState !== "suspended" && tab.memoryState !== "destroyed";
+    const snapshot = eligible ? videoByTab.current.get(activeTab) : undefined;
     setHasVideo(snapshot?.hasVideo ?? false);
     setPipActive(snapshot?.pipActive === true);
     setPipSupported(snapshot?.pipSupported ?? undefined);
-  }, [activeTab, videoSnapshotVersion]);
+  }, [activeTab, tabs, videoSnapshotVersion]);
 
   useEffect(() => {
-    const live = new Set(tabs.map(t => t.id));
+    const live = new Set(tabs.filter(t => !t.suspended &&
+      t.memoryState !== "suspended" && t.memoryState !== "destroyed").map(t => t.id));
     for (const id of videoByTab.current.keys()) {
       if (!live.has(id)) videoByTab.current.delete(id);
     }
