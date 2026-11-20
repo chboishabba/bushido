@@ -104,6 +104,16 @@ function frecencyScore(visitCount: number, lastVisitMs: number): number {
   return visitCount * w;
 }
 
+// Report command admission errors; a returned print dialog is not print completion.
+function invokeDesktopAction(command: "print_tab" | "toggle_devtools", id: string) {
+  if (!id) return;
+  if (command === "toggle_devtools" && useDataStore.getState().settings.disableDevTools) {
+    window.alert("Developer tools are disabled in Security settings.");
+    return;
+  }
+  invoke(command, { id }).catch(e => window.alert(String(e)));
+}
+
 export default function App() {
   // --- Zustand stores ---
   const tabs = useTabStore(s => s.tabs);
@@ -2299,8 +2309,8 @@ export default function App() {
       case "zoomOut": { const z = Math.max((zoomRef.current[activeTab] || 1) - 0.1, 0.3); setZoom(activeTab, z); break; }
       case "zoomReset": setZoom(activeTab, 1); break;
       case "findInPage": setFindOpen(true); break;
-      case "printPage": invoke("print_tab", { id: activeTab }); break;
-      case "toggleDevtools": invoke("toggle_devtools", { id: activeTab }); break;
+      case "printPage": invokeDesktopAction("print_tab", activeTab); break;
+      case "toggleDevtools": invokeDesktopAction("toggle_devtools", activeTab); break;
       case "toggleFullscreen": invoke("toggle_fullscreen"); break;
       case "clearHistory": clearHistory("all"); break;
       case "newWorkspace": addWorkspace(); break;
@@ -2321,11 +2331,11 @@ export default function App() {
       if (ctrl && e.key === "k") { e.preventDefault(); setCmdOpen(p => !p); }
       if (ctrl && e.shiftKey && e.key === "R") { e.preventDefault(); toggleReader(); }
       if (ctrl && e.shiftKey && e.key === "T") { e.preventDefault(); const c = closedTabsRef.current.pop(); if (c) addTab(c.url); }
-      if (ctrl && e.shiftKey && e.key === "I") { e.preventDefault(); invoke("toggle_devtools", { id: activeTab }); }
+      if (ctrl && e.shiftKey && e.key === "I") { e.preventDefault(); invokeDesktopAction("toggle_devtools", activeTab); }
       if (ctrl && e.key === "d" && !e.shiftKey) { e.preventDefault(); toggleBookmark(); }
       if (ctrl && e.key === "h" && !e.shiftKey) { e.preventDefault(); setHistoryOpen(p => !p); }
       if (ctrl && e.shiftKey && e.key === "P") { e.preventDefault(); setPerfOpen(p => !p); }
-      if (ctrl && e.key === "p" && !e.shiftKey) { e.preventDefault(); invoke("print_tab", { id: activeTab }); }
+      if (ctrl && e.key === "p" && !e.shiftKey) { e.preventDefault(); invokeDesktopAction("print_tab", activeTab); }
       if (ctrl && e.key === "j" && !e.shiftKey) { e.preventDefault(); setDownloadsOpen(p => !p); }
       if (ctrl && e.key === "r" && !e.shiftKey) { e.preventDefault(); invoke("reload_tab", { id: activeTab }); }
       if (ctrl && e.key === "=") { e.preventDefault(); const z = Math.min((zoomRef.current[activeTab] || 1) + 0.1, 3); setZoom(activeTab, z); }
@@ -2372,11 +2382,11 @@ export default function App() {
         case "screenshot": openScreenshot(); break;
         case "reader-mode": toggleReader(); break;
         case "split-view": toggleSplit(); break;
-        case "print": invoke("print_tab", { id: activeTab }); break;
+        case "print": invokeDesktopAction("print_tab", activeTab); break;
         case "reload": invoke("reload_tab", { id: activeTab }); break;
         case "fullscreen": invoke("toggle_fullscreen"); break;
         case "downloads": setDownloadsOpen(p => !p); break;
-        case "devtools": invoke("toggle_devtools", { id: activeTab }); break;
+        case "devtools": invokeDesktopAction("toggle_devtools", activeTab); break;
         case "reopen-tab": { const c = closedTabsRef.current.pop(); if (c) addTab(c.url); break; }
         case "zoom-in": { const z = Math.min((zoomRef.current[activeTab] || 1) + 0.1, 3); setZoom(activeTab, z); break; }
         case "zoom-out": { const z = Math.max((zoomRef.current[activeTab] || 1) - 0.1, 0.3); setZoom(activeTab, z); break; }
@@ -3121,7 +3131,7 @@ export default function App() {
           }}>
             Copy page URL
           </div>
-          <div className="ctx-item" tabIndex={0} onClick={() => { invoke("print_tab", { id: pageCtx.tabId }); setPageCtx(null); }}>
+          <div className="ctx-item" tabIndex={0} onClick={() => { invokeDesktopAction("print_tab", pageCtx.tabId); setPageCtx(null); }}>
             Print page
           </div>
           <div className="ctx-item" tabIndex={0} onClick={() => {
@@ -3132,7 +3142,7 @@ export default function App() {
             View page source
           </div>
           <div className="ctx-divider" />
-          <div className="ctx-item" tabIndex={0} onClick={() => { invoke("toggle_devtools", { id: pageCtx.tabId }); setPageCtx(null); }}>
+          <div className="ctx-item" tabIndex={0} onClick={() => { invokeDesktopAction("toggle_devtools", pageCtx.tabId); setPageCtx(null); }}>
             Inspect
           </div>
         </div>

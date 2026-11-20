@@ -17,6 +17,8 @@ mod linux_vault;
 mod linux_vault_save;
 mod import;
 mod screenshot;
+#[cfg(target_os = "linux")]
+mod linux_desktop_actions;
 mod sync;
 mod vault;
 
@@ -1203,7 +1205,8 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     // native subset remains an experimental, incomplete rule translator.
     #[cfg(target_os = "linux")]
     {
-        builder = builder.native_content_filter_enabled(ad_blocker && !site_whitelisted);
+        builder = builder.native_content_filter_enabled(ad_blocker && !site_whitelisted)
+            .devtools(linux_desktop_actions::inspector_allowed(cfg!(debug_assertions), disable_dev_tools, is_panel));
     }
     // Register the initially installed native filter and the current
     // adblock preference before navigation callbacks are invoked.
@@ -2851,7 +2854,7 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
         let whitelisted = app.state::<WhitelistState>()
             .sites.lock().contains(&destination_host);
         let enabled = ad_blocker && !whitelisted;
-        builder = builder.native_content_filter_enabled(enabled);
+        builder = builder.native_content_filter_enabled(enabled).devtools(false);
         #[cfg(debug_assertions)]
         if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
             app.state::<Arc<NativeFilterUpdateState>>()
@@ -3321,41 +3324,55 @@ async fn zoom_tab(app: tauri::AppHandle, id: String, factor: f64) -> Result<(), 
 }
 
 #[tauri::command]
-async fn print_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    if let Some(wv) = app.get_webview(&id) {
-        wv.eval("window.print()").map_err(|e| e.to_string())?;
+async fn print_tab(app: tauri::AppHandle, webview: tauri::Webview, id: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
+        return linux_desktop_actions::print(&app, &id).await;
     }
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = webview;
+        let wv = app.get_webview(&id).ok_or("Webview not found")?;
+        wv.eval("window.print()").map_err(|e| e.to_string())
+    }
 }
 
 #[tauri::command]
-async fn toggle_devtools(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    let wv = app.get_webview(&id).ok_or("webview not found")?;
-    #[cfg(windows)]
+async fn toggle_devtools(app: tauri::AppHandle, webview: tauri::Webview, id: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
     {
-        // Preserve upstream PR #4's guarded WebView2 path.
-        wv.with_webview(|webview| {
-            let _ = catch_unwind(AssertUnwindSafe(|| {
-                unsafe {
-                    if let Ok(core) = webview.controller().CoreWebView2() {
-                        let _ = core.OpenDevToolsWindow();
+        if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
+        return linux_desktop_actions::inspect(&app, &id).await;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = webview;
+        let wv = app.get_webview(&id).ok_or("webview not found")?;
+        #[cfg(windows)]
+        {
+            // Preserve upstream PR #4's guarded WebView2 path.
+            wv.with_webview(|webview| {
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    unsafe {
+                        if let Ok(core) = webview.controller().CoreWebView2() {
+                            let _ = core.OpenDevToolsWindow();
+                        }
                     }
-                }
-            }));
-        }).map_err(|e| e.to_string())?;
-        Ok(())
-    }
-    #[cfg(all(not(windows), debug_assertions))]
-    {
-        // Available in Tauri debug builds; native WebKit inspector on Linux.
-        wv.open_devtools();
-        Ok(())
-    }
-    #[cfg(all(not(windows), not(debug_assertions)))]
-    {
-        // Tauri does not expose open_devtools without its devtools feature.
-        let _ = wv;
-        Err("Developer tools are disabled in this release build".into())
+                }));
+            }).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        #[cfg(all(not(windows), debug_assertions))]
+        {
+            wv.open_devtools();
+            Ok(())
+        }
+        #[cfg(all(not(windows), not(debug_assertions)))]
+        {
+            let _ = wv;
+            Err("Developer tools are disabled in this release build".into())
+        }
     }
 }
 

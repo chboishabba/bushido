@@ -556,9 +556,7 @@ impl InnerWebView {
       settings.set_user_agent(attributes.user_agent.as_deref());
 
       // Devtools
-      if attributes.devtools {
-        settings.set_enable_developer_extras(true);
-      }
+      settings.set_enable_developer_extras(attributes.devtools);
 
       if attributes.javascript_disabled {
         settings.set_enable_javascript(false);
