@@ -70,34 +70,57 @@ impl ScopeProposal {
 
 // Actual native owner and committed WebView URL, never caller-provided
 // workspace/source/port/hostname. Returns aggregate booleans, not capability.
-pub(crate) fn preview(app: &tauri::AppHandle, tab_id: &str, scope: &OperatorScope)
+#[cfg(debug_assertions)]
+pub(crate) async fn preview(app: &tauri::AppHandle, tab_id: &str)
     -> Result<serde_json::Value,String> {
-    if !cfg!(debug_assertions) { return Err("Fixture preview unavailable".into()); }
-    let owner = live_native_tab_owner(app,tab_id).ok_or("No live ordinary tab owner")?;
-    let view = app.get_webview(tab_id).ok_or("No live view")?;
-    let source = view.url().map_err(|_| "No native source URL")?;
-    let blocker = app.state::<BlockerState>();
-    let engine = blocker.engine.read();
-    let proposal = scope.propose(&owner,&source,&engine)?;
-    let current_owner=live_native_tab_owner(app,tab_id).ok_or("Tab owner lost")?;
-    let current_source=app.get_webview(tab_id).and_then(|v| v.url().ok()).ok_or("View URL lost")?;
-    if !proposal.matches(&current_owner,&current_source) {
-        return Err("Native scope observation became stale".into());
-    }
-    Ok(serde_json::json!({
-        "version":"bushido.egress.scope_preview.v1",
-        "state":"proposal_only",
-        "non_authoritative":true,
-        "native_owner_matches":true,
-        "operator_scope_matches":true,
-        "original_document_policy_allows":true,
-        "fixed_loopback_endpoint":proposal.endpoint.ip().is_loopback(),
-        "fixed_dns_name":DNS_NAME,
-        "document_epoch_verified":false,
-        "request_attribution_verified":false,
-        "execution_authorized":false,
-        "native_acceptance":"OPEN"
-    }))
+    use crate::{linux_document_epoch::DocumentEpochs, linux_egress_fixture::EgressFixture};
+    let owner=live_native_tab_owner(app,tab_id).ok_or("No live ordinary tab owner")?;
+    let view=app.get_webview(tab_id).ok_or("No live view")?;
+    let app=app.clone();
+    let id=tab_id.to_owned();
+    let (tx,rx)=tokio::sync::oneshot::channel();
+    view.with_webview(move |platform| {
+        if tx.is_closed() { return; }
+        let result=(|| -> Result<serde_json::Value,String> {
+            if !crate::native_tab_matches_owner(&app,&id,&owner) {
+                return Err("Tab owner changed".into());
+            }
+            let native=platform.inner();
+            let fixture=app.state::<EgressFixture>();
+            let scope=fixture.scope().ok_or("No explicit operator fixture scope")?;
+            let epochs=app.state::<DocumentEpochs>();
+            let doc=epochs.snapshot(&id,&owner,&native)
+                .ok_or("No complete observed native load; reload the synthetic document")?;
+            let blocker=app.state::<BlockerState>();
+            let engine=blocker.engine.try_read().ok_or("Original request policy busy")?;
+            let proposal=scope.propose(&owner,&doc.url,&engine)?;
+            let current_owner=live_native_tab_owner(&app,&id).ok_or("Tab owner lost")?;
+            let current_doc=epochs.snapshot(&id,&current_owner,&native)
+                .ok_or("Native document observation lost")?;
+            if !proposal.matches(&current_owner,&current_doc.url) || doc!=current_doc {
+                return Err("Native scope observation became stale".into());
+            }
+            Ok(serde_json::json!({
+                "version":"bushido.egress.scope_preview.v2",
+                "state":"proposal_only",
+                "non_authoritative":true,
+                "native_owner_matches":true,
+                "operator_scope_matches":true,
+                "original_document_policy_allows":true,
+                "fixed_loopback_endpoint":proposal.endpoint.ip().is_loopback(),
+                "fixed_dns_name":DNS_NAME,
+                "native_load_epoch_observed":true,
+                "document_epoch_verified":false,
+                "request_attribution_verified":false,
+                "execution_authorized":false,
+                "native_acceptance":"OPEN"
+            }))
+        })();
+        let _=tx.send(result);
+    }).map_err(|e| e.to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(5),rx).await
+        .map_err(|_| "Scope preview dispatch timed out".to_string())?
+        .map_err(|_| "Scope preview callback lost".to_string())?
 }
 
 #[cfg(test)]

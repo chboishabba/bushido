@@ -500,3 +500,6 @@ Native vault save dialog polling/read deadline and prior fill callback deadline 
 
 ### P2.4e explicit operator scope preview
 - Debug fixture startup selects fixed synthetic loopback TLS scope with explicit workspace and origin port; native main-only proposal preview uses actual owner/URL and shared blocker, no whitelist override or token. Reject mismatch/rewrite/redirect; recheck owner/URL. Native document epoch and CONNECT-to-view/request attribution OPEN. Transport receiver still test-only; no live authority derived from preview. Three Rust tests authored, not run.
+
+### P2.4e native top-level document epoch observation
+- Debug-only scope observer uses native Started/Committed/Finished (not Tauri's committed-mapped Started), fresh UUID, owner and native object identity, failure/TLS/process/destroy/URI invalidation. Late attach requires complete subsequent load; close forgets; promoted Glance starts unknown. GTK-thread v2 scope preview rechecks same epoch and original policy, still proposal-only and document_epoch_verified=false. Three Rust tests authored, not run. Native lifecycle edge acceptance and request attribution OPEN.

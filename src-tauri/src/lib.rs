@@ -24,6 +24,8 @@ mod linux_desktop_actions;
 mod linux_egress_fixture;
 #[cfg(target_os = "linux")]
 mod linux_destination_scope;
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod linux_document_epoch;
 mod sync;
 mod vault;
 
@@ -1492,6 +1494,13 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
         }
     }
 
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    if !is_panel && profile_name.is_some() {
+        if let Err(e) = linux_document_epoch::install(&app,&webview,&id) {
+            crash_log::log_error("linux-document-epoch",&e);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     if let Err(e) = install_linux_shortcuts(&app, &webview) {
         crash_log::log_error("linux-shortcuts", &e);
@@ -2533,6 +2542,8 @@ async fn close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
     crash_log::log_info("close_tab", &format!("id={}", id));
     // Invalidate source ownership before closing/recreating the native view.
     app.state::<NativeTabOwners>().remove(&id);
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    app.state::<linux_document_epoch::DocumentEpochs>().remove(&id);
     // remove from state FIRST so layout_webviews won't try to position a dying webview
     let state = app.state::<WebviewState>();
     #[cfg(target_os = "linux")]
@@ -3119,6 +3130,10 @@ async fn promote_glance(app: tauri::AppHandle, glance_id: String, workspace_id: 
     ws.tabs.lock().insert(glance_id.clone(), false);
     ps.ids.lock().remove(&glance_id);
     app.state::<NativeTabOwners>().register(&glance_id, &record.workspace);
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    if let Err(e) = linux_document_epoch::install(&app,&view,&glance_id) {
+        crash_log::log_error("linux-document-epoch",&e);
+    }
     // Only promotion acquires credential handlers: a preview must not even
     // arm a password capture candidate. The record is consumed exactly once.
     #[cfg(target_os = "linux")]
@@ -3991,14 +4006,12 @@ async fn set_dns_level(app: tauri::AppHandle, webview: tauri::Webview, level: St
 struct DnsControl(Option<dns_resolver::ResolverControl>);
 
 #[tauri::command]
-fn linux_egress_scope_preview(app: tauri::AppHandle, webview: tauri::Webview, tab_id: String)
+async fn linux_egress_scope_preview(app: tauri::AppHandle, webview: tauri::Webview, tab_id: String)
     -> Result<serde_json::Value,String> {
     if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
     #[cfg(all(target_os = "linux",debug_assertions))]
     {
-        let fixture = app.state::<linux_egress_fixture::EgressFixture>();
-        let scope = fixture.scope().ok_or("No explicit operator fixture scope")?;
-        return linux_destination_scope::preview(&app,&tab_id,scope);
+        return linux_destination_scope::preview(&app,&tab_id).await;
     }
     #[cfg(not(all(target_os = "linux",debug_assertions)))]
     { let _ = (app,tab_id); Err("Local debug scope preview unavailable".into()) }
@@ -4494,6 +4507,8 @@ pub fn run() {
             // are created. Avoid cfg attributes inside a builder method chain.
             #[cfg(all(target_os = "linux", debug_assertions))]
             app.manage(Arc::new(NativeFilterUpdateState::default()));
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            app.manage(linux_document_epoch::DocumentEpochs::default());
             app.manage(DnsControl(dns_control.clone()));
             #[cfg(target_os = "linux")]
             app.manage(egress_fixture);
