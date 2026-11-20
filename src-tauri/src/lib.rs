@@ -6,6 +6,8 @@ mod downloads;
 #[cfg(target_os = "linux")]
 mod linux_downloads;
 #[cfg(target_os = "linux")]
+mod native_download_history;
+#[cfg(target_os = "linux")]
 mod linux_find;
 #[cfg(target_os = "linux")]
 mod linux_vault;
@@ -4108,6 +4110,24 @@ async fn cancel_download(app: tauri::AppHandle, id: String) -> Result<(), String
 }
 
 #[tauri::command]
+async fn clear_completed_downloads(app: tauri::AppHandle) -> Result<(), String> {
+    let dm = app.state::<downloads::DownloadManager>();
+    let mut items = dm.downloads.lock();
+    let completed: Vec<_> = items.values().filter(|i| i.state == downloads::DlState::Completed)
+        .map(|i| (i.id.clone(), i.native)).collect();
+    let mut failed = false;
+    for (id, native) in completed {
+        #[cfg(target_os = "linux")]
+        if native && native_download_history::forget(&app, &id).is_err() {
+            failed = true; continue;
+        }
+        items.remove(&id);
+        let _ = app.emit_to("main", "download-cancelled", serde_json::json!({"id": id}));
+    }
+    if failed { Err("Some download history could not be cleared".into()) } else { Ok(()) }
+}
+
+#[tauri::command]
 async fn get_downloads(app: tauri::AppHandle) -> Result<Vec<downloads::DlItem>, String> {
     let dm = app.state::<downloads::DownloadManager>();
     let downloads = dm.downloads.lock();
@@ -4121,6 +4141,10 @@ async fn open_download(app: tauri::AppHandle, id: String) -> Result<(), String> 
         let downloads = dm.downloads.lock();
         let item = downloads.get(&id).ok_or("not found")?;
         if item.state != downloads::DlState::Completed { return Err("Download not completed".into()); }
+        #[cfg(target_os = "linux")]
+        if item.native && !std::fs::symlink_metadata(&item.file_path).is_ok_and(|m| m.file_type().is_file() && Some(m.len()) == item.total_bytes) {
+            return Err("Completed download missing or changed".into());
+        }
         item.file_path.clone()
     };
     tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| e.to_string())
@@ -4132,6 +4156,10 @@ async fn open_download_folder(app: tauri::AppHandle, id: String) -> Result<(), S
     let path = {
         let downloads = dm.downloads.lock();
         let item = downloads.get(&id).ok_or("not found")?;
+        #[cfg(target_os = "linux")]
+        if item.native && (item.state != downloads::DlState::Completed || !std::path::Path::new(&item.file_path).is_absolute()) {
+            return Err("No completed native download location".into());
+        }
         item.file_path.clone()
     };
     let parent = std::path::Path::new(&path).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or(path);
@@ -4456,6 +4484,16 @@ pub fn run() {
                 }
             }
 
+            #[cfg(target_os = "linux")]
+            match native_download_history::load(app.handle()) {
+                Ok(items) => {
+                    let dm = app.state::<downloads::DownloadManager>();
+                    let mut downloads = dm.downloads.lock();
+                    for item in items { downloads.entry(item.id.clone()).or_insert(item); }
+                }
+                Err(e) => crash_log::log_error("native-download-history", &e),
+            }
+
             // filter list auto-update (startup check + every 24h)
             {
                 let bs = app.state::<BlockerState>();
@@ -4590,6 +4628,7 @@ pub fn run() {
             resume_download,
             cancel_download,
             get_downloads,
+            clear_completed_downloads,
             open_download,
             open_download_folder,
             reorder_download,

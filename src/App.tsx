@@ -1000,7 +1000,7 @@ export default function App() {
 
     // load existing downloads on init
     invoke<DownloadItem[]>("get_downloads").then(items => {
-      if (items.length > 0) setDownloads(items);
+      setDownloads(prev => [...prev, ...items.filter(item => !prev.some(d => d.id === item.id))]);
     }).catch(e => console.warn("[bushido]", e));
 
     // check vault lock state
@@ -2335,19 +2335,19 @@ export default function App() {
   // download callbacks
   const pauseDownload = useCallback((id: string) => invoke("pause_download", { id }), []);
   const resumeDownload = useCallback((id: string) => invoke("resume_download", { id }), []);
-  const cancelDownload = useCallback((id: string) => invoke("cancel_download", { id }), []);
+  const cancelDownload = useCallback((id: string) => invoke("cancel_download", { id }).catch(e => showError(String(e))), [showError]);
   const openDownload = useCallback((id: string) => invoke("open_download", { id }), []);
   const openDownloadFolder = useCallback((id: string) => invoke("open_download_folder", { id }), []);
   const retryDownload = useCallback((id: string) => {
     const dl = downloads.find(d => d.id === id);
-    if (!dl) return;
+    if (!dl || dl.native) return;
     cancelDownload(id);
     const dir = settingsRef.current.downloadLocation || "";
     invoke("start_download", { url: dl.url, filename: dl.fileName, downloadDir: dir, cookies: null });
   }, [downloads, cancelDownload]);
   const clearCompletedDownloads = useCallback(() => {
-    setDownloads(prev => prev.filter(d => d.state !== "completed"));
-  }, []);
+    invoke("clear_completed_downloads").catch(e => showError(String(e)));
+  }, [showError]);
   const toggleDownloads = useCallback(() => setDownloadsOpen(p => !p), []);
   const activeDownloadCount = useMemo(() => downloads.filter(d => d.state === "downloading").length, [downloads]);
 

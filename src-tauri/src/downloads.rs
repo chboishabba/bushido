@@ -23,7 +23,7 @@ pub enum DlState {
     Failed,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DlItem {
     pub id: String,

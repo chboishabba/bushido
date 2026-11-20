@@ -1,9 +1,10 @@
 //! Native WebKit transfers: never replay an authenticated browser download.
 use crate::downloads::{DlItem, DlState, DownloadManager};
+use crate::native_download_history as history;
 use gtk::prelude::*;
 use std::{cell::RefCell, collections::HashMap, path::{Path, PathBuf}, time::{Instant, SystemTime, UNIX_EPOCH}};
 use tauri::{AppHandle, Emitter, Manager};
-use webkit2gtk::{Download, DownloadExt, URIRequestExt, URIResponseExt, WebContextExt, WebViewExt};
+use webkit2gtk::{Download, DownloadExt, URIResponseExt, WebContextExt, WebViewExt};
 
 struct Transfer {
     download: Download,
@@ -109,13 +110,27 @@ fn publish_completed_file(staged: &Path, owned: &Path) -> std::io::Result<PathBu
     Err(Error::new(ErrorKind::AlreadyExists, "Download filename collision limit reached"))
 }
 
-fn publish(app: &AppHandle, id: &str, event: &str, update: impl FnOnce(&mut DlItem)) {
+fn publish(app: &AppHandle, id: &str, event: &str, durable: bool, update: impl FnOnce(&mut DlItem)) -> bool {
     let dm = app.state::<DownloadManager>();
     let snapshot = {
         let mut items = dm.downloads.lock();
         items.get_mut(id).map(|item| { update(item); item.clone() })
     };
-    if let Some(item) = snapshot { let _ = app.emit_to("main", event, item); }
+    if let Some(mut item) = snapshot {
+        let saved = !durable || history::save(app, &item).is_ok();
+        if !saved {
+            // Error details remain static; no URL or request metadata logged.
+            crate::crash_log::log_error("native-download-history", "Cannot persist download receipt");
+            let warning = "Download history could not be saved";
+            item.error = Some(match item.error.take() {
+                Some(e) => format!("{e}; {warning}"),
+                None => warning.into(),
+            });
+            if let Some(live) = dm.downloads.lock().get_mut(id) { live.error = item.error.clone(); }
+        }
+        let _ = app.emit_to("main", event, item);
+        saved
+    } else { false }
 }
 
 fn may_stage(id: &str) -> bool {
@@ -124,7 +139,7 @@ fn may_stage(id: &str) -> bool {
 }
 
 fn fail_destination(app: &AppHandle, id: &str, download: &Download, error: String) {
-    publish(app, id, "download-failed", |item| {
+    publish(app, id, "download-failed", true, |item| {
         item.state = DlState::Failed; item.error = Some(error); item.speed = 0;
     });
     download.cancel();
@@ -143,10 +158,12 @@ fn commit_destination(app: &AppHandle, id: &str, download: &Download, root: &Pat
         ACTIVE.with(|active| {
             if let Some(entry) = active.borrow_mut().get_mut(id) { entry.owned_dir = Some(dir); }
         });
-        publish(app, id, "download-progress", |item| {
+        if !publish(app, id, "download-progress", true, |item| {
             item.file_path = file.to_string_lossy().into_owned();
             item.file_name = name.to_owned();
-        });
+        }) {
+            return Err("Cannot record native download destination".into());
+        }
         download.set_allow_overwrite(false);
         download.set_destination(uri.as_str());
         Ok(())
@@ -213,10 +230,8 @@ fn ask_destination(app: &AppHandle, id: &str, download: &Download, root: Option<
 
 fn start(app: &AppHandle, download: &Download) {
     let id = uuid::Uuid::new_v4().to_string();
-    let url = download.request().and_then(|r| r.uri())
-        .and_then(|s| url::Url::parse(s.as_str()).ok())
-        .filter(|u| matches!(u.scheme(), "http" | "https") && u.username().is_empty() && u.password().is_none())
-        .map(|u| u.to_string()).unwrap_or_default();
+    // Native transfers are not replayable; never retain the request URL.
+    let url = String::new();
     let item = DlItem {
         id: id.clone(), url, file_path: String::new(), file_name: "Preparing download".into(),
         mime_type: String::new(), total_bytes: None, received_bytes: 0, state: DlState::Downloading,
@@ -225,6 +240,7 @@ fn start(app: &AppHandle, download: &Download) {
     };
     app.state::<DownloadManager>().downloads.lock().insert(id.clone(), item.clone());
     ACTIVE.with(|active| active.borrow_mut().insert(id.clone(), Transfer { download: download.clone(), cancelled: false, owned_dir: None, chooser: None }));
+    let persisted = history::save(app, &item).is_ok();
     let _ = app.emit_to("main", "download-started", item);
 
     let handle = app.clone();
@@ -237,7 +253,7 @@ fn start(app: &AppHandle, download: &Download) {
         let settings = download_settings(&handle);
         let name = safe_filename(suggested);
         let root = configured_root(&settings, &mime);
-        publish(&handle, &transfer_id, "download-progress", |item| {
+        publish(&handle, &transfer_id, "download-progress", true, |item| {
             item.file_name = name.clone();
             item.mime_type = mime;
             item.total_bytes = total;
@@ -255,13 +271,16 @@ fn start(app: &AppHandle, download: &Download) {
     let handle = app.clone();
     let transfer_id = id.clone();
     let last = std::cell::Cell::new(Instant::now());
+    let last_checkpoint = std::cell::Cell::new(Instant::now());
     download.connect_received_data(move |download, _| {
         let now = Instant::now();
         if now.duration_since(last.get()).as_millis() < 500 { return; }
         last.set(now);
         let bytes = download.received_data_length();
         let elapsed = download.elapsed_time();
-        publish(&handle, &transfer_id, "download-progress", |item| {
+        let durable = now.duration_since(last_checkpoint.get()).as_secs() >= 5;
+        if durable { last_checkpoint.set(now); }
+        publish(&handle, &transfer_id, "download-progress", durable, |item| {
             if item.state == DlState::Downloading {
                 item.received_bytes = bytes;
                 item.speed = if elapsed > 0.0 { (bytes as f64 / elapsed) as u64 } else { 0 };
@@ -271,13 +290,14 @@ fn start(app: &AppHandle, download: &Download) {
     let handle = app.clone();
     let transfer_id = id.clone();
     download.connect_failed(move |_, error| {
-        publish(&handle, &transfer_id, "download-failed", |item| {
+        publish(&handle, &transfer_id, "download-failed", true, |item| {
             item.state = DlState::Failed; item.speed = 0;
             if item.error.is_none() { item.error = Some(error.to_string()); }
         });
     });
     let handle = app.clone();
-    download.connect_finished(move |download| {
+    let download_id_for_failure = id.clone();
+    download.connect_finished(move |_download| {
         let entry = ACTIVE.with(|active| active.borrow_mut().remove(&id));
         let Some(entry) = entry else { return; };
         if let Some(chooser) = entry.chooser.as_ref() { chooser.hide(); }
@@ -292,43 +312,83 @@ fn start(app: &AppHandle, download: &Download) {
                 .then_some(path)
         });
         if let Some(staged) = staged {
+            // Sync the finished data before recording completion. A staging
+            // file observed after a crash is not by itself a finish receipt.
+            let synced = std::fs::File::open(&staged).and_then(|f| { f.sync_all()?; f.metadata() });
+            let Ok(attrs) = synced else {
+                publish(&handle, &id, "download-failed", true, |item| {
+                    item.state = DlState::Failed; item.speed = 0;
+                    item.error = Some("Finished data could not be synced; staged file retained".into());
+                });
+                return;
+            };
+            let bytes = attrs.len();
+            let staged_recorded = publish(&handle, &id, "download-progress", true, |item| {
+                item.state = DlState::Completed; item.received_bytes = bytes;
+                item.total_bytes = Some(bytes); item.speed = 0;
+                item.error = Some("Saved in private staging; publication pending".into());
+            });
+            if !staged_recorded { return; }
             let mut final_path = staged.clone();
             let mut warning = None;
             if let Some(owned) = entry.owned_dir.as_deref() {
                 match publish_completed_file(&staged, owned) {
-                    Ok(path) => {
-                        final_path = path;
-                        // Publication is committed already. Never roll it back
-                        // or recursively delete staging on a cleanup failure.
-                        if let Err(e) = std::fs::remove_file(&staged).and_then(|_| std::fs::remove_dir(owned)) {
-                            warning = Some(format!("Saved; staging cleanup failed: {e}"));
-                        }
-                    }
+                    Ok(path) => { final_path = path; }
                     Err(e) => warning = Some(format!("Saved in staging; folder publication failed: {e}")),
                 }
             } else {
                 warning = Some("Saved without flat-directory publication".into());
             }
-            publish(&handle, &id, "download-complete", |item| {
-                item.state = DlState::Completed; item.received_bytes = download.received_data_length();
-                item.total_bytes = Some(item.received_bytes); item.speed = 0;
+            // Persist actual final path before unlinking staging. If the
+            // process dies after hard_link but before this write, the prior
+            // completed-staging receipt remains valid and both links survive.
+            let recorded = publish(&handle, &id, "download-complete", true, |item| {
+                item.state = DlState::Completed; item.received_bytes = bytes;
+                item.total_bytes = Some(bytes); item.speed = 0;
                 item.file_path = final_path.to_string_lossy().into_owned();
                 item.file_name = final_path.file_name().and_then(|s| s.to_str())
                     .unwrap_or(&item.file_name).to_owned();
                 item.error = warning;
             });
+            if recorded && final_path != staged {
+                if let Some(owned) = entry.owned_dir.as_deref() {
+                    // Sync the publication directory before dropping the
+                    // fallback link. On failure preserve both names.
+                    let synced = final_path.parent().is_some_and(|root|
+                        std::fs::File::open(root).and_then(|f| f.sync_all()).is_ok());
+                    if !synced || std::fs::remove_file(&staged).and_then(|_| std::fs::remove_dir(owned)).is_err() {
+                        publish(&handle, &id, "download-complete", true, |item| {
+                            item.error = Some("Saved; staging retained or cleanup incomplete".into());
+                        });
+                    }
+                }
+            }
         } else if entry.cancelled {
-            dm.downloads.lock().remove(&id);
-            if let Some(dir) = entry.owned_dir { let _ = std::fs::remove_dir_all(dir); }
-            let _ = handle.emit_to("main", "download-cancelled", serde_json::json!({"id": id}));
+            if history::forget(&handle, &id).is_ok() {
+                dm.downloads.lock().remove(&id);
+                let _ = handle.emit_to("main", "download-cancelled", serde_json::json!({"id": id}));
+            } else {
+                publish(&handle, &id, "download-failed", true, |item| {
+                    item.state = DlState::Failed; item.speed = 0;
+                    item.error = Some("Cancelled; could not remove history".into());
+                });
+            }
+            // Do not recursively delete files in an externally mutable root.
+            // A partial retained by WebKit is never opened as completed.
+            if let Some(dir) = entry.owned_dir { let _ = std::fs::remove_dir(dir); }
         } else {
-            publish(&handle, &id, "download-failed", |item| {
+            publish(&handle, &id, "download-failed", true, |item| {
                 item.state = DlState::Failed; item.speed = 0;
                 if item.error.is_none() { item.error = Some("No completed destination".into()); }
             });
-            if let Some(dir) = entry.owned_dir { let _ = std::fs::remove_dir_all(dir); }
+            if let Some(dir) = entry.owned_dir { let _ = std::fs::remove_dir(dir); }
         }
+
     });
+    if !persisted {
+        // Refuse an unjournaled transfer before choosing its destination.
+        fail_destination(app, &download_id_for_failure, download, "Cannot initialize native download history".into());
+    }
 }
 
 pub fn install(app: &AppHandle, webview: &tauri::Webview) -> Result<(), String> {
@@ -374,15 +434,20 @@ pub async fn cancel(app: &AppHandle, id: String) -> Result<(), String> {
             download.cancel();
         } else {
             let dm = handle.state::<DownloadManager>();
-            dm.downloads.lock().remove(&id);
-            // Removing a finished record must not delete the completed file.
-            let _ = handle.emit_to("main", "download-cancelled", serde_json::json!({"id": id}));
+            let result = history::forget(&handle, &id);
+            if result.is_ok() {
+                dm.downloads.lock().remove(&id);
+                // Removing a history record must never delete any file.
+                let _ = handle.emit_to("main", "download-cancelled", serde_json::json!({"id": id}));
+            }
+            let _ = tx.send(result);
+            return;
         }
-        let _ = tx.send(());
+        let _ = tx.send(Ok(()));
     }).map_err(|e| e.to_string())?;
     tokio::time::timeout(std::time::Duration::from_secs(5), rx).await
         .map_err(|_| "Native cancellation dispatch timed out".to_owned())?
-        .map_err(|_| "Native cancellation callback lost".to_owned())?;
+        .map_err(|_| "Native cancellation callback lost".to_owned())??;
     Ok(())
 }
 
