@@ -13,7 +13,13 @@ static gchar received[sizeof(PREFIX)+32+1+4];
 static gboolean initialized = FALSE;
 static gchar decisions[4] = {'X','X','X','X'};
 
-typedef struct { guint sent; guint challenges; } PageState;
+typedef struct {
+    guint sent;
+    guint challenges;
+    gboolean initialized;
+    gchar received[sizeof(received)];
+    gchar decisions[sizeof(decisions)];
+} PageState;
 
 static void observe(WebKitWebPage *page, PageState *state, const gchar *name)
 {
@@ -39,7 +45,7 @@ static gboolean on_send(WebKitWebPage *page, WebKitURIRequest *request,
     };
     for (guint i=0;i<4;i++) {
         if (strcmp(uri,routes[i])!=0) continue;
-        if (decisions[i]=='D') {
+        if (state->decisions[i]=='D') {
             const gchar *name = i==1 ? "bushido.fixture.v1.deny_direct" :
                 i==3 ? (previous ? "bushido.fixture.v1.deny_redirect" :
                                    "bushido.fixture.v1.deny_target_direct") :
@@ -47,7 +53,7 @@ static gboolean on_send(WebKitWebPage *page, WebKitURIRequest *request,
             observe(page,state,name);
             return TRUE;
         }
-        if (decisions[i]=='A') {
+        if (state->decisions[i]=='A') {
             observe(page,state,i==0 ? "bushido.fixture.v1.allow_control" :
                 i==2 ? "bushido.fixture.v1.allow_redirect" : "bushido.fixture.v2.other_allow");
         } else {
@@ -79,7 +85,7 @@ static gboolean on_challenge(WebKitWebPage *page, WebKitUserMessage *message, gp
         webkit_user_message_get_fd_list(message)) return TRUE;
     const gchar *nonce=g_variant_get_string(param,NULL);
     if (strlen(nonce)!=32 || !lower_hex(nonce,32)) return TRUE;
-    gchar *payload=g_strdup_printf("%s:%s",nonce,initialized?received:"invalid");
+    gchar *payload=g_strdup_printf("%s:%s",nonce,state->initialized?state->received:"invalid");
     webkit_user_message_send_reply(message,
         webkit_user_message_new(REPLY,g_variant_new_string(payload)));
     g_free(payload);
@@ -92,6 +98,10 @@ static void page_created(WebKitWebExtension *extension, WebKitWebPage *page,
     (void)extension;
     (void)unused;
     PageState *state = g_new0(PageState, 1);
+    if (g_object_get_data(G_OBJECT(page),"bushido-fixture-state")) {g_free(state);return;}
+    state->initialized=initialized;
+    memcpy(state->received,received,sizeof(state->received));
+    memcpy(state->decisions,decisions,sizeof(state->decisions));
     g_object_set_data_full(G_OBJECT(page),"bushido-fixture-state",state,g_free);
     g_signal_connect(page,"send-request",G_CALLBACK(on_send),state);
     // Both callbacks use state owned by the page, not by either signal.

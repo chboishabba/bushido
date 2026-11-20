@@ -81,11 +81,11 @@ pub(crate) async fn preview(app: &tauri::AppHandle, tab_id: &str)
     let (tx,rx)=tokio::sync::oneshot::channel();
     view.with_webview(move |platform| {
         if tx.is_closed() { return; }
+        let native=platform.inner();
         let result=(|| -> Result<(serde_json::Value,crate::linux_document_epoch::DocumentSnapshot,Option<String>),String> {
             if !crate::native_tab_matches_owner(&app,&id,&owner) {
                 return Err("Tab owner changed".into());
             }
-            let native=platform.inner();
             let fixture=app.state::<EgressFixture>();
             let scope=fixture.scope().ok_or("No explicit operator fixture scope")?;
             let epochs=app.state::<DocumentEpochs>();
