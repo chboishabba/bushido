@@ -36,7 +36,7 @@ class Runner:
         self.env = dict(os.environ, LC_ALL="C", TZ="UTC")
         self.results = {}
 
-    def stage(self, name, argv, needs=()):
+    def stage(self, name, argv, needs=(), probe=False):
         blocked = [n for n in needs if self.results[n]["status"] != "PASS"]
         row = {"argv": argv}
         if blocked:
@@ -50,7 +50,7 @@ class Runner:
                 try:
                     rc = subprocess.run(argv, cwd=self.root, env=self.env,
                                         stdout=log, stderr=subprocess.STDOUT).returncode
-                    row.update(status="PASS" if rc == 0 else "FAIL", exit_code=rc)
+                    row.update(status="PASS" if rc == 0 else ("BLOCKED" if probe else "FAIL"), exit_code=rc)
                 except OSError as exc:
                     row.update(status="FAIL", reason=str(exc))
             row.update(log=path.name, sha256=digest(path),
@@ -87,21 +87,21 @@ def execute(root, out):
             "complete": False}
     r.receipt(meta)
 
-    def stage(name, argv, needs=()):
+    def stage(name, argv, needs=(), probe=False):
         # Never start another source-dependent stage after a checkout change.
         if not clean(root, sha):
             r.results[name] = {"argv": argv, "status": "BLOCKED",
                                "reason": "Checkout changed during execution"}
             print(name + ": BLOCKED", flush=True)
         else:
-            r.stage(name, argv, needs)
+            r.stage(name, argv, needs, probe)
         r.receipt(meta)
 
     for tool in ("node", "npm", "rustc", "cargo"):
-        stage(tool, [tool, "--version"])
-    stage("webkit_min", ["pkg-config", "--atleast-version=2.40", "webkit2gtk-4.1"])
+        stage(tool, [tool, "--version"], probe=True)
+    stage("webkit_min", ["pkg-config", "--atleast-version=2.40", "webkit2gtk-4.1"], probe=True)
     stage("native_deps", ["pkg-config", "--modversion", "gtk+-3.0",
-                          "webkit2gtk-4.1", "libsoup-3.0", "openssl"])
+                          "webkit2gtk-4.1", "libsoup-3.0", "openssl"], probe=True)
     stage("js_policy", ["node", "--test", "scripts/linux/test-pip-policy.cjs",
                         "scripts/linux/test-vault-fill.cjs", "scripts/linux/test-vault-save.cjs"], ("node",))
     for name, file, flag in (
@@ -135,6 +135,9 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("receipt marker", (root / ok["log"]).read_text())
             fail = r.stage("fail", [sys.executable, "-c", "raise SystemExit(7)"])
             self.assertEqual(fail["exit_code"], 7)
+            probe = r.stage("probe", [sys.executable, "-c", "raise SystemExit(7)"], probe=True)
+            self.assertEqual(probe["status"], "BLOCKED")
+            self.assertEqual(probe["exit_code"], 7)
             self.assertEqual(r.stage("blocked", [sys.executable], ("fail",))["status"], "BLOCKED")
             self.assertFalse((root / "blocked.log").exists())
             missing = r.stage("missing", ["/nonexistent/bushido-test-command"])
