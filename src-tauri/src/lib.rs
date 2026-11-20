@@ -79,7 +79,13 @@ struct PanelState {
 // represent only successfully constructed previews, not promoted tabs.
 #[derive(Default)]
 struct GlanceLifecycle {
-    previews: tokio::sync::Mutex<HashMap<String, String>>,
+    previews: tokio::sync::Mutex<HashMap<String, GlanceRecord>>,
+}
+
+struct GlanceRecord {
+    workspace: String,
+    disable_autofill: bool,
+    disable_password_save: bool,
 }
 
 // Each asynchronous WebKitGTK filter compilation carries a monotonically
@@ -906,6 +912,44 @@ async fn update_filter_lists(app: tauri::AppHandle) -> Result<String, String> {
     Ok("Filter lists updated".into())
 }
 
+fn document_security_script(block_service_workers: bool, block_font_enum: bool) -> String {
+    // build security hardening JS (only enabled features)
+    let mut sec_parts: Vec<&str> = Vec::new();
+    if block_service_workers {
+        sec_parts.push("try{if(navigator.serviceWorker){Object.defineProperty(navigator,'serviceWorker',{get:function(){return{register:function(){return Promise.reject(new DOMException('blocked','SecurityError'))},getRegistration:function(){return Promise.resolve(undefined)},getRegistrations:function(){return Promise.resolve([])},ready:new Promise(function(){}),controller:null}},configurable:false});}}catch(e){}");
+    }
+    if block_font_enum {
+        sec_parts.push(concat!(
+            "try{if(document.fonts){",
+            "var _origFonts=document.fonts;",
+            "var _safeList=['Arial','Helvetica','Times New Roman','Times','Courier New','Courier','Verdana','Georgia','Palatino','Garamond','Comic Sans MS','Trebuchet MS','Arial Black','Impact','Tahoma','Segoe UI'];",
+            "var fakeSet={",
+              "size:0,",
+              "status:'loaded',",
+              "ready:Promise.resolve(),",
+              "check:function(f){try{var m=f.match(/['\"]([^'\"]+)['\"]/);if(m){for(var i=0;i<_safeList.length;i++)if(_safeList[i].toLowerCase()===m[1].toLowerCase())return true}return false}catch(e){return false}},",
+              "load:function(){return Promise.resolve([])},",
+              "forEach:function(){},",
+              "entries:function(){return[][Symbol.iterator]()},",
+              "keys:function(){return[][Symbol.iterator]()},",
+              "values:function(){return[][Symbol.iterator]()},",
+              "has:function(){return false},",
+              "add:function(){},",
+              "delete:function(){return false},",
+              "clear:function(){},",
+              "addEventListener:function(){},",
+              "removeEventListener:function(){},",
+              "dispatchEvent:function(){return true},",
+              "onloading:null,onloadingdone:null,onloadingerror:null",
+            "};",
+            "fakeSet[Symbol.iterator]=function(){return[][Symbol.iterator]()};",
+            "Object.defineProperty(document,'fonts',{get:function(){return fakeSet},configurable:false});",
+            "}}catch(e){}"
+        ));
+    }
+    if sec_parts.is_empty() { String::new() } else { format!("(function(){{{}}})();", sec_parts.join("")) }
+}
+
 fn is_blocked_scheme(url: &str) -> bool {
     let lower = url.trim().to_lowercase();
     lower.starts_with("javascript:") || lower.starts_with("data:")
@@ -1057,41 +1101,7 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     let inject_glance = glance_script.clone();
     let inject_preload = bs.preload_script.clone();
 
-    // build security hardening JS (only enabled features)
-    let mut sec_parts: Vec<&str> = Vec::new();
-    if block_service_workers {
-        sec_parts.push("try{if(navigator.serviceWorker){Object.defineProperty(navigator,'serviceWorker',{get:function(){return{register:function(){return Promise.reject(new DOMException('blocked','SecurityError'))},getRegistration:function(){return Promise.resolve(undefined)},getRegistrations:function(){return Promise.resolve([])},ready:new Promise(function(){}),controller:null}},configurable:false});}}catch(e){}");
-    }
-    if block_font_enum {
-        sec_parts.push(concat!(
-            "try{if(document.fonts){",
-            "var _origFonts=document.fonts;",
-            "var _safeList=['Arial','Helvetica','Times New Roman','Times','Courier New','Courier','Verdana','Georgia','Palatino','Garamond','Comic Sans MS','Trebuchet MS','Arial Black','Impact','Tahoma','Segoe UI'];",
-            "var fakeSet={",
-              "size:0,",
-              "status:'loaded',",
-              "ready:Promise.resolve(),",
-              "check:function(f){try{var m=f.match(/['\"]([^'\"]+)['\"]/);if(m){for(var i=0;i<_safeList.length;i++)if(_safeList[i].toLowerCase()===m[1].toLowerCase())return true}return false}catch(e){return false}},",
-              "load:function(){return Promise.resolve([])},",
-              "forEach:function(){},",
-              "entries:function(){return[][Symbol.iterator]()},",
-              "keys:function(){return[][Symbol.iterator]()},",
-              "values:function(){return[][Symbol.iterator]()},",
-              "has:function(){return false},",
-              "add:function(){},",
-              "delete:function(){return false},",
-              "clear:function(){},",
-              "addEventListener:function(){},",
-              "removeEventListener:function(){},",
-              "dispatchEvent:function(){return true},",
-              "onloading:null,onloadingdone:null,onloadingerror:null",
-            "};",
-            "fakeSet[Symbol.iterator]=function(){return[][Symbol.iterator]()};",
-            "Object.defineProperty(document,'fonts',{get:function(){return fakeSet},configurable:false});",
-            "}}catch(e){}"
-        ));
-    }
-    let security_js = if sec_parts.is_empty() { String::new() } else { format!("(function(){{{}}})();", sec_parts.join("")) };
+    let security_js = document_security_script(block_service_workers, block_font_enum);
     let inject_security = security_js.clone();
 
     // per-tab cosmetic state: computed in on_navigation, injected in on_page_load
@@ -1439,16 +1449,7 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
             crash_log::log_error("linux-glance-input", &e);
         }
         if let Some(workspace) = profile_name.as_deref().filter(|s| !s.is_empty()) {
-            if !disable_autofill {
-                if let Err(e) = linux_vault::install(&app, &webview, &id, workspace) {
-                    crash_log::log_error("linux-vault", &e);
-                }
-            }
-            if !disable_password_save {
-                if let Err(e) = linux_vault_save::install(&app, &webview, &id, workspace) {
-                    crash_log::log_error("linux-vault-save", &e);
-                }
-            }
+            install_linux_vault_hooks(&app, &webview, &id, workspace, disable_autofill, disable_password_save);
         }
     }
 
@@ -1457,77 +1458,8 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
         crash_log::log_error("linux-download", &e);
     }
 
-    // Linux remote documents must not receive general Tauri command access.
-    // This dedicated native channel accepts only bounded cosmetic probes
-    // and returns engine-derived selectors to its own WebView.
     #[cfg(target_os = "linux")]
-    {
-        use webkit2gtk::{UserContentManagerExt, WebViewExt};
-        use javascriptcore::ValueExt;
-        let cosmetic_app = app.clone();
-        let cosmetic_id = id.clone();
-        let cosmetic_engine = engine.clone();
-        webview.with_webview(move |platform| {
-            let view = platform.inner();
-            let Some(manager) = view.user_content_manager() else { return; };
-            let weak_view = gtk::prelude::ObjectExt::downgrade(&view);
-            let last_probe = std::cell::Cell::new(None::<std::time::Instant>);
-            manager.connect_script_message_received(Some("bushidoCosmetic"), move |_, message| {
-                let Some(view) = weak_view.upgrade() else { return; };
-                let Some(uri) = view.uri() else { return; };
-                let Ok(url) = url::Url::parse(uri.as_str()) else { return; };
-                if !matches!(url.scheme(), "http" | "https") { return; }
-                let Some(host) = url.host_str() else { return; };
-                if cosmetic_app.state::<WhitelistState>().sites.lock().contains(&host.to_lowercase()) {
-                    return;
-                }
-                #[cfg(debug_assertions)]
-                let ad_blocker = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
-                    cosmetic_app.state::<Arc<NativeFilterUpdateState>>().preference_for(&cosmetic_id)
-                } else { ad_blocker };
-                if !ad_blocker { return; }
-                let now = std::time::Instant::now();
-                if last_probe.get().is_some_and(|last| now.duration_since(last).as_millis() < 200) {
-                    return;
-                }
-                let Some(value) = message.js_value() else { return; };
-                let raw = value.to_string();
-                if raw.len() > 32768 { return; }
-                let Ok(probe) = serde_json::from_str::<serde_json::Value>(&raw) else { return; };
-                if probe.get("__bushido").and_then(|v| v.as_str()) != Some("cosmetic-probe") { return; }
-                // Reject delayed messages from a previous URL. This is a consistency
-                // check, not authentication of the sending frame.
-                if probe.get("url").and_then(|v| v.as_str()) != Some(uri.as_str()) { return; }
-                let tokens = |key: &str| -> Vec<String> {
-                    probe.get(key).and_then(|v| v.as_array()).into_iter().flatten()
-                        .take(256).filter_map(|v| v.as_str())
-                        .filter(|s| !s.is_empty() && s.len() <= 128)
-                        .map(str::to_owned).collect()
-                };
-                let classes = tokens("classes");
-                let ids = tokens("ids");
-                if classes.is_empty() && ids.is_empty() { return; }
-                last_probe.set(Some(now));
-                let guard = cosmetic_engine.read();
-                // Recompute for the actual current document, not a pending
-                // navigation's cached exception set.
-                let cosmetic = blocker::get_cosmetic_resources(&guard, uri.as_str());
-                if cosmetic.generichide { return; }
-                let selectors = blocker::get_hidden_selectors(&guard, &classes, &ids, &cosmetic.exceptions);
-                drop(guard);
-                if selectors.is_empty() { return; }
-                if let Ok(json) = serde_json::to_string(&selectors) {
-                    let script = format!("if(window.__bushidoApplyCosmetic)window.__bushidoApplyCosmetic({});", json);
-                    view.run_javascript(&script, None::<&gtk::gio::Cancellable>, |_| {});
-                }
-            });
-            if !manager.register_script_message_handler("bushidoCosmetic") {
-                crash_log::log_error("cosmetic-ipc", "Unable to register Linux cosmetic channel");
-            }
-
-
-        }).map_err(|e| e.to_string())?;
-    }
+    install_linux_cosmetic_receiver(&app, &webview, &id, engine.clone(), ad_blocker)?;
 
     #[cfg(target_os = "linux")]
     install_linux_media_receiver(&app, &webview, &id)?;
@@ -2657,6 +2589,91 @@ async fn clear_network_log(app: tauri::AppHandle, tab_id: String) -> Result<(), 
 }
 
 #[cfg(target_os = "linux")]
+fn install_linux_vault_hooks(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str, workspace: &str,
+    disable_autofill: bool, disable_password_save: bool) {
+    if !disable_autofill {
+        if let Err(e) = linux_vault::install(app, webview, id, workspace) {
+            crash_log::log_error("linux-vault", &e);
+        }
+    }
+    if !disable_password_save {
+        if let Err(e) = linux_vault_save::install(app, webview, id, workspace) {
+            crash_log::log_error("linux-vault-save", &e);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_cosmetic_receiver(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str,
+    engine: Arc<RwLock<adblock::engine::Engine>>, ad_blocker: bool) -> Result<(), String> {
+        use webkit2gtk::{UserContentManagerExt, WebViewExt};
+        use javascriptcore::ValueExt;
+        let cosmetic_app = app.clone();
+        let cosmetic_id = id.to_owned();
+        let cosmetic_engine = engine;
+        webview.with_webview(move |platform| {
+            let view = platform.inner();
+            let Some(manager) = view.user_content_manager() else { return; };
+            let weak_view = gtk::prelude::ObjectExt::downgrade(&view);
+            let last_probe = std::cell::Cell::new(None::<std::time::Instant>);
+            manager.connect_script_message_received(Some("bushidoCosmetic"), move |_, message| {
+                let Some(view) = weak_view.upgrade() else { return; };
+                let Some(uri) = view.uri() else { return; };
+                let Ok(url) = url::Url::parse(uri.as_str()) else { return; };
+                if !matches!(url.scheme(), "http" | "https") { return; }
+                let Some(host) = url.host_str() else { return; };
+                if cosmetic_app.state::<WhitelistState>().sites.lock().contains(&host.to_lowercase()) {
+                    return;
+                }
+                #[cfg(debug_assertions)]
+                let ad_blocker = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+                    cosmetic_app.state::<Arc<NativeFilterUpdateState>>().preference_for(&cosmetic_id)
+                } else { ad_blocker };
+                if !ad_blocker { return; }
+                let now = std::time::Instant::now();
+                if last_probe.get().is_some_and(|last| now.duration_since(last).as_millis() < 200) {
+                    return;
+                }
+                let Some(value) = message.js_value() else { return; };
+                let raw = value.to_string();
+                if raw.len() > 32768 { return; }
+                let Ok(probe) = serde_json::from_str::<serde_json::Value>(&raw) else { return; };
+                if probe.get("__bushido").and_then(|v| v.as_str()) != Some("cosmetic-probe") { return; }
+                // Reject delayed messages from a previous URL. This is a consistency
+                // check, not authentication of the sending frame.
+                if probe.get("url").and_then(|v| v.as_str()) != Some(uri.as_str()) { return; }
+                let tokens = |key: &str| -> Vec<String> {
+                    probe.get(key).and_then(|v| v.as_array()).into_iter().flatten()
+                        .take(256).filter_map(|v| v.as_str())
+                        .filter(|s| !s.is_empty() && s.len() <= 128)
+                        .map(str::to_owned).collect()
+                };
+                let classes = tokens("classes");
+                let ids = tokens("ids");
+                if classes.is_empty() && ids.is_empty() { return; }
+                last_probe.set(Some(now));
+                let guard = cosmetic_engine.read();
+                // Recompute for the actual current document, not a pending
+                // navigation's cached exception set.
+                let cosmetic = blocker::get_cosmetic_resources(&guard, uri.as_str());
+                if cosmetic.generichide { return; }
+                let selectors = blocker::get_hidden_selectors(&guard, &classes, &ids, &cosmetic.exceptions);
+                drop(guard);
+                if selectors.is_empty() { return; }
+                if let Ok(json) = serde_json::to_string(&selectors) {
+                    let script = format!("if(window.__bushidoApplyCosmetic)window.__bushidoApplyCosmetic({});", json);
+                    view.run_javascript(&script, None::<&gtk::gio::Cancellable>, |_| {});
+                }
+            });
+            if !manager.register_script_message_handler("bushidoCosmetic") {
+                crash_log::log_error("cosmetic-ipc", "Unable to register Linux cosmetic channel");
+            }
+
+
+        }).map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "linux")]
 fn install_linux_media_receiver(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str) -> Result<(), String> {
     let media_app = app.clone();
     let media_id = id.to_owned();
@@ -2733,7 +2750,24 @@ fn install_linux_media_receiver(app: &tauri::AppHandle, webview: &tauri::Webview
 }
 
 #[tauri::command]
-async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, sidebar_w: f64, top_offset: f64, profile_name: Option<String>, ad_blocker: bool) -> Result<(), String> {
+async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, sidebar_w: f64, top_offset: f64, profile_name: Option<String>, ad_blocker: bool,
+    https_only: Option<bool>, cookie_auto_reject: Option<bool>, block_service_workers: Option<bool>, block_font_enum: Option<bool>,
+    disable_autofill: Option<bool>, disable_password_save: Option<bool>) -> Result<(), String> {
+    let https_only = https_only.unwrap_or(true);
+    let cookie_auto_reject = cookie_auto_reject.unwrap_or(false);
+    let disable_autofill = disable_autofill.unwrap_or(true);
+    let disable_password_save = disable_password_save.unwrap_or(true);
+    let requested = url::Url::parse(&url).map_err(|_| "Invalid Glance URL")?;
+    if !matches!(requested.scheme(), "http" | "https") || requested.host_str().is_none()
+        || !requested.username().is_empty() || requested.password().is_some() {
+        return Err("Glance requires an HTTP(S) destination without embedded credentials".into());
+    }
+    let mut requested = requested;
+    if https_only && requested.scheme() == "http" {
+        requested.set_scheme("https").map_err(|_| "HTTPS upgrade failed")?;
+    }
+    let url = requested.to_string();
+    let security_js = document_security_script(block_service_workers.unwrap_or(false), block_font_enum.unwrap_or(false));
     let lifecycle = app.state::<GlanceLifecycle>();
     let mut previews = lifecycle.previews.lock().await;
     let workspace = profile_name.as_ref().filter(|s| !s.is_empty())
@@ -2806,9 +2840,17 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
     let glance_app_nav = app.clone();
     let glance_id_nav = glance_id.clone();
     let glance_engine = bs.engine.clone();
+    let glance_load_engine = bs.engine.clone();
     builder = builder.on_navigation(move |destination| {
         let destination_url = destination.to_string();
-        if is_blocked_scheme(&destination_url) {
+        // Invalidate any pending native filter retry even for a denied navigation.
+        #[cfg(all(target_os = "linux", debug_assertions))]
+        let sequence = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+            Some(glance_app_nav.state::<Arc<NativeFilterUpdateState>>().begin_navigation(&glance_id_nav))
+        } else { None };
+        if is_blocked_scheme(&destination_url) || !matches!(destination.scheme(), "http" | "https")
+            || destination.host_str().is_none() || !destination.username().is_empty() || destination.password().is_some()
+            || (https_only && destination.scheme() == "http") {
             return false;
         }
 
@@ -2819,7 +2861,7 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
         #[cfg(all(target_os = "linux", debug_assertions))]
         if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
             let state = glance_app_nav.state::<Arc<NativeFilterUpdateState>>().inner().clone();
-            let attempt = state.begin_navigation(&glance_id_nav);
+            let attempt = sequence.expect("native sequence enabled");
             let desired = state.desired_for(&glance_id_nav, whitelisted);
             if desired != state.applied_for(&glance_id_nav) {
                 state.reserve_navigation(&glance_id_nav, attempt, &destination_url);
@@ -2884,17 +2926,53 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
         let _ = glance_title_app.emit_to("main", "tab-title-changed", serde_json::json!({
             "id": glance_title_id, "title": clean
         }));
-    }).on_page_load(move |_, payload| {
-        let loading = matches!(payload.event(), tauri::webview::PageLoadEvent::Started);
-        let _ = glance_load_app.emit_to("main", "tab-loading", serde_json::json!({
-            "id": glance_load_id, "loading": loading
-        }));
+    }).on_page_load({
+        let observer = bs.cosmetic_observer_script.clone();
+        let cookie = bs.cookie_script.clone();
+        move |wv, payload| {
+            let loading = matches!(payload.event(), tauri::webview::PageLoadEvent::Started);
+            let _ = glance_load_app.emit_to("main", "tab-loading", serde_json::json!({
+                "id": glance_load_id, "loading": loading
+            }));
+            // Derive cosmetic resources from the actual committed URL,
+            // not from the source tab or an earlier preview navigation.
+            if !loading {
+                let Ok(uri) = wv.url() else { return; };
+                if !matches!(uri.scheme(), "http" | "https") { return; }
+                let whitelisted = uri.host_str().is_some_and(|host|
+                    glance_load_app.state::<WhitelistState>().sites.lock().contains(&host.to_lowercase()));
+                #[cfg(all(target_os = "linux", debug_assertions))]
+                let ad_blocker = if std::env::var_os("BUSHIDO_LINUX_FILTER_JSON").is_some() {
+                    glance_load_app.state::<Arc<NativeFilterUpdateState>>().preference_for(&glance_load_id)
+                } else { ad_blocker };
+                if ad_blocker && !whitelisted {
+                    let resources = blocker::get_cosmetic_resources(&glance_load_engine.read(), uri.as_str());
+                    if !resources.css.is_empty() {
+                        let js = format!("(function(){{var s=document.createElement('style');s.id='bushido-cosmetic';s.textContent={};(document.head||document.documentElement).appendChild(s)}})();",
+                            serde_json::to_string(&resources.css).unwrap_or_default());
+                        let _ = wv.eval(&js);
+                    }
+                    if !resources.script.is_empty() {
+                        let _ = wv.eval(&format!("(function(){{if(window.__bushidoSL)return;window.__bushidoSL=true;{}}})();", resources.script));
+                    }
+                    if !resources.generichide { let _ = wv.eval(&observer); }
+                }
+                if cookie_auto_reject && !whitelisted { let _ = wv.eval(&cookie); }
+            }
+        }
     });
 
     #[cfg(not(target_os = "linux"))]
     { builder = builder.initialization_script(&shortcut_s); }
     builder = builder.initialization_script(&media_s);
     builder = builder.initialization_script(&fingerprint_s);
+    builder = builder.initialization_script(&bs.scriptlet_preamble);
+    // The ordinary tab's privacy script includes WebRTC restrictions.
+    // Keep it independent of the cosmetic whitelist.
+    builder = builder.initialization_script(&bs.cosmetic_script);
+    if !security_js.is_empty() {
+        builder = builder.initialization_script(&security_js);
+    }
     #[cfg(not(target_os = "linux"))]
     { builder = builder.initialization_script(&vault_s); }
     #[cfg(not(target_os = "linux"))]
@@ -2933,11 +3011,12 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
             ("linux-glance", install_linux_glance_menu(&app, &_webview, &glance_id)),
             ("linux-glance-input", install_linux_glance_input(&app, &_webview, &glance_id)),
             ("linux-media", install_linux_media_receiver(&app, &_webview, &glance_id)),
+            ("linux-cosmetic", install_linux_cosmetic_receiver(&app, &_webview, &glance_id, bs.engine.clone(), ad_blocker)),
         ] {
             if let Err(e) = result { crash_log::log_error(kind, &e); }
         }
     }
-    previews.insert(glance_id, workspace);
+    previews.insert(glance_id, GlanceRecord { workspace, disable_autofill, disable_password_save });
 
     Ok(())
 }
@@ -2962,12 +3041,9 @@ async fn close_glance(app: tauri::AppHandle, glance_id: String) -> Result<(), St
 async fn promote_glance(app: tauri::AppHandle, glance_id: String, workspace_id: String) -> Result<(), String> {
     let lifecycle = app.state::<GlanceLifecycle>();
     let mut previews = lifecycle.previews.lock().await;
-    if previews.get(&glance_id) != Some(&workspace_id) {
-        return Err("Glance is not a live preview in this workspace".into());
-    }
-    if app.get_webview(&glance_id).is_none() {
-        return Err("Glance WebView is missing".into());
-    }
+    let record = previews.get(&glance_id).filter(|record| record.workspace == workspace_id)
+        .ok_or("Glance is not a live preview in this workspace")?;
+    let view = app.get_webview(&glance_id).ok_or("Glance WebView is missing")?;
     let ps = app.state::<PanelState>();
     if !ps.ids.lock().contains(&glance_id) {
         return Err("Glance panel is missing".into());
@@ -2981,6 +3057,11 @@ async fn promote_glance(app: tauri::AppHandle, glance_id: String, workspace_id: 
     #[cfg(not(target_os = "linux"))]
     ws.tabs.lock().insert(glance_id.clone(), false);
     ps.ids.lock().remove(&glance_id);
+    // Only promotion acquires credential handlers: a preview must not even
+    // arm a password capture candidate. The record is consumed exactly once.
+    #[cfg(target_os = "linux")]
+    install_linux_vault_hooks(&app, &view, &glance_id, &record.workspace,
+        record.disable_autofill, record.disable_password_save);
     previews.remove(&glance_id);
     Ok(())
 }

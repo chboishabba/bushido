@@ -933,6 +933,12 @@ export default function App() {
           url: e.payload.url, glanceId, sidebarW: layoutOffsetRef.current,
           topOffset, profileName: src.workspaceId,
           adBlocker: settingsRef.current.adBlocker,
+          httpsOnly: settingsRef.current.httpsOnly,
+          cookieAutoReject: settingsRef.current.cookieAutoReject,
+          blockServiceWorkers: settingsRef.current.blockServiceWorkers,
+          blockFontEnum: settingsRef.current.blockFontEnumeration,
+          disableAutofill: settingsRef.current.disableAutofill,
+          disablePasswordSave: settingsRef.current.disablePasswordSave,
         }).then(() => {
           if (glanceRef.current?.id === glanceId) {
             glanceReadyRef.current = glanceId;
