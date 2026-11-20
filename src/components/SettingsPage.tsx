@@ -1,4 +1,4 @@
-import { memo, useCallback, useState, useEffect } from "react";
+import { memo, useCallback, useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -209,10 +209,27 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
   const syncTypes = settings.syncDataTypes || { bookmarks: true, history: true, settings: true, tabs: true };
   const setSyncTypes = (next: typeof syncTypes) => set("syncDataTypes", next);
   const [recordingAction, setRecordingAction] = useState<string | null>(null);
-  const [vaultEntries, setVaultEntries] = useState<VaultEntry[]>([]);
+  const [vaultEntries, setVaultEntries] = useState<Pick<VaultEntry, "id" | "domain" | "username">[]>([]);
   const [vaultUnlocked, setVaultUnlocked] = useState(false);
   const [vaultSearch, setVaultSearch] = useState("");
-  const [vaultRevealId, setVaultRevealId] = useState<string | null>(null);
+  const [vaultReveal, setVaultReveal] = useState<{ id: string; password: string } | null>(null);
+  const vaultRevealRequest = useRef(0);
+  const vaultListRequest = useRef(0);
+  const invalidateVaultReveal = useCallback(() => {
+    vaultRevealRequest.current++;
+    setVaultReveal(null);
+  }, []);
+  const refreshVaultList = useCallback(async () => {
+    const request = ++vaultListRequest.current;
+    const entries = await invoke<Pick<VaultEntry, "id" | "domain" | "username">[]>("vault_get_entries", {});
+    if (request === vaultListRequest.current) setVaultEntries(entries);
+  }, []);
+  const clearVaultUi = useCallback(() => {
+    vaultListRequest.current++;
+    invalidateVaultReveal();
+    setVaultUnlocked(false);
+    setVaultEntries([]);
+  }, [invalidateVaultReveal]);
   const [vaultGenLen, setVaultGenLen] = useState(20);
   const [vaultGenResult, setVaultGenResult] = useState("");
   const [vaultHasMaster, setVaultHasMaster] = useState(false);
@@ -774,14 +791,35 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
   }, [activeTab, permsLoaded, loadPerms]);
 
   useEffect(() => {
+    let alive = true;
+    const listener = listen("vault-locked", () => { if (alive) clearVaultUi(); });
+    return () => { alive = false; listener.then(unlisten => unlisten()); };
+  }, [clearVaultUi]);
+
+  useEffect(() => {
+    let alive = true;
     if (activeTab === "passwords") {
-      invoke<boolean>("vault_has_master_password").then(setVaultHasMaster).catch(e => console.warn("[bushido]", e));
+      invoke<boolean>("vault_has_master_password").then(value => { if (alive) setVaultHasMaster(value); }).catch(() => {});
+      const request = ++vaultListRequest.current;
       invoke<boolean>("vault_is_unlocked").then(u => {
+        if (!alive || request !== vaultListRequest.current) return;
         setVaultUnlocked(u);
-        if (u) invoke<VaultEntry[]>("vault_get_entries", {}).then(setVaultEntries).catch(e => console.warn("[bushido]", e));
-      }).catch(e => console.warn("[bushido]", e));
+        if (u) refreshVaultList().catch(() => {});
+      }).catch(() => {});
     }
-  }, [activeTab]);
+    return () => {
+      alive = false;
+      vaultListRequest.current++;
+      invalidateVaultReveal();
+      setVaultEntries([]);
+    };
+  }, [activeTab, refreshVaultList, invalidateVaultReveal]);
+
+  useEffect(() => {
+    if (!vaultReveal) return;
+    const timer = setTimeout(invalidateVaultReveal, 15000);
+    return () => clearTimeout(timer);
+  }, [vaultReveal, invalidateVaultReveal]);
 
   const revokePermission = useCallback((domain: string, permission: string) => {
     invoke("revoke_permission", { domain, permission }).then(() => {
@@ -1211,7 +1249,7 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
     try {
       await invoke("vault_unlock", { masterPassword: pw });
       setVaultUnlocked(true);
-      invoke<VaultEntry[]>("vault_get_entries", {}).then(setVaultEntries).catch(e => console.warn("[bushido]", e));
+      await refreshVaultList();
     } catch (e) { useUiStore.getState().showError(String(e)); }
   };
 
@@ -1261,7 +1299,10 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
                 className="settings-input"
                 style={{ maxWidth: 300 }}
               />
-              <button className="settings-about-btn" onClick={() => { invoke("vault_lock").catch(() => {}); setVaultUnlocked(false); setVaultEntries([]); }}>
+              <button className="settings-about-btn" onClick={() => {
+                clearVaultUi();
+                invoke("vault_lock").catch(() => useUiStore.getState().showError("Vault lock failed"));
+              }}>
                 Lock Vault
               </button>
             </div>
@@ -1280,8 +1321,7 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
                   password: String(values.get("password") ?? ""),
                 });
                 form.reset();
-                const entries = await invoke<VaultEntry[]>("vault_get_entries", {});
-                if (await invoke<boolean>("vault_is_unlocked")) setVaultEntries(entries);
+                await refreshVaultList();
               } catch (error) {
                 // Do not log form data or password-containing errors.
                 useUiStore.getState().showError(typeof error === "string" ? error : "Unable to save login");
@@ -1304,14 +1344,30 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
                   <div className="vault-entry-domain">{entry.domain}</div>
                   <div className="vault-entry-user">{entry.username}</div>
                   <div className="vault-entry-pass">
-                    <span>{vaultRevealId === entry.id ? entry.password : "\u2022".repeat(12)}</span>
-                    <button className="vault-entry-btn" onClick={() => setVaultRevealId(vaultRevealId === entry.id ? null : entry.id)}>
-                      {vaultRevealId === entry.id ? "Hide" : "Show"}
+                    <span>{vaultReveal?.id === entry.id ? vaultReveal.password : "\u2022".repeat(12)}</span>
+                    <button className="vault-entry-btn" onClick={async () => {
+                      const wasVisible = vaultReveal?.id === entry.id;
+                      invalidateVaultReveal();
+                      if (wasVisible) return;
+                      const request = vaultRevealRequest.current;
+                      try {
+                        const password = await invoke<string>("vault_reveal_entry", { id: entry.id });
+                        if (request === vaultRevealRequest.current && await invoke<boolean>("vault_is_unlocked")
+                            && request === vaultRevealRequest.current) setVaultReveal({ id: entry.id, password });
+                      } catch {
+                        if (request === vaultRevealRequest.current) useUiStore.getState().showError("Unable to reveal login");
+                      }
+                    }}>
+                      {vaultReveal?.id === entry.id ? "Hide" : "Show"}
                     </button>
-                    <button className="vault-entry-btn" onClick={() => navigator.clipboard.writeText(entry.password)}>Copy</button>
+                    <button className="vault-entry-btn" onClick={() => {
+                      invalidateVaultReveal();
+                      invoke("vault_copy_entry", { id: entry.id }).catch(() => useUiStore.getState().showError("Unable to copy login"));
+                    }}>Copy</button>
                   </div>
                   <button className="vault-entry-btn danger" onClick={async () => {
                     try {
+                      invalidateVaultReveal();
                       await invoke("vault_delete_entry", { id: entry.id });
                       setVaultEntries(prev => prev.filter(e => e.id !== entry.id));
                     } catch { useUiStore.getState().showError("Failed to delete password"); }

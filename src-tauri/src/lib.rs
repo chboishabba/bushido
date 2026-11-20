@@ -4505,6 +4505,8 @@ pub fn run() {
             vault::vault_save_entry,
             vault::vault_save_manual_entry,
             vault::vault_get_entries,
+            vault::vault_reveal_entry,
+            vault::vault_copy_entry,
             vault::vault_delete_entry,
             vault::vault_update_entry,
             vault::vault_generate_password,

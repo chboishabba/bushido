@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::atomic::{AtomicU64, Ordering}};
+use tauri::Emitter;
+use zeroize::{Zeroize, Zeroizing};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -15,6 +17,8 @@ pub struct VaultState {
     pub db_path: PathBuf,
     // derived key from master password, None = locked
     pub derived_key: Mutex<Option<[u8; 32]>>,
+    // Access only while holding derived_key, including transitions.
+    epoch: AtomicU64,
 }
 
 #[derive(Serialize, Clone)]
@@ -30,7 +34,7 @@ pub struct VaultEntry {
 
 impl VaultState {
     pub fn new(db_path: PathBuf) -> Self {
-        Self { db_path, derived_key: Mutex::new(None) }
+        Self { db_path, derived_key: Mutex::new(None), epoch: AtomicU64::new(0) }
     }
 
     pub fn init_db(&self) -> Result<(), String> {
@@ -64,7 +68,7 @@ impl VaultState {
         let mut nonce_bytes = [0u8; 12];
         rand::thread_rng().fill(&mut nonce_bytes);
         let nonce = GenericArray::from_slice(&nonce_bytes);
-        let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&key));
+        let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&*key));
         let encrypted = cipher.encrypt(nonce, plaintext.as_bytes())
             .map_err(|_| "encrypt failed".to_string())?;
         let wrapped = dpapi_encrypt(&encrypted)?;
@@ -76,15 +80,39 @@ impl VaultState {
         let unwrapped = dpapi_decrypt(enc)?;
         if nonce.len() != 12 { return Err("invalid vault nonce".into()); }
         let nonce_arr = GenericArray::from_slice(nonce);
-        let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&key));
+        let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&*key));
         let decrypted = cipher.decrypt(nonce_arr, unwrapped.as_ref())
             .map_err(|_| "decrypt failed".to_string())?;
         String::from_utf8(decrypted).map_err(|_| "invalid utf8".to_string())
     }
 
-    fn get_key(&self) -> Result<[u8; 32], String> {
+    fn get_key(&self) -> Result<Zeroizing<[u8; 32]>, String> {
         let guard = self.derived_key.lock();
-        guard.ok_or_else(|| "vault locked".to_string())
+        guard.as_ref().map(|key| Zeroizing::new(*key))
+            .ok_or_else(|| "vault locked".to_string())
+    }
+
+    pub(crate) fn session(&self) -> Result<u64, String> {
+        let guard = self.derived_key.lock();
+        if guard.is_none() { return Err("Unlock the vault in Settings first".into()); }
+        Ok(self.epoch.load(Ordering::Relaxed))
+    }
+
+    // Synchronous admission only: do not await, or call a function that
+    // re-acquires derived_key, inside this closure.
+    pub(crate) fn with_session<T>(&self, expected: u64, action: impl FnOnce() -> T) -> Result<T, String> {
+        let guard = self.derived_key.lock();
+        if guard.is_none() || self.epoch.load(Ordering::Relaxed) != expected {
+            return Err("Vault session changed; authorize again".into());
+        }
+        Ok(action())
+    }
+
+    fn replace_key(&self, key: Option<[u8; 32]>) {
+        let mut guard = self.derived_key.lock();
+        if let Some(old) = guard.as_mut() { old.zeroize(); }
+        *guard = key;
+        self.epoch.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -175,6 +203,7 @@ pub async fn vault_has_master_password(state: tauri::State<'_, VaultState>) -> R
 
 #[tauri::command]
 pub async fn vault_setup(state: tauri::State<'_, VaultState>, master_password: String) -> Result<(), String> {
+    let master_password = Zeroizing::new(master_password);
     if master_password.len() < 8 {
         return Err("password must be at least 8 characters".into());
     }
@@ -184,28 +213,33 @@ pub async fn vault_setup(state: tauri::State<'_, VaultState>, master_password: S
     let hash = argon2.hash_password(master_password.as_bytes(), &salt)
         .map_err(|e| format!("hash: {}", e))?;
 
-    let conn = state.open_db()?;
-    conn.execute(
-        "INSERT OR REPLACE INTO vault_meta (key, value) VALUES ('master_hash', ?1)",
+    let key = Zeroizing::new(derive_key(&master_password, salt.as_str().as_bytes())?);
+    let mut conn = state.open_db()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| "Vault setup transaction failed".to_owned())?;
+    let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM vault_meta WHERE key IN ('master_hash','salt'))", [], |row| row.get(0))
+        .map_err(|_| "Vault metadata query failed".to_owned())?;
+    if exists { return Err("Vault already initialized; unlock instead".into()); }
+    tx.execute(
+        "INSERT INTO vault_meta (key, value) VALUES ('master_hash', ?1)",
         [hash.to_string().as_bytes()],
     ).map_err(|e| format!("save hash: {}", e))?;
 
     // store salt separately for key derivation
-    conn.execute(
-        "INSERT OR REPLACE INTO vault_meta (key, value) VALUES ('salt', ?1)",
+    tx.execute(
+        "INSERT INTO vault_meta (key, value) VALUES ('salt', ?1)",
         [salt.as_str().as_bytes()],
     ).map_err(|e| format!("save salt: {}", e))?;
 
-    // derive and store key in memory
-    let key = derive_key(&master_password, salt.as_str().as_bytes())?;
-    let mut guard = state.derived_key.lock();
-    *guard = Some(key);
+    tx.commit().map_err(|_| "Vault setup commit failed".to_owned())?;
+    state.replace_key(Some(*key));
 
     Ok(())
 }
 
 #[tauri::command]
 pub async fn vault_unlock(state: tauri::State<'_, VaultState>, master_password: String) -> Result<(), String> {
+    let master_password = Zeroizing::new(master_password);
     let conn = state.open_db()?;
 
     let hash_str: String = conn.query_row(
@@ -234,20 +268,16 @@ pub async fn vault_unlock(state: tauri::State<'_, VaultState>, master_password: 
         .map_err(|_| "wrong password".to_string())?;
 
     let key = derive_key(&master_password, salt_str.as_bytes())?;
-    let mut guard = state.derived_key.lock();
-    *guard = Some(key);
+    state.replace_key(Some(key));
 
     Ok(())
 }
 
 #[tauri::command]
-pub async fn vault_lock(state: tauri::State<'_, VaultState>) -> Result<(), String> {
-    let mut guard = state.derived_key.lock();
-    if let Some(ref mut key) = *guard {
-        // zero out before dropping
-        key.iter_mut().for_each(|b| *b = 0);
-    }
-    *guard = None;
+pub async fn vault_lock(app: tauri::AppHandle, state: tauri::State<'_, VaultState>) -> Result<(), String> {
+    state.replace_key(None);
+    // No sensitive payload. UI drops any selected plaintext immediately.
+    let _ = app.emit_to("main", "vault-locked", ());
     Ok(())
 }
 
@@ -308,64 +338,58 @@ pub async fn vault_save_manual_entry(
     vault_save_entry(state, domain, username, password, None).await
 }
 
+#[derive(Serialize)]
+pub struct VaultEntryMetadata {
+    id: String,
+    domain: String,
+    username: String,
+}
+
+fn list_metadata(conn: &Connection, domain: Option<&str>) -> Result<Vec<VaultEntryMetadata>, String> {
+    let mut stmt = conn.prepare(
+        "SELECT id, domain, username FROM vault_entries WHERE (?1 IS NULL OR domain = ?1) ORDER BY domain, updated_at DESC"
+    ).map_err(|_| "Vault metadata query failed".to_owned())?;
+    let rows = stmt.query_map([domain], |row| Ok(VaultEntryMetadata {
+        id: row.get(0)?, domain: row.get(1)?, username: row.get(2)?,
+    })).map_err(|_| "Vault metadata query failed".to_owned())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|_| "Vault metadata read failed".to_owned())
+}
+
 #[tauri::command]
-pub async fn vault_get_entries(
-    state: tauri::State<'_, VaultState>,
-    domain: Option<String>,
-) -> Result<Vec<VaultEntry>, String> {
+pub async fn vault_get_entries(state: tauri::State<'_, VaultState>, domain: Option<String>) -> Result<Vec<VaultEntryMetadata>, String> {
+    let epoch = state.session()?;
     let conn = state.open_db()?;
+    let metadata = list_metadata(&conn, domain.as_deref())?;
+    state.with_session(epoch, || metadata)
+}
 
-    let mut entries = Vec::new();
-    if let Some(ref d) = domain {
-        let mut stmt = conn.prepare(
-            "SELECT id, domain, username, password_enc, nonce, notes, created_at, updated_at FROM vault_entries WHERE domain = ?1 ORDER BY updated_at DESC"
-        ).map_err(|e| format!("query: {}", e))?;
+fn selected_password(state: &VaultState, id: &str, epoch: u64) -> Result<Zeroizing<String>, String> {
+    state.with_session(epoch, || ())?;
+    let conn = state.open_db()?;
+    let (enc, nonce): (Vec<u8>, Vec<u8>) = conn.query_row(
+        "SELECT password_enc, nonce FROM vault_entries WHERE id = ?1",
+        [id], |row| Ok((row.get(0)?, row.get(1)?))
+    ).map_err(|_| "Selected account not found".to_owned())?;
+    let password = Zeroizing::new(state.decrypt_password(&enc, &nonce)?);
+    state.with_session(epoch, || password)
+}
 
-        let rows = stmt.query_map([d], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, Vec<u8>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, i64>(6)?,
-                row.get::<_, i64>(7)?,
-            ))
-        }).map_err(|e| format!("query: {}", e))?;
+// Called by trusted Settings only; one explicit reveal, no bulk password list.
+#[tauri::command]
+pub async fn vault_reveal_entry(state: tauri::State<'_, VaultState>, id: String) -> Result<String, String> {
+    let epoch = state.session()?;
+    let password = selected_password(&state, &id, epoch)?;
+    state.with_session(epoch, || password.to_string())
+}
 
-        for row in rows {
-            let (id, domain, username, enc, nonce, notes, created_at, updated_at) = row.map_err(|e| format!("row: {}", e))?;
-            // only decrypt if vault is unlocked
-            let password = state.decrypt_password(&enc, &nonce).unwrap_or_default();
-            entries.push(VaultEntry { id, domain, username, password, notes, created_at, updated_at });
-        }
-    } else {
-        let mut stmt = conn.prepare(
-            "SELECT id, domain, username, password_enc, nonce, notes, created_at, updated_at FROM vault_entries ORDER BY domain, updated_at DESC"
-        ).map_err(|e| format!("query: {}", e))?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, Vec<u8>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, i64>(6)?,
-                row.get::<_, i64>(7)?,
-            ))
-        }).map_err(|e| format!("query: {}", e))?;
-
-        for row in rows {
-            let (id, domain, username, enc, nonce, notes, created_at, updated_at) = row.map_err(|e| format!("row: {}", e))?;
-            let password = state.decrypt_password(&enc, &nonce).unwrap_or_default();
-            entries.push(VaultEntry { id, domain, username, password, notes, created_at, updated_at });
-        }
-    }
-
-    Ok(entries)
+#[tauri::command]
+pub async fn vault_copy_entry(state: tauri::State<'_, VaultState>, id: String) -> Result<(), String> {
+    let epoch = state.session()?;
+    let password = selected_password(&state, &id, epoch)?;
+    state.with_session(epoch, || {
+        let mut clipboard = arboard::Clipboard::new().map_err(|_| "Clipboard unavailable".to_owned())?;
+        clipboard.set_text(password.to_string()).map_err(|_| "Clipboard write failed".to_owned())
+    })?
 }
 
 #[tauri::command]
@@ -436,4 +460,37 @@ pub async fn vault_generate_password(
     let password: String = (0..len).map(|_| chars[rng.gen_range(0..chars.len())]).collect();
 
     Ok(password)
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn lock_and_reunlock_revoke_old_session() {
+        let state = VaultState::new(PathBuf::from("unused"));
+        assert!(state.session().is_err());
+        state.replace_key(Some([1; 32]));
+        let old = state.session().unwrap();
+        assert_eq!(state.with_session(old, || 7), Ok(7));
+        state.replace_key(None);
+        assert!(state.with_session(old, || panic!("revoked")).is_err());
+        state.replace_key(Some([1; 32]));
+        assert_ne!(old, state.session().unwrap());
+        assert!(state.with_session(old, || panic!("revoked")).is_err());
+    }
+
+    #[test]
+    fn metadata_list_does_not_select_or_decrypt_ciphertext() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE vault_entries (id TEXT, domain TEXT, username TEXT, updated_at INTEGER);
+            INSERT INTO vault_entries VALUES ('one','https://a.test','user1',1), ('two','https://b.test','user2',2);").unwrap();
+        let all = list_metadata(&conn, None).unwrap();
+        assert_eq!(all.len(), 2);
+        let one = list_metadata(&conn, Some("https://a.test")).unwrap();
+        assert_eq!(one.len(), 1);
+        let json = serde_json::to_value(&one[0]).unwrap();
+        assert_eq!(json["id"], "one");
+        assert!(json.get("password").is_none());
+    }
 }

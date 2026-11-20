@@ -124,8 +124,13 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                     let _reset = Reset(busy);
                     let valid = || generation.get() == opened && live(&app, &id, &view, &href);
                     if !valid() { return; }
+                    let epoch = match app.state::<crate::vault::VaultState>().session() {
+                        Ok(epoch) => epoch,
+                        Err(e) => { message(&app, &e); return; }
+                    };
+                    let authorized = || valid() && app.state::<crate::vault::VaultState>().with_session(epoch, || ()).is_ok();
                     let token = uuid::Uuid::new_v4().to_string();
-                    if !evaluate(&view, script("probe", &token, &origin, &href, "", "").as_str()).await || !valid() {
+                    if !evaluate(&view, script("probe", &token, &origin, &href, "", "").as_str()).await || !authorized() {
                         message(&app, "No unambiguous empty same-origin HTTPS login form"); return;
                     }
                     let db_app = app.clone();
@@ -137,23 +142,33 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                         Ok(Err(e)) => { message(&app, &e); return; }
                         _ => { message(&app, "No exact-origin saved login; add the HTTPS origin in Settings → Passwords"); return; }
                     };
-                    if !valid() { return; }
+                    if !authorized() { return; }
                     let Some(selected) = select(&view, &origin, &choices).await else { return; };
-                    if !valid() { return; }
+                    if !authorized() { return; }
                     let db_app = app.clone();
                     let db_origin = origin.clone();
                     let result = tauri::async_runtime::spawn_blocking(move ||
                         crate::vault::native_selected(&db_app.state::<crate::vault::VaultState>(), &db_origin, &selected)).await;
                     let Ok(Ok((user, pass))) = result else { message(&app, "Cannot decrypt selected account"); return; };
-                    if !valid() || app.state::<crate::vault::VaultState>().derived_key.lock().is_none() {
-                        return;
-                    }
+                    if !authorized() { return; }
                     let source = script("fill", &token, &origin, &href, &user, pass.as_str());
                     drop(pass);
-                    if evaluate(&view, source.as_str()).await {
-                        message(&app, "Saved login filled; review before submitting");
-                    } else {
-                        message(&app, "Login form changed; nothing filled");
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    // Admit dispatch synchronously with the vault session lock;
+                    // a subsequent vault lock cannot retract engine work that
+                    // was already queued. Never hold a mutex across await.
+                    if app.state::<crate::vault::VaultState>().with_session(epoch, || {
+                        view.run_javascript_in_world(source.as_str(), WORLD,
+                            None::<&gtk::gio::Cancellable>, move |result| {
+                                let ok = result.ok().and_then(|r| r.js_value()).is_some_and(|v| v.to_boolean());
+                                let _ = tx.send(ok);
+                            });
+                    }).is_err() { return; }
+                    drop(source);
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+                        Ok(Ok(true)) => message(&app, "Saved login filled; review before submitting"),
+                        Ok(Ok(false)) => message(&app, "Login form changed; nothing filled"),
+                        _ => message(&app, "Login fill result unavailable; inspect the form"),
                     }
                 });
             });
