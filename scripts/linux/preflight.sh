@@ -23,6 +23,7 @@ pkg-config --modversion gtk+-3.0 webkit2gtk-4.1 libsoup-3.0
 node --test scripts/linux/test-pip-policy.cjs scripts/linux/test-vault-fill.cjs scripts/linux/test-vault-save.cjs
 python3 scripts/linux/check-package.py --self-test
 python3 scripts/linux/test-source-candidate.py
+python3 scripts/linux/witness-receipt.py --self-test
 python3 scripts/linux/network_fixture.py test
 python3 scripts/linux/compile_webkit_subset.py --test
 npm ci

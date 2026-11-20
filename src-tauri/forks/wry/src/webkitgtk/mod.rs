@@ -53,6 +53,11 @@ use x11_dl::xlib::*;
 
 pub use web_context::WebContextImpl;
 
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod permission_observation;
+#[cfg(all(target_os = "linux", debug_assertions))]
+pub use permission_observation::permission_denial_count;
+
 // GTK-thread-only hooks keyed by the native view, not a reusable tab label.
 type NativeNavigationPreview = Rc<dyn Fn(&WebView, &NavigationAction, &str) -> bool>;
 thread_local! {
@@ -580,6 +585,9 @@ impl InnerWebView {
     #[cfg(target_os = "linux")]
     webview.connect_permission_request(|_webview, request| {
       request.deny();
+      // Observation only, after the existing fail-closed control action.
+      #[cfg(debug_assertions)]
+      permission_observation::observe_denial();
       true // handled; do not propagate to another permissive handler
     });
 

@@ -4215,6 +4215,22 @@ fn take_external_activation(app: tauri::AppHandle, webview: tauri::Webview) -> R
     Ok(None)
 }
 
+// Explicit local acceptance observation; never an authorization or a grant.
+#[tauri::command]
+fn linux_permission_observation(webview: tauri::Webview) -> Result<serde_json::Value, String> {
+    if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    if let Some(count) = wry::permission_denial_count() {
+        // Decimal text preserves the full u64 through JavaScript JSON.
+        return Ok(serde_json::json!({
+            "schema": 1, "state": "proposal_only",
+            "scope": "process_aggregate", "reason_code": "request_origin_unresolved",
+            "native_deny_calls": count.to_string()
+        }));
+    }
+    Err("Local debug permission observation unavailable".into())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -4683,6 +4699,7 @@ pub fn run() {
             load_bookmarks,
             toggle_whitelist,
             set_tab_native_filter,
+            linux_permission_observation,
             get_whitelist,
             is_whitelisted,
             respond_permission,

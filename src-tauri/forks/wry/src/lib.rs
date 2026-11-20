@@ -378,6 +378,8 @@ use raw_window_handle::HasWindowHandle;
 use webkitgtk::*;
 #[cfg(gtk)]
 pub use webkitgtk::set_native_navigation_preview;
+#[cfg(all(gtk, target_os = "linux", debug_assertions))]
+pub use webkitgtk::permission_denial_count;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use objc2::rc::Retained;
