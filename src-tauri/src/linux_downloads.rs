@@ -112,25 +112,21 @@ fn publish_completed_file(staged: &Path, owned: &Path) -> std::io::Result<PathBu
 
 fn publish(app: &AppHandle, id: &str, event: &str, durable: bool, update: impl FnOnce(&mut DlItem)) -> bool {
     let dm = app.state::<DownloadManager>();
-    let snapshot = {
-        let mut items = dm.downloads.lock();
-        items.get_mut(id).map(|item| { update(item); item.clone() })
-    };
-    if let Some(mut item) = snapshot {
-        let saved = !durable || history::save(app, &item).is_ok();
-        if !saved {
-            // Error details remain static; no URL or request metadata logged.
-            crate::crash_log::log_error("native-download-history", "Cannot persist download receipt");
-            let warning = "Download history could not be saved";
-            item.error = Some(match item.error.take() {
-                Some(e) => format!("{e}; {warning}"),
-                None => warning.into(),
-            });
-            if let Some(live) = dm.downloads.lock().get_mut(id) { live.error = item.error.clone(); }
-        }
-        let _ = app.emit_to("main", event, item);
-        saved
-    } else { false }
+    // Serialize receipt and UI update against clear_completed_downloads.
+    let mut items = dm.downloads.lock();
+    let Some(item) = items.get_mut(id) else { return false; };
+    update(item);
+    let saved = !durable || history::save(app, item).is_ok();
+    if !saved {
+        crate::crash_log::log_error("native-download-history", "Cannot persist download receipt");
+        let warning = "Download history could not be saved";
+        item.error = Some(match item.error.take() {
+            Some(e) => format!("{e}; {warning}"),
+            None => warning.into(),
+        });
+    }
+    let _ = app.emit_to("main", event, item.clone());
+    saved
 }
 
 fn may_stage(id: &str) -> bool {
@@ -314,7 +310,14 @@ fn start(app: &AppHandle, download: &Download) {
         if let Some(staged) = staged {
             // Sync the finished data before recording completion. A staging
             // file observed after a crash is not by itself a finish receipt.
-            let synced = std::fs::File::open(&staged).and_then(|f| { f.sync_all()?; f.metadata() });
+            let synced = std::fs::File::open(&staged).and_then(|f| {
+                f.sync_all()?;
+                if let Some(dir) = staged.parent() {
+                    std::fs::File::open(dir)?.sync_all()?;
+                    if let Some(root) = dir.parent() { std::fs::File::open(root)?.sync_all()?; }
+                }
+                f.metadata()
+            });
             let Ok(attrs) = synced else {
                 publish(&handle, &id, "download-failed", true, |item| {
                     item.state = DlState::Failed; item.speed = 0;
@@ -323,17 +326,39 @@ fn start(app: &AppHandle, download: &Download) {
                 return;
             };
             let bytes = attrs.len();
-            let staged_recorded = publish(&handle, &id, "download-progress", true, |item| {
-                item.state = DlState::Completed; item.received_bytes = bytes;
-                item.total_bytes = Some(bytes); item.speed = 0;
-                item.error = Some("Saved in private staging; publication pending".into());
-            });
-            if !staged_recorded { return; }
+            // The completed staging receipt is private to the journal.
+            // The public item remains downloading until publication is over.
+            let staged_recorded = {
+                let items = dm.downloads.lock();
+                items.get(&id).is_some_and(|item| {
+                    let mut receipt = item.clone();
+                    receipt.state = DlState::Completed;
+                    receipt.received_bytes = bytes; receipt.total_bytes = Some(bytes); receipt.speed = 0;
+                    receipt.error = Some("Saved in private staging; publication pending".into());
+                    history::save(&handle, &receipt).is_ok()
+                })
+            };
+            if !staged_recorded {
+                publish(&handle, &id, "download-complete", true, |item| {
+                    item.state = DlState::Completed; item.received_bytes = bytes;
+                    item.total_bytes = Some(bytes); item.speed = 0;
+                    item.error = Some("Saved in private staging; initial completion receipt failed".into());
+                });
+                return;
+            }
             let mut final_path = staged.clone();
             let mut warning = None;
             if let Some(owned) = entry.owned_dir.as_deref() {
                 match publish_completed_file(&staged, owned) {
-                    Ok(path) => { final_path = path; }
+                    Ok(path) => {
+                        // Persist a final-path receipt only after the new
+                        // directory entry itself has been synced.
+                        if path.parent().is_some_and(|root| std::fs::File::open(root).and_then(|f| f.sync_all()).is_ok()) {
+                            final_path = path;
+                        } else {
+                            warning = Some("Saved in staging; final directory sync failed, both links retained".into());
+                        }
+                    }
                     Err(e) => warning = Some(format!("Saved in staging; folder publication failed: {e}")),
                 }
             } else {
@@ -342,26 +367,33 @@ fn start(app: &AppHandle, download: &Download) {
             // Persist actual final path before unlinking staging. If the
             // process dies after hard_link but before this write, the prior
             // completed-staging receipt remains valid and both links survive.
-            let recorded = publish(&handle, &id, "download-complete", true, |item| {
+            // Hold the same item lock as the clear command through receipt,
+            // cleanup and terminal event. A clear cannot resurrect a row.
+            let mut items = dm.downloads.lock();
+            if let Some(item) = items.get_mut(&id) {
                 item.state = DlState::Completed; item.received_bytes = bytes;
                 item.total_bytes = Some(bytes); item.speed = 0;
                 item.file_path = final_path.to_string_lossy().into_owned();
                 item.file_name = final_path.file_name().and_then(|s| s.to_str())
                     .unwrap_or(&item.file_name).to_owned();
                 item.error = warning;
-            });
-            if recorded && final_path != staged {
-                if let Some(owned) = entry.owned_dir.as_deref() {
-                    // Sync the publication directory before dropping the
-                    // fallback link. On failure preserve both names.
-                    let synced = final_path.parent().is_some_and(|root|
-                        std::fs::File::open(root).and_then(|f| f.sync_all()).is_ok());
-                    if !synced || std::fs::remove_file(&staged).and_then(|_| std::fs::remove_dir(owned)).is_err() {
-                        publish(&handle, &id, "download-complete", true, |item| {
-                            item.error = Some("Saved; staging retained or cleanup incomplete".into());
-                        });
+                if history::save(&handle, item).is_ok() {
+                    if final_path != staged {
+                        if let Some(owned) = entry.owned_dir.as_deref() {
+                            if std::fs::remove_file(&staged).and_then(|_| std::fs::remove_dir(owned)).is_err() {
+                                item.error = Some("Saved; staging cleanup incomplete".into());
+                                let _ = history::save(&handle, item);
+                            }
+                        }
                     }
+                } else {
+                    // The durable staged receipt is still authoritative.
+                    // Preserve both paths, and show the known staged path.
+                    item.file_path = staged.to_string_lossy().into_owned();
+                    item.file_name = staged.file_name().and_then(|s| s.to_str()).unwrap_or(&item.file_name).to_owned();
+                    item.error = Some("Saved in staging; final history update failed".into());
                 }
+                let _ = handle.emit_to("main", "download-complete", item.clone());
             }
         } else if entry.cancelled {
             if history::forget(&handle, &id).is_ok() {

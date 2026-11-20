@@ -692,6 +692,9 @@ export default function App() {
 
   // listen for webview events from rust
   useEffect(() => {
+    // Keep startup snapshots from restoring ids superseded by live events.
+    const downloadStartupTouched = new Set<string>();
+    let downloadSnapshotPending = true;
     const promises = [
       listen<{ id: string; url: string }>("tab-url-changed", (e) => {
         videoByTab.current.delete(e.payload.id);
@@ -789,6 +792,7 @@ export default function App() {
         setDownloadsOpen(true);
       }),
       listen<DownloadItem>("download-started", (e) => {
+        if (downloadSnapshotPending) downloadStartupTouched.add(e.payload.id);
         if (e.payload.native) setDownloadsOpen(true);
         setDownloads(prev => {
           if (prev.find(d => d.id === e.payload.id)) return prev;
@@ -807,15 +811,22 @@ export default function App() {
         }
       }),
       listen<DownloadItem>("download-progress", (e) => {
-        setDownloads(prev => prev.map(d => d.id === e.payload.id ? e.payload : d));
+        if (downloadSnapshotPending) downloadStartupTouched.add(e.payload.id);
+        setDownloads(prev => prev.some(d => d.id === e.payload.id)
+          ? prev.map(d => d.id === e.payload.id ? e.payload : d) : [e.payload, ...prev]);
       }),
       listen<DownloadItem>("download-complete", (e) => {
-        setDownloads(prev => prev.map(d => d.id === e.payload.id ? e.payload : d));
+        if (downloadSnapshotPending) downloadStartupTouched.add(e.payload.id);
+        setDownloads(prev => prev.some(d => d.id === e.payload.id)
+          ? prev.map(d => d.id === e.payload.id ? e.payload : d) : [e.payload, ...prev]);
       }),
       listen<DownloadItem>("download-failed", (e) => {
-        setDownloads(prev => prev.map(d => d.id === e.payload.id ? e.payload : d));
+        if (downloadSnapshotPending) downloadStartupTouched.add(e.payload.id);
+        setDownloads(prev => prev.some(d => d.id === e.payload.id)
+          ? prev.map(d => d.id === e.payload.id ? e.payload : d) : [e.payload, ...prev]);
       }),
       listen<{ id: string }>("download-cancelled", (e) => {
+        if (downloadSnapshotPending) downloadStartupTouched.add(e.payload.id);
         setDownloads(prev => prev.filter(d => d.id !== e.payload.id));
       }),
       listen<{ id: string; reason: string }>("download-resume-failed", (e) => {
@@ -999,9 +1010,13 @@ export default function App() {
     ];
 
     // load existing downloads on init
-    invoke<DownloadItem[]>("get_downloads").then(items => {
-      setDownloads(prev => [...prev, ...items.filter(item => !prev.some(d => d.id === item.id))]);
-    }).catch(e => console.warn("[bushido]", e));
+    Promise.all(promises).then(() => invoke<DownloadItem[]>("get_downloads")).then(items => {
+      const untouched = items.filter(item => !downloadStartupTouched.has(item.id));
+      setDownloads(prev => [...prev, ...untouched.filter(item => !prev.some(d => d.id === item.id))]);
+    }).catch(e => console.warn("[bushido] download history", e)).finally(() => {
+      downloadSnapshotPending = false;
+      downloadStartupTouched.clear();
+    });
 
     // check vault lock state
     invoke<{ epoch: number; unlocked: boolean }>("vault_state_snapshot").then(applyVaultState).catch(() => {});

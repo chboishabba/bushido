@@ -264,3 +264,5 @@ Add Glance initial/redirect URL tests and shared hardening flag tests; verify fa
 
 ### P4 native history / restart
 Test process kill before destination, during transfer, after completed-stage receipt, after hard link before final receipt, after final receipt before cleanup, and after cleanup. Record actual persisted state; never issue GET or resume at restart. Check interrupted/failed and missing/changed completed file, dangling symlink, private history modes, redacted URL/error/request data, write failure, user clear/remove preserves files and remains cleared after restart, old non-native manifest unaffected. Validate power-loss directory/file sync ordering and orphan behavior separately; no native execution claimed. Three Rust tests pending toolchain.
+
+Superseding completion order: private staged receipt only, directory sync before final receipt, staging unlink only after durable final receipt. Exercise clear while finishing and startup snapshot race. Local Python SQLite/OS reference 11/11 PASS, including abrupt subprocess exit before transaction commit; not WebKit or power-loss acceptance. Measure synchronous durable write latency on GTK thread.
