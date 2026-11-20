@@ -10,6 +10,7 @@
     typeof v.requestPictureInPicture === "function";
   const existing = document.getElementById("__bushido_linux_pip_prompt");
   if (existing) {
+    if (existing.__bushidoPipPending) return "request-pending";
     existing.remove();
     return "dismissed";
   }
@@ -34,6 +35,7 @@
   button.style.cssText = "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#191919;color:white;padding:14px 24px;border-radius:10px;border:1px solid #888;font:600 15px system-ui;cursor:pointer;pointer-events:auto";
   const dismiss = () => { host.remove(); report(); };
   const fail = () => {
+    host.__bushidoPipPending = false;
     if (host.isConnected) {
       button.textContent = "Picture-in-picture unavailable";
       button.disabled = true;
@@ -48,12 +50,20 @@
     button.disabled = true;
     if (document.pictureInPictureEnabled !== true || !eligible(video) ||
         document.pictureInPictureElement) { fail(); return; }
+    host.__bushidoPipPending = true;
+    button.textContent = "Opening picture-in-picture…";
     try {
       Promise.resolve(video.requestPictureInPicture()).then(dismiss, fail);
     } catch (_) { fail(); }
   });
   shadow.appendChild(button);
   document.documentElement.appendChild(host);
-  setTimeout(dismiss, 15000);
+  setTimeout(() => {
+    if (host.__bushidoPipPending) {
+      button.textContent = "Waiting for video engine…";
+      return; // do not permit a second request while the first is unresolved
+    }
+    dismiss();
+  }, 15000);
   return "awaiting-gesture";
 })()

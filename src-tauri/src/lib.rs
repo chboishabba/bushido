@@ -3325,7 +3325,7 @@ async fn toggle_pip(app: tauri::AppHandle, id: String) -> Result<(), String> {
             .map_err(|_| "PiP callback lost".to_owned())??;
         // These are request/availability states, not proof of a detached window.
         return match status.as_str() {
-            "awaiting-gesture" | "dismissed" | "exit-requested" => Ok(()),
+            "awaiting-gesture" | "dismissed" | "exit-requested" | "request-pending" => Ok(()),
             "unsupported" => Err("This WebKitGTK engine does not expose picture-in-picture".into()),
             "no-eligible-video" => Err("No eligible loaded video supports picture-in-picture".into()),
             _ => Err("Picture-in-picture request failed".into()),

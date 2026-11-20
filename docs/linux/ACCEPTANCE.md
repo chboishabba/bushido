@@ -232,3 +232,5 @@ Add a page with at least three matches and exercise Next/Previous repeatedly on 
 
 ### P4 Linux PiP capability/automation controls
 Run node --test scripts/linux/test-pip-policy.cjs for mocked policy. On native WebKitGTK test document API false/absent, disabled/not-loaded videos, eligible media, trusted/untrusted activation, rejected request, active exit, timeout and navigation. Require observable detached compositor window and same original media session to accept detached PiP; neither a prompt nor a document boolean alone proves it. Verify unsupported engine surfaces a truthful error, no duplicate request or replay, and Windows regression. See MCP_AUTOMATION.md for separate driver/fixture acceptance. No hosted CI changes.
+
+PiP mock suite local receipt: Node v22.16.0, 9/9 pass, blobs 1923ffcd772640a5b5aadcc58827cfd870e2fbd5 / d1cbd1491d3f4397de25c12c4a98c0aa4a45357e. Additional case delays the native request promise, toggles repeatedly and fires prompt expiry; requires one entry call while pending. Actual WebKit promise/window behavior is unverified. Local preflight includes the mock suite.

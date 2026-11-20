@@ -11,7 +11,7 @@ function fixture(opts = {}) {
   const timers = [];
   const video = { isConnected: true, readyState: 2, videoWidth: 640,
     disablePictureInPicture: false, requestPictureInPicture() {
-      calls++; return opts.reject ? Promise.reject(new Error("denied")) : Promise.resolve();
+      calls++; return opts.deferred || (opts.reject ? Promise.reject(new Error("denied")) : Promise.resolve());
     }, ...opts.video };
   const document = {
     pictureInPictureEnabled: opts.enabled !== false,
@@ -69,4 +69,13 @@ test("active PiP can exit even if entry support disabled", async () => {
 test("abandoned prompt expires", () => {
   const f=fixture(); f.run(); f.timers.find(t=>t.delay===15000).callback(); f.click(true);
   assert.equal(f.host.isConnected,false); assert.equal(f.calls,0);
+});
+test("pending native request cannot be replaced by repeated toggle or timeout", async () => {
+  let resolve;
+  const deferred = new Promise(r => { resolve = r; });
+  const f = fixture({deferred}); f.run(); f.click(true);
+  assert.equal(f.run(),"request-pending");
+  f.timers.find(t=>t.delay===15000).callback();
+  assert.equal(f.run(),"request-pending"); f.click(true); assert.equal(f.calls,1);
+  resolve(); await settle(); assert.equal(f.host.isConnected,false);
 });
