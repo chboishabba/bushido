@@ -3303,6 +3303,35 @@ async fn toggle_reader(app: tauri::AppHandle, id: String, font_size: u32, font: 
 
 #[tauri::command]
 async fn toggle_pip(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use webkit2gtk::WebViewExt;
+        use javascriptcore::ValueExt;
+        let wv = app.get_webview(&id).ok_or("Unknown WebView")?;
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+        wv.with_webview(move |platform| {
+            platform.inner().run_javascript(include_str!("linux_pip.js"),
+                None::<&gtk::gio::Cancellable>, move |result| {
+                    let status = result.map_err(|e| e.to_string()).and_then(|r|
+                        r.js_value().and_then(|v| v.to_json(0))
+                            .ok_or_else(|| "Missing PiP capability result".to_owned())
+                            .and_then(|json| serde_json::from_str::<String>(json.as_str())
+                                .map_err(|e| e.to_string())));
+                    let _ = tx.send(status);
+                });
+        }).map_err(|e| e.to_string())?;
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await
+            .map_err(|_| "PiP capability request timed out".to_owned())?
+            .map_err(|_| "PiP callback lost".to_owned())??;
+        // These are request/availability states, not proof of a detached window.
+        return match status.as_str() {
+            "awaiting-gesture" | "dismissed" | "exit-requested" => Ok(()),
+            "unsupported" => Err("This WebKitGTK engine does not expose picture-in-picture".into()),
+            "no-eligible-video" => Err("No eligible loaded video supports picture-in-picture".into()),
+            _ => Err("Picture-in-picture request failed".into()),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
     if let Some(wv) = app.get_webview(&id) {
         let js = r#"(function(){if(document.pictureInPictureElement){if(typeof document.exitPictureInPicture==='function')document.exitPictureInPicture().catch(function(){});return}var existing=document.getElementById('__bushido_pip_host');if(existing){existing.remove();return}var v=Array.from(document.querySelectorAll('video')).find(function(v){return typeof v.requestPictureInPicture==='function'&&!v.disablePictureInPicture});if(!v||document.pictureInPictureEnabled!==true)return;var host=document.createElement('div');host.id='__bushido_pip_host';host.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483647;pointer-events:none';var shadow=host.attachShadow({mode:'closed'});var btn=document.createElement('div');btn.innerHTML='<svg width="18" height="18" viewBox="0 0 16 16" fill="none" style="vertical-align:middle;margin-right:6px"><rect x="1" y="2.5" width="14" height="11" rx="1.5" stroke="white" stroke-width="1.3"/><rect x="8" y="7" width="6" height="5" rx="1" fill="white" opacity="0.4" stroke="white" stroke-width="1"/></svg>Picture in Picture';btn.style.cssText='position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.9);color:#fff;padding:14px 24px;border-radius:10px;cursor:pointer;font:600 15px system-ui;box-shadow:0 8px 32px rgba(0,0,0,0.6);pointer-events:auto;display:flex;align-items:center;border:1px solid rgba(255,255,255,0.15);backdrop-filter:blur(12px);transition:background 0.15s';btn.onmouseenter=function(){btn.style.background='rgba(99,102,241,0.9)'};btn.onmouseleave=function(){btn.style.background='rgba(0,0,0,0.9)'};btn.onclick=function(e){e.stopPropagation();if(!e.isTrusted)return;v.requestPictureInPicture().then(function(){host.remove()}).catch(function(){btn.innerHTML='PiP not available';btn.style.background='rgba(239,68,68,0.9)';setTimeout(function(){host.remove()},2000)})};shadow.appendChild(btn);document.documentElement.appendChild(host)})()"#;
         wv.eval(js).map_err(|e| e.to_string())?;

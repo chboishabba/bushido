@@ -11,7 +11,8 @@
     });
     var supported = document.pictureInPictureEnabled === true &&
       Array.prototype.some.call(videos, function(v) {
-        return typeof v.requestPictureInPicture === 'function' && !v.disablePictureInPicture;
+        return v.isConnected && v.readyState > 0 && v.videoWidth > 0 &&
+          typeof v.requestPictureInPicture === 'function' && !v.disablePictureInPicture;
       });
     return {__bushido: 'video', url: location.href, hasVideo: has,
       pipSupported: supported, pipActive: !!document.pictureInPictureElement};

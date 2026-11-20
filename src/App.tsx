@@ -2106,13 +2106,13 @@ export default function App() {
   // --- picture in picture ---
   const togglePip = useCallback(() => {
     if (!activeTab) return;
-    if (pipSupported === false) {
+    if (pipSupported === false && !pipActive) {
       useUiStore.getState().showError("Picture-in-picture is not available for this video");
       return;
     }
-    invoke("toggle_pip", { id: activeTab }).catch(() =>
-      useUiStore.getState().showError("Unable to request picture-in-picture"));
-  }, [activeTab, pipSupported]);
+    invoke("toggle_pip", { id: activeTab }).catch(error =>
+      useUiStore.getState().showError(typeof error === "string" ? error : "Unable to request picture-in-picture"));
+  }, [activeTab, pipSupported, pipActive]);
 
   useEffect(() => {
     const tab = tabs.find(t => t.id === activeTab);
