@@ -3,7 +3,7 @@
 use gtk::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
-use webkit2gtk::{PrintOperation, PrintOperationExt, WebViewExt};
+use webkit2gtk::{PrintOperation, PrintOperationExt, PrintOperationResponse, WebViewExt};
 
 static PRINT_DIALOG: AtomicBool = AtomicBool::new(false);
 
@@ -22,20 +22,22 @@ impl Drop for DialogGuard<'_> {
     fn drop(&mut self) { self.0.store(false, Ordering::Release); }
 }
 
-pub(crate) async fn print(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+pub(crate) async fn print(app: &tauri::AppHandle, id: &str) -> Result<String, String> {
     let owner = crate::live_native_tab_owner(app, id).ok_or("Not a live ordinary tab")?;
     let wv = app.get_webview(id).ok_or("Webview not found")?;
     let pos = wv.position().map_err(|e| e.to_string())?;
     if pos.x < 0 || pos.y < 0 { return Err("Tab is not on screen".into()); }
+    let expected_url = wv.url().map_err(|e| e.to_string())?;
     let app = app.clone();
     let id = id.to_owned();
     let (tx, rx) = tokio::sync::oneshot::channel();
     wv.with_webview(move |platform| {
         if tx.is_closed() { return; }
-        let result = (|| -> Result<(), String> {
+        let result = (|| -> Result<String, String> {
             let view = platform.inner();
             if !crate::native_tab_matches_owner(&app, &id, &owner)
-                || !view.is_mapped() || view.is_loading() {
+                || !view.is_mapped() || view.is_loading()
+                || view.uri().and_then(|uri| url::Url::parse(uri.as_str()).ok()).as_ref() != Some(&expected_url) {
                 return Err("Tab unavailable or loading".into());
             }
             let parent = view.toplevel().and_then(|widget| widget.downcast::<gtk::Window>().ok())
@@ -46,8 +48,11 @@ pub(crate) async fn print(app: &tauri::AppHandle, id: &str) -> Result<(), String
             // run_dialog is not evidence that a physical print job completed.
             // The modal can run a nested GLib event loop: retain the guard
             // until it returns, and never hold a tab registry lock here.
-            let _response = operation.run_dialog(Some(&parent));
-            Ok(())
+            match operation.run_dialog(Some(&parent)) {
+                PrintOperationResponse::Cancel => Ok("cancelled".into()),
+                PrintOperationResponse::Print => Ok("submitted".into()),
+                _ => Err("Unknown native print dialog response".into()),
+            }
         })();
         let _ = tx.send(result);
     }).map_err(|e| e.to_string())?;
@@ -68,6 +73,7 @@ pub(crate) async fn inspect(app: &tauri::AppHandle, id: &str) -> Result<(), Stri
         let wv = app.get_webview(id).ok_or("Webview not found")?;
         let pos = wv.position().map_err(|e| e.to_string())?;
         if pos.x < 0 || pos.y < 0 { return Err("Tab is not on screen".into()); }
+        let expected_url = wv.url().map_err(|e| e.to_string())?;
         let app = app.clone();
         let id = id.to_owned();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -75,7 +81,8 @@ pub(crate) async fn inspect(app: &tauri::AppHandle, id: &str) -> Result<(), Stri
             if tx.is_closed() { return; }
             let result = (|| -> Result<(), String> {
                 let view = platform.inner();
-                if !crate::native_tab_matches_owner(&app, &id, &owner) || !view.is_mapped() {
+                if !crate::native_tab_matches_owner(&app, &id, &owner) || !view.is_mapped()
+                    || view.uri().and_then(|uri| url::Url::parse(uri.as_str()).ok()).as_ref() != Some(&expected_url) {
                     return Err("Tab unavailable".into());
                 }
                 let settings = WebViewExt::settings(&view).ok_or("Missing WebKit settings")?;

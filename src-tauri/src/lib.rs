@@ -3324,7 +3324,7 @@ async fn zoom_tab(app: tauri::AppHandle, id: String, factor: f64) -> Result<(), 
 }
 
 #[tauri::command]
-async fn print_tab(app: tauri::AppHandle, webview: tauri::Webview, id: String) -> Result<(), String> {
+async fn print_tab(app: tauri::AppHandle, webview: tauri::Webview, id: String) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
         if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
@@ -3334,7 +3334,8 @@ async fn print_tab(app: tauri::AppHandle, webview: tauri::Webview, id: String) -
     {
         let _ = webview;
         let wv = app.get_webview(&id).ok_or("Webview not found")?;
-        wv.eval("window.print()").map_err(|e| e.to_string())
+        wv.eval("window.print()").map_err(|e| e.to_string())?;
+        Ok("requested".into())
     }
 }
 

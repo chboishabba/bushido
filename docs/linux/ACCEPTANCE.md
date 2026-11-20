@@ -300,3 +300,5 @@ Negative controls: direct IPC from a remote child view must reject visible captu
 
 ### P4.2 print and inspector
 Use a page replacing window.print, local print CSS and PDF printer; explicit chrome action must invoke native dialog, not replaced page JS. Cancel and accept, inspect actual print output separately; no success claim from dialog return. Try duplicate action during nested GTK loop, hidden/loading/stale/panel/remote child IPC, close/navigate while dialog visible. Verify inspector opens only debug normal enabled views, disabled preference after reload, panel/Glance/promoted Glance denied until eligible recreate, release denied, frontend errors visible from menu/quick action/shortcuts. Test actual Wry settings and native callback lifetime; live revocation and document-originated print requests remain open. Two Rust tests pending user-side native run.
+
+Check native print response cancelled vs submitted; verify actual print output separately. Non-Linux response requested means evaluation dispatch only. Change URL between command and GTK callback and require rejection. Navigation during modal and same-URL reload remain distinct acceptance cases.
