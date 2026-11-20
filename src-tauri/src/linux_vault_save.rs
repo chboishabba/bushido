@@ -55,6 +55,12 @@ fn arm(view: &WebView, channel: &str, state: &RefCell<Option<Arm>>) {
         None::<&gtk::gio::Cancellable>, |_| {});
 }
 
+fn discard(view: &WebView, notice: &Notice) {
+    let ticket = serde_json::to_string(&notice.ticket).expect("string serializes");
+    let source = format!("globalThis.__bushidoSaveDiscard?.({ticket},{})", notice.id);
+    view.run_javascript_in_world(&source, WORLD, None::<&gtk::gio::Cancellable>, |_| {});
+}
+
 async fn approve(view: &WebView, origin: &str, username: &str, valid: &impl Fn() -> bool) -> bool {
     let Some(parent) = view.toplevel().and_then(|w| w.downcast::<gtk::Window>().ok()) else { return false; };
     let dialog = gtk::Dialog::with_buttons(
@@ -117,8 +123,12 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                 armed.seen = notice.id;
             }
             let Some(origin) = crate::linux_vault::https_origin(&notice.href) else { return; };
-            if busy.get() || !view.has_focus() || !live(&app, &id, &view, &notice.href) { return; }
-            let Ok(epoch) = app.state::<crate::vault::VaultState>().session() else { return; };
+            if busy.get() || !view.has_focus() || !live(&app, &id, &view, &notice.href) {
+                discard(&view, &notice); return;
+            }
+            let Ok(epoch) = app.state::<crate::vault::VaultState>().session() else {
+                discard(&view, &notice); return;
+            };
             let opened = recv_generation.load(Ordering::SeqCst);
             let deadline = Instant::now() + TTL;
             busy.set(true);
@@ -131,7 +141,9 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                 let valid = || Instant::now() < deadline && generation.load(Ordering::SeqCst) == opened
                     && live(&app, &id, &view, &notice.href)
                     && app.state::<crate::vault::VaultState>().with_session(epoch, || ()).is_ok();
-                if !valid() || !approve(&view, &origin, &notice.username, &valid).await { return; }
+                if !valid() || !approve(&view, &origin, &notice.username, &valid).await {
+                    discard(&view, &notice); return;
+                }
                 let ticket = serde_json::to_string(&notice.ticket).expect("string serializes");
                 let source = format!("globalThis.__bushidoSaveTake?.({ticket},{}) ?? null", notice.id);
                 let result = tokio::time::timeout(Duration::from_secs(3), view.run_javascript_in_world_future(&source, WORLD)).await;
@@ -181,8 +193,7 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
             destroy_gen.fetch_add(1, Ordering::SeqCst);
             destroy_state.borrow_mut().take();
             manager.unregister_script_message_handler_in_world(&destroy_channel, WORLD);
-            // The registered handler owns only a weak view and is no longer
-            // reachable through the removed world channel.
+            manager.disconnect(handler);
         });
         arm(&view, &channel, &state);
     }).map_err(|e| e.to_string())

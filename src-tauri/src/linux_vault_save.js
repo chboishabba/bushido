@@ -41,22 +41,27 @@ function (channel, ticket, href) {
     if (!fields || !typed.has(fields.pass)) return;
     const username = fields.user.value, password = fields.pass.value;
     if (!username || username.length > 1024 || !password || password.length > 8192) return;
-    pending = {id: ++serial, form: e.target, ...fields, username, password};
+    typed.delete(fields.pass);
+    pending = {id: ++serial, form: e.target, ...fields, username, password, expires: Date.now() + 20000};
     timer = setTimeout(clear, 20000);
     try { handler.postMessage(JSON.stringify({ticket, href, id: serial, username})); } catch (_) { clear(); }
   };
   globalThis.__bushidoSaveTake = (secret, id) => {
     const saved = pending; clear();
-    if (secret !== ticket || !saved || saved.id !== id || location.href !== href) return null;
+    if (secret !== ticket || !saved || saved.id !== id || Date.now() >= saved.expires || location.href !== href) return null;
     const fields = pair(saved.form);
     if (!fields || fields.user !== saved.user || fields.pass !== saved.pass || fields.action !== saved.action || fields.user.value !== saved.username || fields.pass.value !== saved.password) return null;
     return JSON.stringify({username: saved.username, password: saved.password});
+  };
+  globalThis.__bushidoSaveDiscard = (secret, id) => {
+    if (secret === ticket && pending?.id === id) clear();
   };
   const dispose = () => {
     clear(); gesture = null;
     for (const [type, fn] of events) document.removeEventListener(type, fn, true);
     window.removeEventListener("pagehide", dispose, true);
     delete globalThis.__bushidoSaveTake;
+    delete globalThis.__bushidoSaveDiscard;
     delete globalThis.__bushidoSaveDispose;
   };
   const events = [["input", input], ["click", click], ["keydown", key], ["submit", submit]];
