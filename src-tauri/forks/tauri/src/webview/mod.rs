@@ -1105,6 +1105,13 @@ fn main() {
     self
   }
 
+  /// Internal Linux debug extension initialization data (not page IPC).
+  #[cfg(target_os = "linux")]
+  pub fn linux_extension_initialization(mut self, data: String) -> Self {
+    self.webview_attributes.linux_extension_initialization=Some(data);
+    self
+  }
+
   /// Initialize the WebView with a custom data store identifier.
   /// Can be used as a replacement for data_directory not being available in WKWebView.
   ///

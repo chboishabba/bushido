@@ -25,6 +25,8 @@ mod linux_egress_fixture;
 #[cfg(target_os = "linux")]
 mod linux_extension_fixture;
 #[cfg(target_os = "linux")]
+mod linux_extension_policy;
+#[cfg(target_os = "linux")]
 mod linux_destination_scope;
 #[cfg(all(target_os = "linux", debug_assertions))]
 mod linux_document_epoch;
@@ -982,6 +984,10 @@ async fn run_benchmarks(app: tauri::AppHandle) -> Result<Vec<bench::BenchResult>
 
 #[tauri::command]
 async fn update_filter_lists(app: tauri::AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    if app.state::<linux_egress_fixture::EgressFixture>().extension_configured() {
+        return Err("Synthetic extension policy is frozen; restart fixture to change it".into());
+    }
     let bs = app.state::<BlockerState>();
     let engine = bs.engine.clone();
     let data_dir = bs.data_dir.clone();
@@ -1244,7 +1250,10 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
             linux_workspace_data_directory(profile_name.as_deref())
         ));
         if let Some(proxy) = fixture.proxy() { builder = builder.proxy_url(proxy); }
-        if let Some(path) = fixture.extension_path()? { builder = builder.extensions_path(path); }
+        if let Some(path) = fixture.extension_path()? {
+            let data=fixture.extension_policy().ok_or("Extension policy snapshot missing")?;
+            builder=builder.extensions_path(path).linux_extension_initialization(data.to_owned());
+        }
     }
 
     if is_panel {
@@ -2900,7 +2909,10 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
             linux_workspace_data_directory(Some(&workspace))
         ));
         if let Some(proxy) = fixture.proxy() { builder = builder.proxy_url(proxy); }
-        if let Some(path) = fixture.extension_path()? { builder = builder.extensions_path(path); }
+        if let Some(path) = fixture.extension_path()? {
+            let data=fixture.extension_policy().ok_or("Extension policy snapshot missing")?;
+            builder=builder.extensions_path(path).linux_extension_initialization(data.to_owned());
+        }
     }
     // Glance can navigate independently after creation. Keep its native
     // filter aligned with each destination BEFORE approving the request.
@@ -4291,7 +4303,7 @@ fn linux_permission_observation(webview: tauri::Webview) -> Result<serde_json::V
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
-    let egress_fixture = match linux_egress_fixture::EgressFixture::from_environment() {
+    let mut egress_fixture = match linux_egress_fixture::EgressFixture::from_environment() {
         Ok(f) => f,
         Err(e) => { eprintln!("Bushido egress fixture: {e}"); std::process::exit(2); }
     };
@@ -4382,6 +4394,13 @@ pub fn run() {
     crash_log::log_info("startup", &format!("Bushido Browser v0.9.2 starting, pid={}", std::process::id()));
 
     // init adblock-rust engine (cached binary or cold compile)
+    #[cfg(target_os = "linux")]
+    let engine = if egress_fixture.extension_configured() {
+        let engine=blocker::extension_fixture_engine(&data_dir);
+        egress_fixture.bind_extension_policy(&engine.read());
+        engine
+    } else { blocker::init_engine(&data_dir) };
+    #[cfg(not(target_os = "linux"))]
     let engine = blocker::init_engine(&data_dir);
 
     // Native Linux filter integration reuses the original downloaded/bundled
@@ -4651,7 +4670,13 @@ pub fn run() {
             }
 
             // filter list auto-update (startup check + every 24h)
-            {
+            let freeze_fixture_policy = {
+                #[cfg(target_os = "linux")]
+                { app.state::<linux_egress_fixture::EgressFixture>().extension_configured() }
+                #[cfg(not(target_os = "linux"))]
+                { false }
+            };
+            if !freeze_fixture_policy {
                 let bs = app.state::<BlockerState>();
                 let engine_update = bs.engine.clone();
                 let data_dir_update = bs.data_dir.clone();

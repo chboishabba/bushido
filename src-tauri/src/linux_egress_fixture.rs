@@ -6,6 +6,7 @@ pub(crate) struct EgressFixture {
     proxy: Option<url::Url>,
     scope: Option<crate::linux_destination_scope::OperatorScope>,
     extension: Option<crate::linux_extension_fixture::ExtensionFixture>,
+    extension_policy: Option<String>,
 }
 
 fn endpoint(raw: &str) -> Result<url::Url, String> {
@@ -37,7 +38,7 @@ impl EgressFixture {
         let Some(raw) = std::env::var_os("BUSHIDO_LINUX_EGRESS_FIXTURE_PORT") else {
             let scope = crate::linux_destination_scope::OperatorScope::from_environment(false)?;
             let extension=crate::linux_extension_fixture::ExtensionFixture::from_environment(false)?;
-            return Ok(Self { proxy: None, scope, extension });
+            return Ok(Self { proxy: None, scope, extension, extension_policy: None });
         };
         if !cfg!(debug_assertions) { return Err("Egress fixture unavailable in release".into()); }
         let proxy = endpoint(raw.to_str().ok_or("Invalid fixture port")?)?;
@@ -57,10 +58,15 @@ impl EgressFixture {
         }
         let scope = crate::linux_destination_scope::OperatorScope::from_environment(true)?;
         let extension=crate::linux_extension_fixture::ExtensionFixture::from_environment(scope.is_some())?;
-        Ok(Self { proxy: Some(proxy), scope, extension })
+        Ok(Self { proxy: Some(proxy), scope, extension, extension_policy: None })
     }
 
     pub(crate) fn scope(&self) -> Option<&crate::linux_destination_scope::OperatorScope> { self.scope.as_ref() }
+
+    pub(crate) fn bind_extension_policy(&mut self, engine:&adblock::engine::Engine) {
+        if self.extension.is_some() { self.extension_policy=Some(crate::linux_extension_policy::snapshot(engine)); }
+    }
+    pub(crate) fn extension_policy(&self)->Option<&str> { self.extension_policy.as_deref() }
 
     pub(crate) fn extension_configured(&self) -> bool { self.extension.is_some() }
 
@@ -87,11 +93,11 @@ mod tests {
     }
     #[test]
     fn profile_namespace_preserves_workspace() {
-        let f = EgressFixture { proxy: Some(endpoint("8765").unwrap()), scope: None, extension: None };
+        let f = EgressFixture { proxy: Some(endpoint("8765").unwrap()), scope: None, extension: None, extension_policy: None };
         let a = PathBuf::from("linux-workspaces/profile-a");
         let b = PathBuf::from("linux-workspaces/profile-b");
         assert_eq!(f.profile_directory(a.clone()),PathBuf::from("egress-fixture").join(&a));
         assert_ne!(f.profile_directory(a.clone()),f.profile_directory(b));
-        assert_eq!(EgressFixture { proxy: None, scope: None, extension: None }.profile_directory(a.clone()),a);
+        assert_eq!(EgressFixture { proxy: None, scope: None, extension: None, extension_policy: None }.profile_directory(a.clone()),a);
     }
 }

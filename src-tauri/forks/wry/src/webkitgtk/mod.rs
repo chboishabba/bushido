@@ -398,9 +398,18 @@ impl InnerWebView {
     }
 
     // Extension loading
-    if let Some(extension_path) = &pl_attrs.extension_path {
+    if let Some(data)=attributes.linux_extension_initialization.as_deref() {
+      let path=pl_attrs.extension_path.as_ref().ok_or_else(||Error::Io(
+        std::io::Error::new(std::io::ErrorKind::InvalidInput,"Missing extension fixture path")))?;
+      if pl_attrs.related_view.is_some() {
+        return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+          "Related view extension fixture identity unresolved")));
+      }
+      web_context.os.configure_fixture_extension(path,data)?;
+    } else if let Some(extension_path) = &pl_attrs.extension_path {
       web_context.os.set_web_extensions_directory(extension_path);
     }
+    web_context.os.mark_view_created();
 
     let webview = Self::create_webview(web_context, &attributes, &pl_attrs);
 

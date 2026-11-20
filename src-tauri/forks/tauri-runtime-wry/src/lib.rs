@@ -4913,6 +4913,10 @@ You may have it installed on another user account, but it is not available for t
     if let Some(path) = &webview_attributes.extensions_path {
       webview_builder = webview_builder.with_extensions_path(path);
     }
+    #[cfg(target_os = "linux")]
+    if let Some(data) = webview_attributes.linux_extension_initialization.as_ref() {
+      webview_builder = webview_builder.with_linux_extension_initialization(data.clone());
+    }
   }
 
   #[cfg(any(

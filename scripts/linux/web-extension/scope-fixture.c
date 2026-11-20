@@ -6,6 +6,8 @@
 
 #define ROOT "https://bushido-tunnel.test/"
 #define MAX_MESSAGES 128
+#define PREFIX "bushido.fixture.policy.v1:"
+static gchar decisions[4] = {'X','X','X','X'};
 
 typedef struct { guint sent; } PageState;
 
@@ -27,22 +29,28 @@ static gboolean on_send(WebKitWebPage *page, WebKitURIRequest *request,
     const gchar *uri = webkit_uri_request_get_uri(request);
     if (!uri)
         return FALSE;
-    if (strcmp(uri, ROOT "extension-deny") == 0) {
-        observe(page, state, "bushido.fixture.v1.deny_direct");
-        return TRUE;
+    static const gchar *routes[4] = {
+        ROOT "extension-allow", ROOT "extension-deny",
+        ROOT "extension-redirect-deny", ROOT "extension-redirect-deny-target"
+    };
+    for (guint i=0;i<4;i++) {
+        if (strcmp(uri,routes[i])!=0) continue;
+        if (decisions[i]=='D') {
+            const gchar *name = i==1 ? "bushido.fixture.v1.deny_direct" :
+                i==3 ? (previous ? "bushido.fixture.v1.deny_redirect" :
+                                   "bushido.fixture.v1.deny_target_direct") :
+                       "bushido.fixture.v2.other_deny";
+            observe(page,state,name);
+            return TRUE;
+        }
+        if (decisions[i]=='A') {
+            observe(page,state,i==0 ? "bushido.fixture.v1.allow_control" :
+                i==2 ? "bushido.fixture.v1.allow_redirect" : "bushido.fixture.v2.other_allow");
+        } else {
+            observe(page,state,"bushido.fixture.v2.abstain");
+        }
+        break;
     }
-    if (strcmp(uri, ROOT "extension-redirect-deny-target") == 0) {
-        /* Count direct and redirect sends distinctly. Both fixed target
-         * sends are cancelled, regardless of the optional prior response. */
-        observe(page, state, previous ?
-            "bushido.fixture.v1.deny_redirect" :
-            "bushido.fixture.v1.deny_target_direct");
-        return TRUE;
-    }
-    if (strcmp(uri, ROOT "extension-allow") == 0)
-        observe(page, state, "bushido.fixture.v1.allow_control");
-    if (strcmp(uri, ROOT "extension-redirect-deny") == 0)
-        observe(page, state, "bushido.fixture.v1.allow_redirect");
     return FALSE;
 }
 
@@ -63,7 +71,17 @@ static void page_created(WebKitWebExtension *extension, WebKitWebPage *page,
     observe(page, state, "bushido.fixture.v1.page_created");
 }
 
-G_MODULE_EXPORT void webkit_web_extension_initialize(WebKitWebExtension *extension)
+G_MODULE_EXPORT void webkit_web_extension_initialize_with_user_data(
+    WebKitWebExtension *extension, const GVariant *user_data)
 {
+    /* No data or malformed data => all X; no hard-coded cancellation. */
+    if (user_data && g_variant_is_of_type((GVariant *)user_data,G_VARIANT_TYPE_STRING)) {
+        const gchar *s=g_variant_get_string((GVariant *)user_data,NULL);
+        if (g_str_has_prefix(s,PREFIX)) {
+            const gchar *table=s+strlen(PREFIX);
+            if (strlen(table)==4 && strspn(table,"ADX")==4)
+                memcpy(decisions,table,4);
+        }
+    }
     g_signal_connect(extension, "page-created", G_CALLBACK(page_created), NULL);
 }

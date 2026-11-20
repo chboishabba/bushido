@@ -14,6 +14,9 @@ fn category(name:&str)->Option<&'static str> {
         "bushido.fixture.v1.deny_target_direct"=>Some("deny_target_direct"),
         "bushido.fixture.v1.allow_control"=>Some("allow_control"),
         "bushido.fixture.v1.allow_redirect"=>Some("allow_redirect"),
+        "bushido.fixture.v2.other_deny"=>Some("other_deny"),
+        "bushido.fixture.v2.other_allow"=>Some("other_allow"),
+        "bushido.fixture.v2.abstain"=>Some("abstain"),
         _=>None,
     }
 }

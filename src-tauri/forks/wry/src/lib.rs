@@ -763,6 +763,7 @@ pub struct WebViewAttributes<'a> {
   pub profile_name: Option<String>,
   /// Per-WebView experimental native Linux filter opt-in.
   pub native_content_filter_enabled: bool,
+  pub linux_extension_initialization: Option<String>,
 
   /// Whether all media can be played without user interaction.
   pub autoplay: bool,
@@ -839,6 +840,7 @@ impl Default for WebViewAttributes<'_> {
       incognito: false,
       profile_name: None,
       native_content_filter_enabled: false,
+      linux_extension_initialization: None,
       autoplay: true,
       on_page_load_handler: None,
       proxy_config: None,
@@ -1380,6 +1382,12 @@ impl<'a> WebViewBuilder<'a> {
   /// WebView. Non-Linux platforms ignore this flag.
   pub fn with_native_content_filter_enabled(mut self, enabled: bool) -> Self {
     self.attrs.native_content_filter_enabled = enabled;
+    self
+  }
+
+  /// Internal debug fixture initialization data.
+  pub fn with_linux_extension_initialization(mut self, data:String) -> Self {
+    self.attrs.linux_extension_initialization=Some(data);
     self
   }
 

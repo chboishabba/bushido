@@ -136,6 +136,10 @@ pub fn init_engine(data_dir: &PathBuf) -> Arc<RwLock<Engine>> {
 
 // ── compile engine from best available lists ────────────────────────────────
 fn compile_engine(data_dir: &PathBuf) -> Engine {
+    compile_engine_with_extra(data_dir, &[])
+}
+
+fn compile_engine_with_extra(data_dir: &PathBuf, extra: &[&str]) -> Engine {
     let lists_dir = data_dir.join(LISTS_DIR);
     let mut filter_set = FilterSet::new(false);
 
@@ -159,6 +163,7 @@ fn compile_engine(data_dir: &PathBuf) -> Engine {
         }
     }
 
+    filter_set.add_filters(extra, ParseOptions::default());
     let mut engine = Engine::from_filter_set(filter_set, true);
 
     // tune regex memory: discard unused regexes after 5 min, check every 2 min
@@ -169,6 +174,17 @@ fn compile_engine(data_dir: &PathBuf) -> Engine {
 
     load_resources(&mut engine, Some(data_dir));
     engine
+}
+
+// Explicit synthetic fixture only: original list compiler and original
+// evaluate_request semantics, plus two exact unconditional fixture rules.
+// Never serialize this engine to the normal filter cache.
+#[cfg(target_os = "linux")]
+pub(crate) fn extension_fixture_engine(data_dir: &PathBuf) -> Arc<RwLock<Engine>> {
+    Arc::new(RwLock::new(compile_engine_with_extra(data_dir, &[
+        "|https://bushido-tunnel.test/extension-deny|",
+        "|https://bushido-tunnel.test/extension-redirect-deny-target|",
+    ])))
 }
 
 // ── load scriptlet + redirect resources ─────────────────────────────────────
