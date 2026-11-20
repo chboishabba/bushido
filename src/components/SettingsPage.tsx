@@ -227,15 +227,24 @@ export default memo(function SettingsPage({ workspaceId, workspaceName, settings
     return () => { alive = false; };
   }, []);
   const vaultScope = { workspaceId, legacy: legacyView };
+  // Scope generation changes even when switching away and back to the
+  // same scope. A late operation from an earlier render cannot refresh it.
+  const vaultScopeKey = JSON.stringify([workspaceId, legacyView, activeTab]);
+  const vaultScopeGeneration = useRef({ key: vaultScopeKey, generation: 0 });
+  if (vaultScopeGeneration.current.key !== vaultScopeKey) {
+    vaultScopeGeneration.current = { key: vaultScopeKey, generation: vaultScopeGeneration.current.generation + 1 };
+  }
+  const scopeGeneration = vaultScopeGeneration.current.generation;
   const invalidateVaultReveal = useCallback(() => {
     vaultRevealRequest.current++;
     setVaultReveal(null);
   }, []);
   const refreshVaultList = useCallback(async () => {
+    if (activeTab !== "passwords" || scopeGeneration !== vaultScopeGeneration.current.generation) return;
     const request = ++vaultListRequest.current;
     const entries = await invoke<Pick<VaultEntry, "id" | "domain" | "username">[]>("vault_get_entries", { workspaceId, legacy: legacyView });
-    if (request === vaultListRequest.current) setVaultEntries(entries);
-  }, [workspaceId, legacyView]);
+    if (request === vaultListRequest.current && scopeGeneration === vaultScopeGeneration.current.generation) setVaultEntries(entries);
+  }, [workspaceId, legacyView, activeTab, scopeGeneration]);
   const clearVaultUi = useCallback(() => {
     vaultListRequest.current++;
     invalidateVaultReveal();
@@ -1301,6 +1310,8 @@ export default memo(function SettingsPage({ workspaceId, workspaceName, settings
           <div className="settings-row" style={{ gap: 10, flexWrap: "wrap" }}>
             <span>{legacyView ? "Legacy, unassigned entries — manual recovery only" : `Workspace: ${workspaceName}`}</span>
             <button className="settings-about-btn" onClick={() => {
+              // Invalidate immediately, before the new scope renders.
+              vaultScopeGeneration.current.generation++;
               clearVaultUi();
               setLegacyView(v => !v);
             }}>{legacyView ? "Back to workspace" : "View legacy entries"}</button>
@@ -1389,8 +1400,11 @@ export default memo(function SettingsPage({ workspaceId, workspaceName, settings
                       const request = vaultRevealRequest.current;
                       try {
                         const password = await invoke<string>("vault_reveal_entry", { id: entry.id, ...vaultScope });
-                        if (request === vaultRevealRequest.current && await invoke<boolean>("vault_is_unlocked")
-                            && request === vaultRevealRequest.current) setVaultReveal({ id: entry.id, password });
+                        if (request === vaultRevealRequest.current && scopeGeneration === vaultScopeGeneration.current.generation
+                            && await invoke<boolean>("vault_is_unlocked")
+                            && request === vaultRevealRequest.current && scopeGeneration === vaultScopeGeneration.current.generation) {
+                          setVaultReveal({ id: entry.id, password });
+                        }
                       } catch {
                         if (request === vaultRevealRequest.current) useUiStore.getState().showError("Unable to reveal login");
                       }
@@ -1406,7 +1420,9 @@ export default memo(function SettingsPage({ workspaceId, workspaceName, settings
                     try {
                       invalidateVaultReveal();
                       await invoke("vault_delete_entry", { id: entry.id, ...vaultScope });
-                      setVaultEntries(prev => prev.filter(e => e.id !== entry.id));
+                      if (scopeGeneration === vaultScopeGeneration.current.generation) {
+                        setVaultEntries(prev => prev.filter(e => e.id !== entry.id));
+                      }
                     } catch { useUiStore.getState().showError("Failed to delete password"); }
                   }}>Delete</button>
                 </div>

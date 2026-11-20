@@ -344,6 +344,13 @@ pub async fn vault_save_entry(
     notes: Option<String>,
 ) -> Result<String, String> {
     let password = zeroize::Zeroizing::new(password);
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (&state, &domain, &username, &password, &notes);
+        return Err("Use workspace-scoped manual login provisioning on Linux".into());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
     let (enc, nonce) = state.encrypt_password(password.as_str())?;
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp();
@@ -356,6 +363,7 @@ pub async fn vault_save_entry(
     ).map_err(|e| format!("save: {}", e))?;
 
     Ok(id)
+    }
 }
 
 // Explicit browser-chrome provisioning, independent of page save prompts.
@@ -481,6 +489,14 @@ pub async fn vault_update_entry(
     password: Option<String>,
     notes: Option<String>,
 ) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (&state, &id, &username, &notes);
+        let _password = password.map(Zeroizing::new);
+        return Err("Legacy credentials cannot be edited on Linux; add a new scoped login".into());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
     let conn = state.open_db()?;
     let now = chrono::Utc::now().timestamp();
 
@@ -505,6 +521,7 @@ pub async fn vault_update_entry(
     }
 
     Ok(())
+    }
 }
 
 #[tauri::command]
