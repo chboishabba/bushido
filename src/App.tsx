@@ -73,8 +73,8 @@ const PANEL_W = 350;
 let tabCounter = Date.now();
 const genId = (prefix = "tab") => `${prefix}-${++tabCounter}`;
 
-let wsCounter = 0;
-const genWsId = () => `ws-${++wsCounter}`;
+// Never recycle a deleted workspace's cookie/credential identity.
+const genWsId = () => `ws-${crypto.randomUUID()}`;
 
 const PERM_LABELS: Record<string, string> = {
   microphone: "microphone", camera: "camera", geolocation: "location",
@@ -377,8 +377,7 @@ export default function App() {
         // new workspace format
         const session = parsed as SessionData;
         const restoredWs: Workspace[] = session.workspaces.map(w => {
-          const num = parseInt(w.id.replace("ws-", ""), 10);
-          if (num >= wsCounter) wsCounter = num;
+          // Preserve existing persisted workspace IDs without recycling them.
           return { id: w.id, name: w.name, color: w.color, icon: w.icon, activeTabId: w.activeTabId, paneLayout: w.paneLayout };
         });
 
@@ -977,7 +976,8 @@ export default function App() {
         const id = genId();
         setTabs(prev => {
           const sourceTab = prev.find(t => t.id === e.payload.sourceTabId);
-          const wsId = sourceTab?.workspaceId || "ws-1";
+          const wsId = sourceTab?.workspaceId;
+          if (!wsId) return prev;
           const tab: Tab = { id, url: e.payload.url, title: "Loading...", loading: true, workspaceId: wsId, lastActiveAt: Date.now() };
           const sr = settingsRef.current;
           invoke("create_tab", { id, url: e.payload.url, sidebarW: layoutOffsetRef.current, topOffset, httpsOnly: sr.httpsOnly, adBlocker: sr.adBlocker, cookieAutoReject: sr.cookieAutoReject, isPanel: false, profileName: wsId, ...secArgs(sr) });
@@ -2708,6 +2708,9 @@ export default function App() {
             />
           ) : showSettings ? (
             <SettingsPage
+              key={activeWorkspaceId}
+              workspaceId={activeWorkspaceId}
+              workspaceName={activeWs?.name ?? activeWorkspaceId}
               settings={settings}
               onUpdate={updateSettings}
               onReloadAllTabs={reloadAllTabs}

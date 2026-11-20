@@ -11,6 +11,8 @@ interface ImportedHistory { title: string; url: string; visit_count: number; las
 interface BrowserInfo { name: string; has_bookmarks: boolean; has_history: boolean; }
 
 interface Props {
+  workspaceId: string;
+  workspaceName: string;
   settings: BushidoSettings;
   onUpdate: (patch: Partial<BushidoSettings>) => void;
   onReloadAllTabs: () => void;
@@ -194,7 +196,7 @@ interface SyncInfo {
   paired_devices: { device_id: string; name: string; fingerprint: string; paired_at: number }[];
 }
 
-export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs, onThemeChange, onOpenUrl, onImportBookmarks, onImportHistory }: Props) {
+export default memo(function SettingsPage({ workspaceId, workspaceName, settings, onUpdate, onReloadAllTabs, onThemeChange, onOpenUrl, onImportBookmarks, onImportHistory }: Props) {
   const [activeTab, setActiveTab] = useState<TabId>("general");
   const [securityDirty, setSecurityDirty] = useState(false);
   const [syncInfo, setSyncInfo] = useState<SyncInfo | null>(null);
@@ -216,15 +218,24 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
   const vaultRevealRequest = useRef(0);
   const vaultListRequest = useRef(0);
   const vaultStateEpoch = useRef(-1);
+  const [scopedMode, setScopedMode] = useState<boolean | null>(null);
+  const [legacyView, setLegacyView] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    invoke<boolean>("vault_scoped_mode").then(value => { if (alive) setScopedMode(value); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+  const vaultScope = { workspaceId, legacy: legacyView };
   const invalidateVaultReveal = useCallback(() => {
     vaultRevealRequest.current++;
     setVaultReveal(null);
   }, []);
   const refreshVaultList = useCallback(async () => {
     const request = ++vaultListRequest.current;
-    const entries = await invoke<Pick<VaultEntry, "id" | "domain" | "username">[]>("vault_get_entries", {});
+    const entries = await invoke<Pick<VaultEntry, "id" | "domain" | "username">[]>("vault_get_entries", { workspaceId, legacy: legacyView });
     if (request === vaultListRequest.current) setVaultEntries(entries);
-  }, []);
+  }, [workspaceId, legacyView]);
   const clearVaultUi = useCallback(() => {
     vaultListRequest.current++;
     invalidateVaultReveal();
@@ -1286,6 +1297,15 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
     return (
       <section className="settings-section">
         <h2 className="settings-section-title">Passwords</h2>
+        {scopedMode === true && (
+          <div className="settings-row" style={{ gap: 10, flexWrap: "wrap" }}>
+            <span>{legacyView ? "Legacy, unassigned entries — manual recovery only" : `Workspace: ${workspaceName}`}</span>
+            <button className="settings-about-btn" onClick={() => {
+              clearVaultUi();
+              setLegacyView(v => !v);
+            }}>{legacyView ? "Back to workspace" : "View legacy entries"}</button>
+          </div>
+        )}
 
         {!vaultHasMaster ? (
           <div className="settings-row" style={{ flexDirection: "column", gap: 8, alignItems: "flex-start" }}>
@@ -1323,7 +1343,7 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
               </button>
             </div>
 
-            <form autoComplete="off" onSubmit={async e => {
+            {!legacyView && <form autoComplete="off" onSubmit={async e => {
               e.preventDefault();
               const form = e.currentTarget;
               const values = new FormData(form);
@@ -1332,6 +1352,7 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
               submit.disabled = true;
               try {
                 await invoke("vault_save_manual_entry", {
+                  workspaceId,
                   site: String(values.get("site") ?? ""),
                   username: String(values.get("username") ?? ""),
                   password: String(values.get("password") ?? ""),
@@ -1347,12 +1368,12 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
               }
             }} style={{ display: "flex", flexDirection: "column", gap: 8, maxWidth: 420, margin: "12px 0" }}>
               <span style={{ fontSize: 13, fontWeight: 600 }}>Add saved login</span>
-              <span className="settings-hint">Enter the full HTTPS site, including a non-default port if needed. Linux matches the exact origin; use the native page context menu to fill.</span>
+              <span className="settings-hint">Enter the full HTTPS site, including a non-default port if needed. Linux matches this workspace and exact origin; use the native page context menu to fill.</span>
               <input name="site" type="url" placeholder="https://example.com" aria-label="HTTPS site" required maxLength={4096} className="settings-input" />
               <input name="username" type="text" placeholder="Username" aria-label="Username" autoComplete="off" required maxLength={4096} className="settings-input" />
               <input name="password" type="password" placeholder="Password" aria-label="Password" autoComplete="new-password" required maxLength={65536} className="settings-input" />
               <button type="submit" className="settings-about-btn">Add saved login</button>
-            </form>
+            </form>}
             <div className="vault-entries">
               {filtered.length === 0 && <p style={{ opacity: 0.5, fontSize: 13, padding: "12px 0" }}>No saved passwords{vaultSearch ? " matching search" : ""}.</p>}
               {filtered.map(entry => (
@@ -1367,7 +1388,7 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
                       if (wasVisible) return;
                       const request = vaultRevealRequest.current;
                       try {
-                        const password = await invoke<string>("vault_reveal_entry", { id: entry.id });
+                        const password = await invoke<string>("vault_reveal_entry", { id: entry.id, ...vaultScope });
                         if (request === vaultRevealRequest.current && await invoke<boolean>("vault_is_unlocked")
                             && request === vaultRevealRequest.current) setVaultReveal({ id: entry.id, password });
                       } catch {
@@ -1378,13 +1399,13 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
                     </button>
                     <button className="vault-entry-btn" onClick={() => {
                       invalidateVaultReveal();
-                      invoke("vault_copy_entry", { id: entry.id }).catch(() => useUiStore.getState().showError("Unable to copy login"));
+                      invoke("vault_copy_entry", { id: entry.id, ...vaultScope }).catch(() => useUiStore.getState().showError("Unable to copy login"));
                     }}>Copy</button>
                   </div>
                   <button className="vault-entry-btn danger" onClick={async () => {
                     try {
                       invalidateVaultReveal();
-                      await invoke("vault_delete_entry", { id: entry.id });
+                      await invoke("vault_delete_entry", { id: entry.id, ...vaultScope });
                       setVaultEntries(prev => prev.filter(e => e.id !== entry.id));
                     } catch { useUiStore.getState().showError("Failed to delete password"); }
                   }}>Delete</button>

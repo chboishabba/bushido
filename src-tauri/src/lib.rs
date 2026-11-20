@@ -1437,8 +1437,10 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
             crash_log::log_error("linux-glance-input", &e);
         }
         if !disable_autofill {
-            if let Err(e) = linux_vault::install(&app, &webview, &id) {
-                crash_log::log_error("linux-vault", &e);
+            if let Some(workspace) = profile_name.as_deref().filter(|s| !s.is_empty()) {
+                if let Err(e) = linux_vault::install(&app, &webview, &id, workspace) {
+                    crash_log::log_error("linux-vault", &e);
+                }
             }
         }
     }
@@ -4503,6 +4505,7 @@ pub fn run() {
             vault::vault_lock,
             vault::vault_is_unlocked,
             vault::vault_state_snapshot,
+            vault::vault_scoped_mode,
             vault::vault_save_entry,
             vault::vault_save_manual_entry,
             vault::vault_get_entries,

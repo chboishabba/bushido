@@ -12,6 +12,9 @@ use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
 use chacha20poly1305::aead::generic_array::GenericArray;
 
 use crate::sync::keys::{dpapi_encrypt, dpapi_decrypt};
+#[cfg(target_os = "linux")]
+#[path = "vault_scoped.rs"]
+mod scoped;
 
 pub struct VaultState {
     pub db_path: PathBuf,
@@ -55,7 +58,10 @@ impl VaultState {
                 key TEXT PRIMARY KEY,
                 value BLOB NOT NULL
             );"
-        ).map_err(|e| format!("db init: {}", e))
+        ).map_err(|e| format!("db init: {}", e))?;
+        #[cfg(target_os = "linux")]
+        scoped::init(&conn)?;
+        Ok(())
     }
 
     fn open_db(&self) -> Result<Connection, String> {
@@ -182,31 +188,27 @@ pub fn has_master_password_sync(state: &VaultState) -> bool {
     ).unwrap_or(false)
 }
 
-// Linux native selection lists only metadata; no bulk decryption.
+// Linux native selection is scoped to the actual WebView's creation profile.
 #[cfg(target_os = "linux")]
-pub(crate) fn native_choices(state: &VaultState, origin: &str) -> Result<Vec<(String, String)>, String> {
-    if state.derived_key.lock().is_none() { return Err("Unlock the vault in Settings first".into()); }
+pub(crate) fn native_choices(state: &VaultState, workspace: &str, origin: &str, epoch: u64) -> Result<Vec<(String, String)>, String> {
+    state.with_session(epoch, || ())?;
     let conn = state.open_db()?;
-    let mut stmt = conn.prepare("SELECT id, username FROM vault_entries WHERE domain = ?1 ORDER BY updated_at DESC LIMIT 51")
+    let mut stmt = conn.prepare("SELECT id, username FROM vault_scoped_v2 WHERE workspace = ?1 AND origin = ?2 ORDER BY updated_at DESC LIMIT 51")
         .map_err(|_| "Vault query failed".to_owned())?;
-    let choices = stmt.query_map([origin], |row| Ok((row.get(0)?, row.get(1)?)))
+    let choices = stmt.query_map(rusqlite::params![workspace, origin], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(|_| "Vault query failed".to_owned())?
         .collect::<Result<Vec<(String, String)>, _>>().map_err(|_| "Vault query failed".to_owned())?;
     if choices.len() > 50 { return Err("Too many matching accounts; use vault Settings".into()); }
-    Ok(choices)
+    state.with_session(epoch, || choices)
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn native_selected(state: &VaultState, origin: &str, id: &str) -> Result<(String, zeroize::Zeroizing<String>), String> {
-    let conn = state.open_db()?;
-    let (username, enc, nonce): (String, Vec<u8>, Vec<u8>) = conn.query_row(
-        "SELECT username, password_enc, nonce FROM vault_entries WHERE domain = ?1 AND id = ?2",
-        rusqlite::params![origin, id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-    ).map_err(|_| "Selected account no longer exists".to_owned())?;
-    let password = zeroize::Zeroizing::new(state.decrypt_password(&enc, &nonce)?);
-    if password.is_empty() { return Err("Selected credential is empty".into()); }
-    Ok((username, password))
+pub(crate) fn native_selected(state: &VaultState, workspace: &str, origin: &str, id: &str, user: &str, epoch: u64) -> Result<(String, Zeroizing<String>), String> {
+    scoped::selected(state, workspace, Some(origin), id, Some(user), epoch)
 }
+
+#[tauri::command]
+pub fn vault_scoped_mode() -> bool { cfg!(target_os = "linux") }
 
 // sync helper for postMessage handler (no async)
 pub fn get_entries_for_domain(state: &VaultState, domain: &str) -> Result<Vec<VaultEntry>, String> {
@@ -363,7 +365,9 @@ pub async fn vault_save_manual_entry(
     site: String,
     username: String,
     password: String,
+    workspace_id: Option<String>,
 ) -> Result<String, String> {
+    let password = Zeroizing::new(password);
     if site.len() > 4096 || username.len() > 4096 || password.len() > 65536
         || username.is_empty() || password.is_empty() {
         return Err("Enter a valid HTTPS site, username and password".into());
@@ -371,8 +375,12 @@ pub async fn vault_save_manual_entry(
     // Linux fill never silently upgrades hostname-only legacy credentials:
     // the user explicitly supplies the HTTPS site and its port.
     #[cfg(target_os = "linux")]
-    let domain = crate::linux_vault::https_origin(&site)
-        .ok_or("Enter an HTTPS URL without embedded credentials")?;
+    {
+        let domain = crate::linux_vault::https_origin(&site)
+            .ok_or("Enter an HTTPS URL without embedded credentials")?;
+        let workspace = scoped::workspace(workspace_id.as_deref())?;
+        return scoped::save(&state, workspace, &domain, &username, password.as_str());
+    }
     #[cfg(not(target_os = "linux"))]
     let domain = {
         let url = url::Url::parse(&site).map_err(|_| "Enter a valid HTTPS URL")?;
@@ -381,7 +389,8 @@ pub async fn vault_save_manual_entry(
         }
         url.host_str().ok_or("Missing hostname")?.to_owned()
     };
-    vault_save_entry(state, domain, username, password, None).await
+    #[cfg(not(target_os = "linux"))]
+    { let _ = workspace_id; vault_save_entry(state, domain, username, password.to_string(), None).await }
 }
 
 #[derive(Serialize)]
@@ -402,9 +411,14 @@ fn list_metadata(conn: &Connection, domain: Option<&str>) -> Result<Vec<VaultEnt
 }
 
 #[tauri::command]
-pub async fn vault_get_entries(state: tauri::State<'_, VaultState>, domain: Option<String>) -> Result<Vec<VaultEntryMetadata>, String> {
+pub async fn vault_get_entries(state: tauri::State<'_, VaultState>, domain: Option<String>, workspace_id: Option<String>, legacy: Option<bool>) -> Result<Vec<VaultEntryMetadata>, String> {
     let epoch = state.session()?;
     let conn = state.open_db()?;
+    #[cfg(target_os = "linux")]
+    if !legacy.unwrap_or(false) {
+        let metadata = scoped::list(&conn, scoped::workspace(workspace_id.as_deref())?, domain.as_deref())?;
+        return state.with_session(epoch, || metadata);
+    }
     let metadata = list_metadata(&conn, domain.as_deref())?;
     state.with_session(epoch, || metadata)
 }
@@ -422,15 +436,23 @@ fn selected_password(state: &VaultState, id: &str, epoch: u64) -> Result<Zeroizi
 
 // Called by trusted Settings only; one explicit reveal, no bulk password list.
 #[tauri::command]
-pub async fn vault_reveal_entry(state: tauri::State<'_, VaultState>, id: String) -> Result<String, String> {
+pub async fn vault_reveal_entry(state: tauri::State<'_, VaultState>, id: String, workspace_id: Option<String>, legacy: Option<bool>) -> Result<String, String> {
     let epoch = state.session()?;
+    #[cfg(target_os = "linux")]
+    let password = if legacy.unwrap_or(false) { selected_password(&state, &id, epoch)? }
+        else { scoped::selected(&state, scoped::workspace(workspace_id.as_deref())?, None, &id, None, epoch)?.1 };
+    #[cfg(not(target_os = "linux"))]
     let password = selected_password(&state, &id, epoch)?;
     state.with_session(epoch, || password.to_string())
 }
 
 #[tauri::command]
-pub async fn vault_copy_entry(state: tauri::State<'_, VaultState>, id: String) -> Result<(), String> {
+pub async fn vault_copy_entry(state: tauri::State<'_, VaultState>, id: String, workspace_id: Option<String>, legacy: Option<bool>) -> Result<(), String> {
     let epoch = state.session()?;
+    #[cfg(target_os = "linux")]
+    let password = if legacy.unwrap_or(false) { selected_password(&state, &id, epoch)? }
+        else { scoped::selected(&state, scoped::workspace(workspace_id.as_deref())?, None, &id, None, epoch)?.1 };
+    #[cfg(not(target_os = "linux"))]
     let password = selected_password(&state, &id, epoch)?;
     state.with_session(epoch, || {
         let mut clipboard = arboard::Clipboard::new().map_err(|_| "Clipboard unavailable".to_owned())?;
@@ -439,10 +461,15 @@ pub async fn vault_copy_entry(state: tauri::State<'_, VaultState>, id: String) -
 }
 
 #[tauri::command]
-pub async fn vault_delete_entry(state: tauri::State<'_, VaultState>, id: String) -> Result<(), String> {
+pub async fn vault_delete_entry(state: tauri::State<'_, VaultState>, id: String, workspace_id: Option<String>, legacy: Option<bool>) -> Result<(), String> {
+    let epoch = state.session()?;
+    #[cfg(target_os = "linux")]
+    if !legacy.unwrap_or(false) {
+        return scoped::delete(&state, scoped::workspace(workspace_id.as_deref())?, &id, epoch);
+    }
     let conn = state.open_db()?;
-    conn.execute("DELETE FROM vault_entries WHERE id = ?1", [&id])
-        .map_err(|e| format!("delete: {}", e))?;
+    state.with_session(epoch, || conn.execute("DELETE FROM vault_entries WHERE id = ?1", [&id])
+        .map_err(|e| format!("delete: {}", e)))??;
     Ok(())
 }
 

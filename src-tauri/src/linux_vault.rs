@@ -87,9 +87,10 @@ async fn select(view: &WebView, origin: &str, choices: &[(String, String)]) -> O
     selected
 }
 
-pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str) -> Result<(), String> {
+pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str, workspace: &str) -> Result<(), String> {
     let app = app.clone();
     let id = id.to_owned();
+    let workspace = workspace.to_owned();
     webview.with_webview(move |platform| {
         let view = platform.inner();
         let generation = Rc::new(Cell::new(0u64));
@@ -108,6 +109,7 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
             let weak = view.downgrade();
             let app = app.clone();
             let id = id.clone();
+            let workspace = workspace.clone();
             let generation = generation.clone();
             let opened = generation.get();
             let busy = busy.clone();
@@ -117,6 +119,7 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                 busy.set(true);
                 let (app, id, origin, href, generation, busy) =
                     (app.clone(), id.clone(), origin.clone(), href.clone(), generation.clone(), busy.clone());
+                let workspace = workspace.clone();
                 glib::MainContext::default().spawn_local(async move {
                     // One operation per view; reset even on an early return.
                     struct Reset(Rc<Cell<bool>>);
@@ -135,20 +138,22 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                     }
                     let db_app = app.clone();
                     let db_origin = origin.clone();
+                    let db_workspace = workspace.clone();
                     let choices = tauri::async_runtime::spawn_blocking(move ||
-                        crate::vault::native_choices(&db_app.state::<crate::vault::VaultState>(), &db_origin)).await;
+                        crate::vault::native_choices(&db_app.state::<crate::vault::VaultState>(), &db_workspace, &db_origin, epoch)).await;
                     let choices = match choices {
                         Ok(Ok(v)) if !v.is_empty() => v,
                         Ok(Err(e)) => { message(&app, &e); return; }
-                        _ => { message(&app, "No exact-origin saved login; add the HTTPS origin in Settings → Passwords"); return; }
+                        _ => { message(&app, "No saved login in this workspace for this HTTPS origin; add one in Settings → Passwords"); return; }
                     };
                     if !authorized() { return; }
                     let Some(selected) = select(&view, &origin, &choices).await else { return; };
+                    let Some((_, expected_user)) = choices.into_iter().find(|(id, _)| id == &selected) else { return; };
                     if !authorized() { return; }
                     let db_app = app.clone();
                     let db_origin = origin.clone();
                     let result = tauri::async_runtime::spawn_blocking(move ||
-                        crate::vault::native_selected(&db_app.state::<crate::vault::VaultState>(), &db_origin, &selected)).await;
+                        crate::vault::native_selected(&db_app.state::<crate::vault::VaultState>(), &workspace, &db_origin, &selected, &expected_user, epoch)).await;
                     let Ok(Ok((user, pass))) = result else { message(&app, "Cannot decrypt selected account"); return; };
                     if !authorized() { return; }
                     let source = script("fill", &token, &origin, &href, &user, pass.as_str());
