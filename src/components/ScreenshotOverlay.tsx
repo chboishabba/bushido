@@ -17,6 +17,12 @@ export default function ScreenshotOverlay({ tabId, tabUrl, preview, onClose, onA
   const [resultData, setResultData] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const [fullPageAvailable, setFullPageAvailable] = useState(false);
+  useEffect(() => {
+    let live = true;
+    invoke<boolean>("screenshot_fullpage_available").then(value => { if (live) setFullPageAvailable(value); }).catch(() => {});
+    return () => { live = false; };
+  }, []);
   const [copied, setCopied] = useState(false);
   const [saved, setSaved] = useState("");
 
@@ -174,6 +180,7 @@ export default function ScreenshotOverlay({ tabId, tabUrl, preview, onClose, onA
   }, [preview]);
 
   const captureFullPage = useCallback(async () => {
+    if (!fullPageAvailable) return;
     setPhase("capturing");
     setError("");
     try {
@@ -188,7 +195,7 @@ export default function ScreenshotOverlay({ tabId, tabUrl, preview, onClose, onA
       setError(e?.toString() || "Full page capture failed");
       setPhase("pick");
     }
-  }, [tabId, onRestoreWebview]);
+  }, [tabId, onRestoreWebview, fullPageAvailable]);
 
   const copyToClipboard = useCallback(async () => {
     if (!resultData) return;
@@ -235,7 +242,7 @@ export default function ScreenshotOverlay({ tabId, tabUrl, preview, onClose, onA
                 </svg>
                 <span>Visible</span>
               </button>
-              <button className="ss-mode-btn" onClick={captureFullPage}>
+              <button className="ss-mode-btn" onClick={captureFullPage} disabled={!fullPageAvailable} title={fullPageAvailable ? "Full-page capture" : "Full-page capture unavailable on this platform"}>
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
                   <rect x="5" y="2" width="14" height="20" rx="2" stroke="currentColor" strokeWidth="2"/>
                   <line x1="9" y1="6" x2="15" y2="6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>

@@ -4691,6 +4691,7 @@ pub fn run() {
             screenshot::capture_preview_for_select,
             screenshot::capture_area,
             screenshot::capture_fullpage,
+            screenshot::screenshot_fullpage_available,
             screenshot::save_screenshot,
             screenshot::copy_image_to_clipboard,
             screenshot::generate_qr_code,

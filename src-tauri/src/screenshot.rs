@@ -1,3 +1,4 @@
+#[cfg(windows)]
 use std::sync::mpsc;
 
 #[cfg(windows)]
@@ -131,6 +132,7 @@ pub async fn capture_visible(app: tauri::AppHandle, id: String) -> Result<String
 
 /// Capture viewport preview + hide webview off-screen (for area select overlay)
 #[tauri::command]
+#[cfg(windows)]
 pub async fn capture_preview_for_select(app: tauri::AppHandle, id: String) -> Result<String, String> {
     use tauri::Manager;
 
@@ -305,7 +307,221 @@ fn extract_cdp_data(json_str: &str) -> Result<String, String> {
         .ok_or_else(|| "No data in CDP response".to_string())
 }
 
+#[cfg(target_os = "linux")]
+const MAX_PIXELS: u64 = 16_777_216;
+#[cfg(target_os = "linux")]
+const MAX_PNG: usize = 64 * 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+fn bounded_dimensions(w: u32, h: u32) -> Result<(), String> {
+    if w == 0 || h == 0 || w > 16384 || h > 16384 || u64::from(w) * u64::from(h) > MAX_PIXELS {
+        return Err("Screenshot dimensions exceed capture limits".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn decode_png(data: &str) -> Result<(Vec<u8>, image::RgbaImage), String> {
+    use base64::Engine as _;
+    if data.len() > (MAX_PNG + 2) / 3 * 4 { return Err("Screenshot payload too large".into()); }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data)
+        .map_err(|_| "Invalid screenshot base64".to_string())?;
+    if bytes.len() > MAX_PNG || bytes.len() < 33 || &bytes[..8] != b"\x89PNG\r\n\x1a\n"
+        || &bytes[8..12] != 13u32.to_be_bytes().as_slice() || &bytes[12..16] != b"IHDR" {
+        return Err("Invalid screenshot PNG header".into());
+    }
+    let w = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+    let h = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+    bounded_dimensions(w, h)?;
+    let rgba = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+        .map_err(|_| "Invalid screenshot PNG".to_string())?.to_rgba8();
+    if rgba.dimensions() != (w, h) { return Err("Screenshot dimensions changed".into()); }
+    Ok((bytes, rgba))
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub async fn capture_visible(app: tauri::AppHandle, id: String) -> Result<String, String> {
+    use base64::Engine as _;
+    use gtk::{glib, gio, prelude::*};
+    use tauri::Manager;
+    use webkit2gtk::{LoadEvent, SnapshotOptions, SnapshotRegion, WebViewExt};
+    use std::{cell::Cell, rc::Rc, time::Duration};
+    let owner = crate::live_native_tab_owner(&app, &id).ok_or("Not a live ordinary tab")?;
+    let wv = app.get_webview(&id).ok_or("Webview not found")?;
+    let pos = wv.position().map_err(|e| e.to_string())?;
+    if pos.x < 0 || pos.y < 0 { return Err("Tab is not on screen".into()); }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let callback_app = app.clone();
+    let callback_id = id.clone();
+    let callback_owner = owner.clone();
+    wv.with_webview(move |platform| {
+        let view = platform.inner();
+        if tx.is_closed() { return; }
+        let admissible = || -> Result<(), String> {
+            if !crate::native_tab_matches_owner(&callback_app, &callback_id, &callback_owner)
+                || !view.is_mapped() || view.is_loading() {
+                return Err("Tab unavailable or loading".into());
+            }
+            let scale = u32::try_from(view.scale_factor()).map_err(|_| "Invalid display scale")?;
+            let w = u32::try_from(view.allocated_width()).ok().and_then(|v| v.checked_mul(scale)).ok_or("Invalid viewport")?;
+            let h = u32::try_from(view.allocated_height()).ok().and_then(|v| v.checked_mul(scale)).ok_or("Invalid viewport")?;
+            bounded_dimensions(w, h)
+        };
+        if let Err(e) = admissible() { let _ = tx.send(Err(e)); return; }
+        let uri = view.uri();
+        let changed = Rc::new(Cell::new(false));
+        let changed_signal = changed.clone();
+        let handler = view.connect_load_changed(move |_, event| {
+            if event == LoadEvent::Started { changed_signal.set(true); }
+        });
+        let cancel = gio::Cancellable::new();
+        let deadline_cancel = cancel.clone();
+        let completed = Rc::new(Cell::new(false));
+        let deadline_completed = completed.clone();
+        glib::timeout_add_local_once(Duration::from_secs(5), move || {
+            if !deadline_completed.get() { deadline_cancel.cancel(); }
+        });
+        let callback_view = view.clone();
+        view.snapshot(SnapshotRegion::Visible, SnapshotOptions::empty(), Some(&cancel), move |result| {
+            completed.set(true);
+            callback_view.disconnect(handler);
+            if tx.is_closed() { return; }
+            let png = (|| -> Result<Vec<u8>, String> {
+                if changed.get() || callback_view.uri() != uri
+                    || !crate::native_tab_matches_owner(&callback_app, &callback_id, &callback_owner) {
+                    return Err("Tab changed during capture".into());
+                }
+                let surface = result.map_err(|e| e.to_string())?;
+                let image = gtk::cairo::ImageSurface::try_from(surface)
+                    .map_err(|_| "Unsupported snapshot surface".to_string())?;
+                let (w, h) = (image.width(), image.height());
+                bounded_dimensions(u32::try_from(w).map_err(|_| "Invalid width")?,
+                                   u32::try_from(h).map_err(|_| "Invalid height")?)?;
+                let pixbuf = gtk::gdk::pixbuf_get_from_surface(&image, 0, 0, w, h)
+                    .ok_or("Snapshot pixel conversion failed")?;
+                let bytes = pixbuf.save_to_bufferv("png", &[]).map_err(|e| e.to_string())?;
+                if bytes.is_empty() || bytes.len() > MAX_PNG { return Err("Snapshot PNG exceeds limits".into()); }
+                Ok(bytes)
+            })();
+            let _ = tx.send(png);
+        });
+    }).map_err(|e| e.to_string())?;
+    let bytes = tokio::time::timeout(Duration::from_secs(6), rx).await
+        .map_err(|_| "Screenshot timed out")?.map_err(|_| "Screenshot callback lost")??;
+    if !crate::native_tab_matches_owner(&app, &id, &owner) { return Err("Tab changed during capture".into()); }
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+// On Linux the frontend uses the frozen visible image for selection. Do not
+// expose a second command that moves an arbitrary or stale native view.
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn capture_preview_for_select(_app: tauri::AppHandle, _id: String) -> Result<String, String> {
+    Err("Use the visible snapshot selection overlay".into())
+}
+
+#[tauri::command]
+pub fn screenshot_fullpage_available() -> bool { cfg!(windows) }
+
+#[cfg(target_os = "linux")]
+fn safe_screenshot_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 180 && name.ends_with(".png")
+        && !name.starts_with('.') && !name.contains('/') && !name.contains('\\')
+        && !name.chars().any(char::is_control)
+}
+
+#[cfg(target_os = "linux")]
+fn save_png_exclusive(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<String, String> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    if !safe_screenshot_name(name) { return Err("Invalid screenshot filename".into()); }
+    let stem = name.strip_suffix(".png").unwrap();
+    for i in 0..1000 {
+        let path = dir.join(if i == 0 { name.to_owned() } else { format!("{stem} ({i}).png") });
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
+            Ok(mut file) => {
+                // A failed write is explicitly reported; never unlink a path
+                // that might have been replaced by another same-user process.
+                file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|_| "Screenshot write failed; partial file may remain")?;
+                return Ok(path.to_string_lossy().into_owned());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err("Cannot create screenshot file".into()),
+        }
+    }
+    Err("Too many screenshot filename collisions".into())
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub async fn save_screenshot(data: String, suggested_name: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let (bytes, _) = decode_png(&data)?;
+        let dir = dirs::download_dir().ok_or("Downloads directory unavailable")?;
+        let name = if suggested_name.is_empty() {
+            format!("Bushido Screenshot {}.png", chrono::Local::now().format("%Y-%m-%d %H%M%S"))
+        } else { suggested_name };
+        save_png_exclusive(&dir, &name, &bytes)
+    }).await.map_err(|_| "Screenshot worker failed".to_string())?
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub async fn copy_image_to_clipboard(app: tauri::AppHandle, data: String) -> Result<(), String> {
+    use gtk::{gdk, gdk_pixbuf, glib};
+    let (_, rgba) = tokio::task::spawn_blocking(move || decode_png(&data))
+        .await.map_err(|_| "Screenshot decoder failed".to_string())??;
+    let (w, h) = rgba.dimensions();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.run_on_main_thread(move || {
+        if tx.is_closed() { return; }
+        let result = (|| -> Result<(), String> {
+            let display = gdk::Display::default().ok_or("No graphical clipboard display")?;
+            let bytes = glib::Bytes::from_owned(rgba.into_raw());
+            let pixbuf = gdk_pixbuf::Pixbuf::from_bytes(&bytes, gdk_pixbuf::Colorspace::Rgb,
+                true, 8, w as i32, h as i32, (w * 4) as i32);
+            // GTK retains the selection payload after this command returns,
+            // unlike a temporary clipboard owner dropped on the worker.
+            gtk::Clipboard::for_display(&display, &gdk::SELECTION_CLIPBOARD).set_image(&pixbuf);
+            Ok(())
+        })();
+        let _ = tx.send(result);
+    }).map_err(|e| e.to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), rx).await
+        .map_err(|_| "Clipboard dispatch timed out")?.map_err(|_| "Clipboard callback lost")?
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn bounds_and_names() {
+        assert!(bounded_dimensions(4096, 4096).is_ok());
+        assert!(bounded_dimensions(8192, 4096).is_err());
+        assert!(bounded_dimensions(0, 1).is_err());
+        for invalid in ["../x.png", "/tmp/x.png", "x\\y.png", ".hidden.png", "x.jpg", "x\n.png"] {
+            assert!(!safe_screenshot_name(invalid));
+        }
+        assert!(safe_screenshot_name("Bushido Screenshot.png"));
+    }
+
+    #[test]
+    fn exclusive_write_preserves_existing_and_symlink() {
+        let dir = std::env::temp_dir().join(format!("bushido-shot-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("x.png"), b"existing").unwrap();
+        std::os::unix::fs::symlink(dir.join("missing"), dir.join("x (1).png")).unwrap();
+        let actual = save_png_exclusive(&dir, "x.png", b"new").unwrap();
+        assert!(actual.ends_with("x (2).png"));
+        assert_eq!(std::fs::read(dir.join("x.png")).unwrap(), b"existing");
+        assert!(!dir.join("missing").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 /// Save base64 PNG to Downloads directory
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub async fn save_screenshot(data: String, suggested_name: String) -> Result<String, String> {
     use base64::Engine as _;
@@ -352,6 +568,7 @@ pub async fn save_screenshot(data: String, suggested_name: String) -> Result<Str
 }
 
 /// Copy base64 PNG image to system clipboard
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub async fn copy_image_to_clipboard(data: String) -> Result<(), String> {
     crash_log::log_info("screenshot", &format!("copy_image_to_clipboard called, data_len={}", data.len()));
@@ -432,7 +649,7 @@ pub async fn generate_qr_code(url: String) -> Result<String, String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 #[tauri::command]
 pub async fn capture_visible(_app: tauri::AppHandle, _id: String) -> Result<String, String> {
     Err("Screenshot capture is not yet implemented on Linux".into())

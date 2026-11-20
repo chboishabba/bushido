@@ -2226,19 +2226,34 @@ export default function App() {
   }, [tabs, selectTab, addTab]);
 
   // Screenshot: capture viewport while webview is on-screen, then hide + open overlay
+  const screenshotPending = useRef(false);
   const openScreenshot = useCallback(async () => {
-    if (!activeTab) return;
+    if (!activeTab || screenshotPending.current || useFeatureStore.getState().screenshotPreview !== null) return;
+    const workspace = activeWorkspaceId;
+    const source = tabs.find(t => t.id === activeTab);
+    if (!source || source.url.startsWith("bushido://")) return;
+    const stillCurrent = () => {
+      const state = useTabStore.getState();
+      const w = state.workspaces.find(w => w.id === workspace);
+      return state.activeWorkspaceId === workspace && w?.activeTabId === activeTab
+        && state.tabs.some(t => t.id === activeTab && t.workspaceId === workspace && t.url === source.url);
+    };
+    screenshotPending.current = true;
+    let hidden = false;
     try {
       const b64: string = await invoke("capture_visible", { id: activeTab });
-      // Hide webviews so React overlay is visible
-      invoke("layout_webviews", { panes: [], focusedTabId: activeTab, sidebarW: 0, topOffset: 0 });
+      if (!stillCurrent()) return;
+      hidden = true;
+      await invoke("layout_webviews", { panes: [], focusedTabId: activeTab, sidebarW: 0, topOffset: 0 });
+      if (!stillCurrent()) { syncLayoutRef.current(); return; }
       setScreenshotPreview(b64);
-    } catch (e: any) {
-      // If capture fails, still open overlay with empty preview
-      invoke("layout_webviews", { panes: [], focusedTabId: activeTab || "__none__", sidebarW: 0, topOffset: 0 });
-      setScreenshotPreview("");
+    } catch (e) {
+      if (hidden) syncLayoutRef.current();
+      if (stillCurrent()) window.alert("Screenshot failed: " + String(e));
+    } finally {
+      screenshotPending.current = false;
     }
-  }, [activeTab]);
+  }, [activeTab, activeWorkspaceId, tabs]);
 
   const executeAction = useCallback((action: string) => {
     switch (action) {
