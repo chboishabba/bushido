@@ -84,7 +84,62 @@ struct GlanceLifecycle {
     previews: tokio::sync::Mutex<HashMap<String, GlanceRecord>>,
 }
 
+// The workspace comes from the native tab constructor, not a page message.
+// A fresh generation distinguishes close/recreate of an identical tab ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NativeTabOwner {
+    workspace: String,
+    generation: uuid::Uuid,
+}
+
+#[derive(Default)]
+struct NativeTabOwners {
+    entries: Mutex<HashMap<String, NativeTabOwner>>,
+}
+
+impl NativeTabOwners {
+    fn register(&self, id: &str, workspace: &str) {
+        self.entries.lock().insert(id.to_owned(), NativeTabOwner {
+            workspace: workspace.to_owned(), generation: uuid::Uuid::new_v4(),
+        });
+    }
+
+    fn remove(&self, id: &str) {
+        self.entries.lock().remove(id);
+    }
+
+    fn get(&self, id: &str) -> Option<NativeTabOwner> {
+        self.entries.lock().get(id).cloned()
+    }
+
+    fn matches(&self, id: &str, owner: &NativeTabOwner) -> bool {
+        self.entries.lock().get(id) == Some(owner)
+    }
+}
+
+fn valid_workspace_identity(workspace: &str) -> bool {
+    !workspace.is_empty() && workspace.len() <= 256
+        && workspace.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn live_native_tab_owner(app: &tauri::AppHandle, id: &str) -> Option<NativeTabOwner> {
+    if !app.state::<WebviewState>().tabs.lock().contains_key(id)
+        || app.state::<PanelState>().ids.lock().contains(id)
+        || app.get_webview(id).is_none() {
+        return None;
+    }
+    app.state::<NativeTabOwners>().get(id)
+}
+
+#[cfg(target_os = "linux")]
+fn native_tab_has_workspace(app: &tauri::AppHandle, id: &str, workspace: &str) -> bool {
+    live_native_tab_owner(app, id).is_some_and(|owner| owner.workspace == workspace)
+}
+
 struct GlanceRecord {
+    source_tab: String,
+    source_owner: NativeTabOwner,
+    source_url: url::Url,
     workspace: String,
     disable_autofill: bool,
     disable_password_save: bool,
@@ -309,17 +364,10 @@ struct BlockerState {
     fingerprint_verify_script: String,
     vault_script: String,
     glance_script: String,
-    preload_script: String,
 }
 
 struct WhitelistState {
     sites: Mutex<HashSet<String>>,
-}
-
-struct PreloadState {
-    url: Mutex<Option<String>>,
-    webview_id: Mutex<Option<String>>,
-    source_tab: Mutex<Option<String>>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -668,7 +716,7 @@ fn install_linux_glance_menu(app: &tauri::AppHandle, webview: &tauri::Webview, i
                 if view.uri().as_ref() != Some(&source) { return; }
                 if !app.state::<WebviewState>().tabs.lock().contains_key(&id) { return; }
                 let _ = app.emit_to("main", "glance-request", serde_json::json!({
-                    "url": target.as_str(), "sourceTabId": id
+                    "url": target.as_str(), "sourceTabId": id, "sourceUrl": source.as_str()
                 }));
             });
             let item = ContextMenuItem::from_gaction(&action, "Open in Glance", None);
@@ -1051,6 +1099,12 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
         return Ok(());
     }
 
+    // Remote ordinary tabs require an explicit, valid storage identity.
+    // Internal pages have already returned above; side panels remain separate.
+    if !is_panel && !profile_name.as_deref().is_some_and(valid_workspace_identity) {
+        return Err("Ordinary tab requires an explicit workspace".into());
+    }
+
     // https upgrade (conditional on https_only setting)
     let final_url = if url.starts_with("https://") {
         url.clone()
@@ -1101,7 +1155,6 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     let inject_fp_verify = fingerprint_verify_script.clone();
     let inject_vault = vault_script.clone();
     let inject_glance = glance_script.clone();
-    let inject_preload = bs.preload_script.clone();
 
     let security_js = document_security_script(block_service_workers, block_font_enum);
     let inject_security = security_js.clone();
@@ -1274,34 +1327,6 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 }
             }
 
-            // check for speculative preload match
-            {
-                let ps = app_nav.state::<PreloadState>();
-                let preload_url = ps.url.lock().clone();
-                if let Some(ref purl) = preload_url {
-                    if *purl == url_str {
-                        let preload_id = ps.webview_id.lock().take();
-                        let source_tab = ps.source_tab.lock().take();
-                        *ps.url.lock() = None;
-                        if let (Some(pid), Some(stab)) = (preload_id, source_tab) {
-                            let panel_s = app_nav.state::<PanelState>();
-                            panel_s.ids.lock().remove(&pid);
-                            let ws = app_nav.state::<WebviewState>();
-                            #[cfg(target_os = "linux")]
-                            ws.register_linux_tab(pid.clone(), false, false);
-                            #[cfg(not(target_os = "linux"))]
-                            ws.tabs.lock().insert(pid.clone(), false);
-                            let _ = app_nav.emit_to("main", "preload-promoted", serde_json::json!({
-                                "preloadId": pid,
-                                "url": url_str,
-                                "sourceTabId": stab
-                            }));
-                            return false;
-                        }
-                    }
-                }
-            }
-
             // update source URL for third-party request classification
             *source_for_nav.lock() = url_str.clone();
 
@@ -1337,7 +1362,6 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 let _ = wv.eval(&inject_vault);
                 #[cfg(not(target_os = "linux"))]
                 let _ = wv.eval(&inject_glance);
-                let _ = wv.eval(&inject_preload);
                 let active_host_whitelisted = wv.url().ok()
                     .and_then(|url| url.host_str().map(|host| host.to_lowercase()))
                     .is_some_and(|host|
@@ -1400,7 +1424,6 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     { builder = builder.initialization_script(&vault_script); }
     #[cfg(not(target_os = "linux"))]
     { builder = builder.initialization_script(&glance_script); }
-    builder = builder.initialization_script(&bs.preload_script);
 
     // WebRTC ICE/STUN restriction in content_blocker.js is transport-level
     // privacy hardening, NOT cosmetic ad blocking. Register it independently
@@ -1436,6 +1459,11 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     state.register_linux_tab(tab_id_track, true, !is_panel && pinned.unwrap_or(false));
     #[cfg(not(target_os = "linux"))]
     state.tabs.lock().insert(tab_id_track, true);
+    if !is_panel {
+        if let Some(workspace) = profile_name.as_deref() {
+            app.state::<NativeTabOwners>().register(&id, workspace);
+        }
+    }
 
     #[cfg(target_os = "linux")]
     if let Err(e) = install_linux_shortcuts(&app, &webview) {
@@ -1929,82 +1957,6 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                                                 );
                                             }
                                         }
-                                    }
-                                    Some("preload") => {
-                                        if let Some(url) = msg.get("url").and_then(|v| v.as_str()) {
-                                            let url = url.to_string();
-                                            let tab_id = tab_ref.to_string();
-                                            let app_clone = (*app_ref).clone();
-                                            std::thread::spawn(move || {
-                                                let old_id = {
-                                                    let ps = app_clone.state::<PreloadState>();
-                                                    let val = ps.webview_id.lock().take();
-                                                    val
-                                                };
-                                                if let Some(old_id) = old_id {
-                                                    let panel_s = app_clone.state::<PanelState>();
-                                                    panel_s.ids.lock().remove(&old_id);
-                                                    if let Some(wv) = app_clone.get_webview(&old_id) {
-                                                        let _ = wv.close();
-                                                    }
-                                                }
-                                                let preload_id = format!("preload-{}", std::time::SystemTime::now()
-                                                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
-                                                let window = match app_clone.get_window("main") {
-                                                    Some(w) => w,
-                                                    None => return,
-                                                };
-                                                let webview_url = match url.parse::<url::Url>() {
-                                                    Ok(u) => tauri::WebviewUrl::External(u),
-                                                    Err(_) => return,
-                                                };
-                                                {
-                                                    let bs = app_clone.state::<BlockerState>();
-                                                    let mut builder = tauri::WebviewBuilder::new(&preload_id, webview_url);
-                                                    builder = builder.initialization_script(&bs.shortcut_script);
-                                                    builder = builder.initialization_script(&bs.fingerprint_script);
-                                                    match window.add_child(
-                                                        builder,
-                                                        tauri::LogicalPosition::new(-9999.0, -9999.0),
-                                                        tauri::LogicalSize::new(800.0, 600.0),
-                                                    ) {
-                                                        Ok(_) => {
-                                                            let panel_s = app_clone.state::<PanelState>();
-                                                            panel_s.ids.lock().insert(preload_id.clone());
-                                                            let ps = app_clone.state::<PreloadState>();
-                                                            *ps.url.lock() = Some(url);
-                                                            *ps.webview_id.lock() = Some(preload_id);
-                                                            *ps.source_tab.lock() = Some(tab_id);
-                                                        }
-                                                        Err(e) => {
-                                                            crash_log::log_error("preload", &format!("failed to create preload webview: {}", e));
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                        }
-                                    }
-                                    Some("preload-cancel") => {
-                                        let app_clone = (*app_ref).clone();
-                                        std::thread::spawn(move || {
-                                            std::thread::sleep(std::time::Duration::from_secs(2));
-                                            let old_id = {
-                                                let ps = app_clone.state::<PreloadState>();
-                                                let id = ps.webview_id.lock().take();
-                                                if id.is_some() {
-                                                    *ps.url.lock() = None;
-                                                    *ps.source_tab.lock() = None;
-                                                }
-                                                id
-                                            };
-                                            if let Some(old_id) = old_id {
-                                                let panel_s = app_clone.state::<PanelState>();
-                                                panel_s.ids.lock().remove(&old_id);
-                                                if let Some(wv) = app_clone.get_webview(&old_id) {
-                                                    let _ = wv.close();
-                                                }
-                                            }
-                                        });
                                     }
                                     Some("fingerprint-verify") => {
                                         if let Some(report) = msg.get("report") {
@@ -2550,6 +2502,8 @@ async fn resume_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
 #[tauri::command]
 async fn close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
     crash_log::log_info("close_tab", &format!("id={}", id));
+    // Invalidate source ownership before closing/recreating the native view.
+    app.state::<NativeTabOwners>().remove(&id);
     // remove from state FIRST so layout_webviews won't try to position a dying webview
     let state = app.state::<WebviewState>();
     #[cfg(target_os = "linux")]
@@ -2809,7 +2763,7 @@ mod glance_policy_tests {
 }
 
 #[tauri::command]
-async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, sidebar_w: f64, top_offset: f64, profile_name: Option<String>, ad_blocker: bool,
+async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, sidebar_w: f64, top_offset: f64, profile_name: Option<String>, source_tab_id: String, source_url: Option<String>, ad_blocker: bool,
     https_only: Option<bool>, cookie_auto_reject: Option<bool>, block_service_workers: Option<bool>, block_font_enum: Option<bool>,
     disable_autofill: Option<bool>, disable_password_save: Option<bool>) -> Result<(), String> {
     let https_only = https_only.unwrap_or(true);
@@ -2820,8 +2774,18 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
     let security_js = document_security_script(block_service_workers.unwrap_or(false), block_font_enum.unwrap_or(false));
     let lifecycle = app.state::<GlanceLifecycle>();
     let mut previews = lifecycle.previews.lock().await;
-    let workspace = profile_name.as_ref().filter(|s| !s.is_empty())
-        .ok_or("Glance requires an originating workspace")?.clone();
+    let source_owner = live_native_tab_owner(&app, &source_tab_id)
+        .ok_or("Glance requires a live ordinary source tab")?;
+    let workspace = source_owner.workspace.clone();
+    if profile_name.as_deref() != Some(workspace.as_str()) {
+        return Err("Glance source workspace does not match native ownership".into());
+    }
+    let committed_source = app.get_webview(&source_tab_id).ok_or("Glance source missing")?
+        .url().map_err(|_| "Cannot read Glance source URL")?;
+    if !glance_navigation_allowed(&committed_source, false)
+        || source_url.as_deref().is_some_and(|raw| url::Url::parse(raw).ok().as_ref() != Some(&committed_source)) {
+        return Err("Glance source document changed or is not HTTP(S)".into());
+    }
     if previews.contains_key(&glance_id) || app.get_webview(&glance_id).is_some() {
         return Err("Glance ID is already in use".into());
     }
@@ -2858,7 +2822,7 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
     let glance_s = bs.glance_script.clone();
 
     let mut builder = tauri::WebviewBuilder::new(&glance_id, webview_url)
-        .with_profile_name(profile_name.clone());
+        .with_profile_name(Some(workspace.clone()));
     // The Glance view inherits the real global adblock preference, but
     // computes its own destination whitelist instead of inheriting the
     // source tab's whitelist (which may be a different origin).
@@ -2881,7 +2845,7 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
     #[cfg(target_os = "linux")]
     {
         builder = builder.data_directory(
-            linux_workspace_data_directory(profile_name.as_deref())
+            linux_workspace_data_directory(Some(&workspace))
         );
     }
     // Glance can navigate independently after creation. Keep its native
@@ -3039,6 +3003,15 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
         }
     };
 
+    // Construction may re-enter the event loop. Reject if source ownership
+    // or its committed URL changed before the new preview became live.
+    if !app.state::<NativeTabOwners>().matches(&source_tab_id, &source_owner)
+        || app.get_webview(&source_tab_id).and_then(|v| v.url().ok()).as_ref() != Some(&committed_source) {
+        let _ = _webview.close();
+        #[cfg(all(target_os = "linux", debug_assertions))]
+        app.state::<Arc<NativeFilterUpdateState>>().forget(&glance_id);
+        return Err("Glance source changed during creation".into());
+    }
     #[cfg(target_os = "linux")]
     if let Err(e) = install_linux_shortcuts(&app, &_webview) {
         crash_log::log_error("linux-shortcuts", &e);
@@ -3064,7 +3037,10 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
             if let Err(e) = result { crash_log::log_error(kind, &e); }
         }
     }
-    previews.insert(glance_id, GlanceRecord { workspace, disable_autofill, disable_password_save });
+    previews.insert(glance_id, GlanceRecord {
+        source_tab: source_tab_id, source_owner, source_url: committed_source,
+        workspace, disable_autofill, disable_password_save,
+    });
 
     Ok(())
 }
@@ -3091,6 +3067,10 @@ async fn promote_glance(app: tauri::AppHandle, glance_id: String, workspace_id: 
     let mut previews = lifecycle.previews.lock().await;
     let record = previews.get(&glance_id).filter(|record| record.workspace == workspace_id)
         .ok_or("Glance is not a live preview in this workspace")?;
+    if live_native_tab_owner(&app, &record.source_tab).as_ref() != Some(&record.source_owner)
+        || app.get_webview(&record.source_tab).and_then(|v| v.url().ok()).as_ref() != Some(&record.source_url) {
+        return Err("Glance source changed; close and reopen the preview".into());
+    }
     let view = app.get_webview(&glance_id).ok_or("Glance WebView is missing")?;
     let ps = app.state::<PanelState>();
     if !ps.ids.lock().contains(&glance_id) {
@@ -3105,6 +3085,7 @@ async fn promote_glance(app: tauri::AppHandle, glance_id: String, workspace_id: 
     #[cfg(not(target_os = "linux"))]
     ws.tabs.lock().insert(glance_id.clone(), false);
     ps.ids.lock().remove(&glance_id);
+    app.state::<NativeTabOwners>().register(&glance_id, &record.workspace);
     // Only promotion acquires credential handlers: a preview must not even
     // arm a password capture candidate. The record is consumed exactly once.
     #[cfg(target_os = "linux")]
@@ -4257,7 +4238,6 @@ pub fn run() {
     let fingerprint_verify_script = include_str!("fingerprint_verify.js").to_string();
     let vault_script = include_str!("vault_autofill.js").to_string();
     let glance_script = include_str!("glance_listener.js").to_string();
-    let preload_script = include_str!("link_preload.js").to_string();
 
     let sync_data_dir = data_dir.clone();
 
@@ -4310,11 +4290,7 @@ pub fn run() {
             ids: Mutex::new(HashSet::new()),
         })
         .manage(GlanceLifecycle::default())
-        .manage(PreloadState {
-            url: Mutex::new(None),
-            webview_id: Mutex::new(None),
-            source_tab: Mutex::new(None),
-        })
+        .manage(NativeTabOwners::default())
         .manage(NetworkLog {
             entries: Mutex::new(HashMap::new()),
             enabled: AtomicBool::new(false),
@@ -4336,7 +4312,6 @@ pub fn run() {
             fingerprint_verify_script,
             vault_script,
             glance_script,
-            preload_script,
         })
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -4707,4 +4682,36 @@ pub fn run() {
             crash_log::log_error("startup", &format!("Tauri run() failed: {}", e));
             eprintln!("FATAL: Bushido failed to start: {}", e);
         });
+}
+
+#[cfg(test)]
+mod native_tab_owner_tests {
+    use super::*;
+
+    #[test]
+    fn owner_does_not_survive_id_reuse_or_workspace_change() {
+        let owners = NativeTabOwners::default();
+        owners.register("tab", "workspace-a");
+        let a = owners.get("tab").unwrap();
+        assert!(owners.matches("tab", &a));
+        owners.remove("tab");
+        assert!(!owners.matches("tab", &a));
+        owners.register("tab", "workspace-a");
+        assert!(!owners.matches("tab", &a));
+        let b = owners.get("tab").unwrap();
+        owners.register("tab", "workspace-b");
+        assert!(!owners.matches("tab", &b));
+        assert_eq!(owners.get("tab").unwrap().workspace, "workspace-b");
+    }
+
+    #[test]
+    fn explicit_workspace_identity_is_bounded_and_not_a_path() {
+        for raw in ["ws-1", "ws_2", "ws-aaaa-bbbb"] {
+            assert!(valid_workspace_identity(raw));
+        }
+        for raw in ["", "../default", "/tmp/workspace", "a b", "界"] {
+            assert!(!valid_workspace_identity(raw));
+        }
+        assert!(!valid_workspace_identity(&"a".repeat(257)));
+    }
 }

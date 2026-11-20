@@ -28,9 +28,8 @@ fn enabled(app: &tauri::AppHandle) -> bool {
     }
 }
 
-fn live(app: &tauri::AppHandle, id: &str, view: &WebView, href: &str) -> bool {
-    enabled(app) && app.state::<crate::WebviewState>().tabs.lock().contains_key(id)
-        && !app.state::<crate::PanelState>().ids.lock().contains(id)
+fn live(app: &tauri::AppHandle, id: &str, workspace: &str, view: &WebView, href: &str) -> bool {
+    enabled(app) && crate::native_tab_has_workspace(app, id, workspace)
         && !view.is_loading() && view.uri().as_deref() == Some(href)
         && view.tls_info().is_some_and(|(_, errors)| errors.is_empty())
 }
@@ -105,7 +104,7 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
         view.connect_context_menu(move |view, menu, _, _| {
             let Some(href) = view.uri().map(|s| s.to_string()) else { return false; };
             let Some(origin) = https_origin(&href) else { return false; };
-            if busy.get() || !live(&app, &id, view, &href) { return false; }
+            if busy.get() || !live(&app, &id, &workspace, view, &href) { return false; }
             let action = gtk::gio::SimpleAction::new("bushido-fill-saved-login", None);
             let weak = view.downgrade();
             let app = app.clone();
@@ -116,7 +115,7 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
             let busy = busy.clone();
             action.connect_activate(move |_, _| {
                 let Some(view) = weak.upgrade() else { return; };
-                if busy.get() || generation.get() != opened || !live(&app, &id, &view, &href) { return; }
+                if busy.get() || generation.get() != opened || !live(&app, &id, &workspace, &view, &href) { return; }
                 busy.set(true);
                 let (app, id, origin, href, generation, busy) =
                     (app.clone(), id.clone(), origin.clone(), href.clone(), generation.clone(), busy.clone());
@@ -126,7 +125,7 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                     struct Reset(Rc<Cell<bool>>);
                     impl Drop for Reset { fn drop(&mut self) { self.0.set(false); } }
                     let _reset = Reset(busy);
-                    let valid = || generation.get() == opened && live(&app, &id, &view, &href);
+                    let valid = || generation.get() == opened && live(&app, &id, &workspace, &view, &href);
                     if !valid() { return; }
                     let epoch = match app.state::<crate::vault::VaultState>().session() {
                         Ok(epoch) => epoch,

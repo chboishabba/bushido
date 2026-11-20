@@ -832,27 +832,6 @@ export default function App() {
       listen<{ id: string; reason: string }>("download-resume-failed", (e) => {
         showError(e.payload.reason);
       }),
-      // speculative preload promotion
-      listen<{ preloadId: string; url: string; sourceTabId: string }>("preload-promoted", (e) => {
-        const { preloadId, url, sourceTabId } = e.payload;
-        setTabs(prev => {
-          // find the source tab to inherit its workspace
-          const sourceTab = prev.find(t => t.id === sourceTabId);
-          const wsId = sourceTab?.workspaceId || activeWorkspaceId;
-          const newTab: Tab = {
-            id: preloadId,
-            url,
-            title: url,
-            loading: true,
-            pinned: false,
-            workspaceId: wsId,
-            parentId: sourceTabId,
-          };
-          return [...prev, newTab];
-        });
-        // set the preloaded tab as active
-        setWorkspaces(prev => prev.map(ws => ws.id === activeWorkspaceId ? { ...ws, activeTabId: preloadId } : ws));
-      }),
       // network inspector
       listen<{ tabId: string; entries: NetworkEntry[] }>("network-request", (e) => {
         const newEntries = e.payload.entries;
@@ -947,6 +926,7 @@ export default function App() {
         invoke("open_glance", {
           url: e.payload.url, glanceId, sidebarW: layoutOffsetRef.current,
           topOffset, profileName: src.workspaceId,
+          sourceTabId: src.id, sourceUrl: e.payload.sourceUrl ?? src.url,
           adBlocker: settingsRef.current.adBlocker,
           httpsOnly: settingsRef.current.httpsOnly,
           cookieAutoReject: settingsRef.current.cookieAutoReject,

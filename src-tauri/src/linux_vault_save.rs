@@ -33,9 +33,8 @@ fn enabled(app: &tauri::AppHandle) -> bool {
     }
 }
 
-fn live(app: &tauri::AppHandle, id: &str, view: &WebView, href: &str) -> bool {
-    enabled(app) && app.state::<crate::WebviewState>().tabs.lock().contains_key(id)
-        && !app.state::<crate::PanelState>().ids.lock().contains(id)
+fn live(app: &tauri::AppHandle, id: &str, workspace: &str, view: &WebView, href: &str) -> bool {
+    enabled(app) && crate::native_tab_has_workspace(app, id, workspace)
         && !view.is_loading() && view.uri().as_deref() == Some(href)
         && view.tls_info().is_some_and(|(_, errors)| errors.is_empty())
 }
@@ -124,7 +123,7 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                 armed.seen = notice.id;
             }
             let Some(origin) = crate::linux_vault::https_origin(&notice.href) else { return; };
-            if busy.get() || !view.has_focus() || !live(&app, &id, &view, &notice.href) {
+            if busy.get() || !view.has_focus() || !live(&app, &id, &workspace, &view, &notice.href) {
                 discard(&view, &notice); return;
             }
             let Ok(epoch) = app.state::<crate::vault::VaultState>().session() else {
@@ -140,7 +139,7 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                 impl Drop for Reset { fn drop(&mut self) { self.0.set(false); } }
                 let _reset = Reset(busy);
                 let valid = || Instant::now() < deadline && generation.load(Ordering::SeqCst) == opened
-                    && live(&app, &id, &view, &notice.href)
+                    && live(&app, &id, &workspace, &view, &notice.href)
                     && app.state::<crate::vault::VaultState>().with_session(epoch, || ()).is_ok();
                 if !valid() || !approve(&view, &origin, &notice.username, &valid).await {
                     discard(&view, &notice); return;
