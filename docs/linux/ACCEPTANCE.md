@@ -319,3 +319,6 @@ Linux standalone resolver: valid Host/port permits fixture traffic; wrong/duplic
 
 ### P2.4e native proxy sentinel
 Use EGRESS_FIXTURE.md procedure and independent process/packet capture. Assert positive fixed proxy routes, separately denied CONNECT, dead-proxy no direct fallback, workspace/panel/Glance/popup/recreation context identity. Fixture tests queued in runner, not executed. No production network claim; actual HTTPS transport, resolver binding and OS egress policy OPEN.
+
+### P2.4e HTTPS positive and address candidate
+Use separate fixed loopback TLS fixture with operator-provided trusted synthetic certificate in disposable account; require CONNECT established, opaque relay and actual origin HTTP, correct hostname/certificate, negative trust and dead origin, wrong authority and bounded relay. Independent trace no direct fallback. Direct address producer synthetic wire/epoch/expiry and mismatch tests; actual DoH call and socket weld OPEN. Tests authored, not executed.

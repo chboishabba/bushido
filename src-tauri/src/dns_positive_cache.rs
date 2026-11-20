@@ -1,7 +1,7 @@
 //! Narrow replay constructor for synthetic/debug resolver acceptance.
 //! The existing Hickory request/response validation must precede insertion.
 //! No EDNS, DNSSEC, aliases, negative answers, authority or additional records.
-use std::{collections::HashMap, time::{Duration, Instant}};
+use std::{net::{IpAddr, Ipv4Addr, Ipv6Addr}, collections::HashMap, time::{Duration, Instant}};
 
 const CAPACITY: usize = 256;
 const MAX_PACKET: usize = 4096;
@@ -46,6 +46,7 @@ pub(crate) fn key(wire: &[u8], generation: u64) -> Option<Key> {
 struct Entry {
     packet: Vec<u8>,
     ttl_offsets: Vec<(usize, u32)>,
+    addresses: Vec<IpAddr>,
     started: Instant,
     lifetime: u32,
 }
@@ -79,6 +80,7 @@ fn make_entry(query: &[u8], packet: &[u8], started: Instant, max_age: u32) -> Op
     if count == 0 || count > 64 { return None; }
     let mut cursor = query.len();
     let mut offsets = Vec::with_capacity(count);
+    let mut addresses = Vec::with_capacity(count);
     let mut lifetime = max_age.min(MAX_LIFETIME);
     for _ in 0..count {
         // Only accept direct owner of the question. No arbitrary compression
@@ -94,17 +96,32 @@ fn make_entry(query: &[u8], packet: &[u8], started: Instant, max_age: u32) -> Op
         let ttl = u32_at(packet,cursor+4)?;
         let rdlen = u16_at(packet,cursor+8)? as usize;
         if rdlen != if kind == 1 { 4 } else { 16 } { return None; }
-        packet.get(cursor+10..cursor+10+rdlen)?;
+        let data = packet.get(cursor+10..cursor+10+rdlen)?;
+        let ip = if kind == 1 {
+            IpAddr::V4(Ipv4Addr::from(<[u8;4]>::try_from(data).ok()?))
+        } else { IpAddr::V6(Ipv6Addr::from(<[u8;16]>::try_from(data).ok()?)) };
+        addresses.push(ip);
         offsets.push((cursor+4,ttl));
         lifetime = lifetime.min(ttl);
         cursor += 10+rdlen;
     }
     if cursor != packet.len() || lifetime == 0 { return None; }
-    Some(Entry { packet: packet.to_vec(), ttl_offsets: offsets, started, lifetime })
+    Some(Entry { packet: packet.to_vec(), ttl_offsets: offsets, addresses, started, lifetime })
 }
 
 fn ceil_seconds(duration: Duration) -> u64 {
     duration.as_secs().saturating_add(u64::from(duration.subsec_nanos() != 0))
+}
+
+/// Exact wire-derived candidate, not an authorized socket destination.
+/// Caller must supply already validated original request/response and approved
+/// policy snapshot. No CNAME, DNSSEC, EDNS, negative or extra records.
+pub(crate) fn address_candidate(query: &[u8], packet: &[u8], started: Instant,
+                                now: Instant) -> Option<(Vec<IpAddr>, Instant)> {
+    let e = make_entry(query, packet, started, 60)?;
+    if now < started || ceil_seconds(now.duration_since(started)) >= u64::from(e.lifetime) { return None; }
+    let expires = started.checked_add(Duration::from_secs(u64::from(e.lifetime)))?;
+    Some((e.addresses, expires))
 }
 
 #[derive(Default)]
@@ -187,6 +204,17 @@ mod tests {
         let mut r=response(&q,30); r[11]=1;
         assert!(make_entry(&q,&r,Instant::now(),30).is_none());
         assert!(make_entry(&q,&response(&q,0),Instant::now(),30).is_none());
+    }
+    #[test]
+    fn address_candidate_retains_exact_bytes_and_expiry() {
+        let q = query(); let t = Instant::now();
+        let r = response(&q, 3);
+        let (ips, expiry) = address_candidate(&q,&r,t,t+Duration::from_secs(1)).unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(192,0,2,1))]);
+        assert_eq!(expiry,t+Duration::from_secs(3));
+        assert!(address_candidate(&q,&r,t,t+Duration::from_secs(3)).is_none());
+        let mut wrong = q.clone(); wrong[1] = 2;
+        assert!(address_candidate(&wrong,&r,t,t).is_none());
     }
     #[test]
     fn http_freshness_narrowly_admitted() {

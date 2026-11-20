@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -60,12 +60,59 @@ pub fn parse_level(value: &str) -> Result<PrivacyLevel, String> {
 pub struct ResolverControl(Arc<Resolver>);
 
 impl ResolverControl {
+    /// Original resolver candidate producer. Only an internal, trusted caller
+    /// may supply the DNS query. No IPC/HTTP route exposes this method. The
+    /// caller still needs explicit destination admission and egress confinement.
+    #[allow(dead_code)]
+    pub(crate) async fn direct_address_candidate(&self, raw: &[u8]) -> Result<AddressCandidate, String> {
+        let r = &self.0;
+        let _permit = r.admission.try_acquire().map_err(|_| "DNS resolver busy")?;
+        let req = Resolver::checked_request(raw)?;
+        let snapshot = *r.policy.read();
+        if dns_positive_cache::key(raw, snapshot.generation).is_none() {
+            return Err("Unsupported direct-address query".into());
+        }
+        let hostname = req.queries()[0].name().to_ascii();
+        if r.is_blocked(&hostname) { return Err("Blocked destination".into()); }
+        // No cache or fallback in this narrower candidate lane.
+        let reply = r.doh(PRIMARY, raw).await?;
+        Resolver::checked_response(&req, &reply.bytes)?;
+        let now = Instant::now();
+        let (addresses, expires) = dns_positive_cache::address_candidate(raw,&reply.bytes,reply.started,now)
+            .ok_or("Unsupported direct-address response")?;
+        r.check_policy(snapshot)?;
+        Ok(AddressCandidate { hostname, policy: snapshot, addresses, expires })
+    }
+
     pub fn set_level(&self, value: &str) -> Result<(), String> {
         let mut policy = self.0.policy.write();
         let previous = *policy;
         policy.change(parse_level(value)?)?;
         if *policy != previous { self.0.cache.lock().clear(); }
         Ok(())
+    }
+}
+
+/// Private candidate provenance. Not a socket capability and not serialized.
+#[allow(dead_code)]
+pub(crate) struct AddressCandidate {
+    hostname: String,
+    policy: Policy,
+    addresses: Vec<IpAddr>,
+    expires: Instant,
+}
+
+impl AddressCandidate {
+    /// Revalidate same configured host, exact independently approved IP and
+    /// policy generation. This only constructs a socket address, never dials.
+    #[allow(dead_code)]
+    pub(crate) fn scoped_destination(&self, control: &ResolverControl,
+        host: &str, approved: IpAddr, now: Instant) -> Result<SocketAddr, String> {
+        if host != self.hostname || !self.addresses.contains(&approved) || now >= self.expires {
+            return Err("Address candidate outside scope or expired".into());
+        }
+        control.0.check_policy(self.policy)?;
+        Ok(SocketAddr::new(approved, 443))
     }
 }
 
@@ -471,6 +518,21 @@ mod tests {
         assert!(!fixture_http_admitted(&h,&uri,1234));
         h.insert(header::HOST,HeaderValue::from_static("attacker.test:1234"));
         assert!(!fixture_http_admitted(&h,&uri,1234));
+    }
+
+    #[test]
+    fn scoped_address_candidate_rejects_other_epoch_and_destination() {
+        let r = make_resolver(); let control = ResolverControl(r.clone());
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let t = Instant::now();
+        let candidate = AddressCandidate { hostname: "a.test.".into(),
+            policy: *r.policy.read(), addresses: vec![ip], expires: t + Duration::from_secs(3) };
+        assert_eq!(candidate.scoped_destination(&control,"a.test.",ip,t).unwrap(), SocketAddr::new(ip,443));
+        assert!(candidate.scoped_destination(&control,"b.test.",ip,t).is_err());
+        assert!(candidate.scoped_destination(&control,"a.test.","127.0.0.1".parse().unwrap(),t).is_err());
+        assert!(candidate.scoped_destination(&control,"a.test.",ip,t+Duration::from_secs(3)).is_err());
+        control.set_level("maximum").unwrap(); control.set_level("strict").unwrap();
+        assert!(candidate.scoped_destination(&control,"a.test.",ip,t).is_err());
     }
 
     #[test]
