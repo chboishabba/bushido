@@ -179,3 +179,7 @@ Create an unwhitelisted tab with adblock enabled, then turn adblock off and relo
 ## Linux cosmetic IPC
 
 Exercise the dedicated channel with valid class/ID batches, invalid JSON, oversized messages, whitelisted pages and generic-hide exceptions. Verify unrelated messages cannot enter ordinary Tauri dispatch. Confirm subsequent DOM mutations and first-load timing on WebKitGTK; no runtime acceptance yet.
+
+## Cosmetic batch acceptance
+
+Exercise more than 256 distinct DOM classes/IDs, escaped Unicode/control characters, a late bridge, and stale URL messages. Batches must fit the native receipt limits and eventually drain when the channel is available. URL equality is not a frame-authentication mechanism.

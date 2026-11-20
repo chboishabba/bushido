@@ -267,3 +267,7 @@ No UI framework rewrite, engine replacement without evidence, simulated network 
 ## P2.2 dedicated Linux cosmetic IPC (source implemented)
 
 - Register a separate WebKit `bushidoCosmetic` channel for ordinary tabs, without remote Tauri capabilities. Scope Wry's standard handler to `ipc` only. Reuse the original Rust selector engine with current URL exceptions, generic-hide policy, whitelist and adblock preference. Bound probe size, token counts and rate. Windows retains its original message transport. Registration occurs after view creation; initial-probe timing, frame provenance, native compilation and dynamic release preferences remain open.
+
+## P2.2 cosmetic transport batching
+
+Bound observer tracking to 16,384 distinct tokens per kind per document, send at most 64 classes and 64 IDs per batch, bound serialized UTF-8 size, drain batches at the existing 500 ms cadence, and retain pending tokens when the bridge is not available. Linux receiver rejects inconsistent document URLs (not authenticated frame provenance). Native runtime acceptance remains open.

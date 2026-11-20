@@ -1104,7 +1104,7 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
         webview.with_webview(move |platform| {
             let view = platform.inner();
             let Some(manager) = view.user_content_manager() else { return; };
-            let weak_view = webkit2gtk::glib::ObjectExt::downgrade(&view);
+            let weak_view = webkit2gtk::glib::ObjectExt::downgrade(view);
             let last_probe = std::cell::Cell::new(None::<std::time::Instant>);
             manager.connect_script_message_received(Some("bushidoCosmetic"), move |_, message| {
                 let Some(view) = weak_view.upgrade() else { return; };
@@ -1129,6 +1129,9 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 if raw.len() > 32768 { return; }
                 let Ok(probe) = serde_json::from_str::<serde_json::Value>(&raw) else { return; };
                 if probe.get("__bushido").and_then(|v| v.as_str()) != Some("cosmetic-probe") { return; }
+                // Reject delayed messages from a previous URL. This is a consistency
+                // check, not authentication of the sending frame.
+                if probe.get("url").and_then(|v| v.as_str()) != Some(uri.as_str()) { return; }
                 let tokens = |key: &str| -> Vec<String> {
                     probe.get(key).and_then(|v| v.as_array()).into_iter().flatten()
                         .take(256).filter_map(|v| v.as_str())
