@@ -434,6 +434,46 @@ fn install_linux_shortcuts(app: &tauri::AppHandle, webview: &tauri::Webview) -> 
     }).map_err(|e| e.to_string())
 }
 
+// Glance is a browser action, not a remote-page IPC capability.
+// Use WebKit's link hit-test and a user-selected native menu action.
+#[cfg(target_os = "linux")]
+fn install_linux_glance_menu(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str) -> Result<(), String> {
+    let handle = app.clone();
+    let source_id = id.to_owned();
+    webview.with_webview(move |platform| {
+        use gtk::prelude::*;
+        use webkit2gtk::{ContextMenuExt, ContextMenuItem, HitTestResultExt, WebViewExt};
+        let view = platform.inner();
+        view.connect_context_menu(move |view, menu, _, hit| {
+            let Some(link) = hit.link_uri() else { return false; };
+            let Ok(target) = url::Url::parse(link.as_str()) else { return false; };
+            if !matches!(target.scheme(), "http" | "https")
+                || target.host_str().is_none()
+                || !target.username().is_empty() || target.password().is_some() {
+                return false;
+            }
+            let Some(source) = view.uri() else { return false; };
+            let Ok(source_url) = url::Url::parse(source.as_str()) else { return false; };
+            if !matches!(source_url.scheme(), "http" | "https") { return false; }
+            let action = gtk::gio::SimpleAction::new("bushido-open-glance", None);
+            let weak_view = view.downgrade();
+            let app = handle.clone();
+            let id = source_id.clone();
+            action.connect_activate(move |_, _| {
+                let Some(view) = weak_view.upgrade() else { return; };
+                if view.uri().as_ref() != Some(&source) { return; }
+                if !app.state::<WebviewState>().tabs.lock().contains_key(&id) { return; }
+                let _ = app.emit_to("main", "glance-request", serde_json::json!({
+                    "url": target.as_str(), "sourceTabId": id
+                }));
+            });
+            let item = ContextMenuItem::from_gaction(&action, "Open in Glance", None);
+            menu.append(&item);
+            false // retain the normal WebKit menu
+        });
+    }).map_err(|e| e.to_string())
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod linux_shortcut_tests {
     use super::*;
@@ -1083,6 +1123,7 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 #[cfg(debug_assertions)]
                 { let _ = wv.eval(&inject_fp_verify); }
                 let _ = wv.eval(&inject_vault);
+                #[cfg(not(target_os = "linux"))]
                 let _ = wv.eval(&inject_glance);
                 let _ = wv.eval(&inject_preload);
                 let active_host_whitelisted = wv.url().ok()
@@ -1144,7 +1185,8 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     // fingerprint_verify.js is injected ONLY via on_page_load (not initialization_script)
     // because window.chrome.webview may not be available at initialization_script time
     builder = builder.initialization_script(&vault_script);
-    builder = builder.initialization_script(&glance_script);
+    #[cfg(not(target_os = "linux"))]
+    { builder = builder.initialization_script(&glance_script); }
     builder = builder.initialization_script(&bs.preload_script);
 
     // WebRTC ICE/STUN restriction in content_blocker.js is transport-level
@@ -1182,6 +1224,11 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     #[cfg(target_os = "linux")]
     if let Err(e) = install_linux_shortcuts(&app, &webview) {
         crash_log::log_error("linux-shortcuts", &e);
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Err(e) = install_linux_glance_menu(&app, &webview, &id) {
+        crash_log::log_error("linux-glance", &e);
     }
 
     // Linux remote documents must not receive general Tauri command access.
@@ -2583,7 +2630,8 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
     builder = builder.initialization_script(&media_s);
     builder = builder.initialization_script(&fingerprint_s);
     builder = builder.initialization_script(&vault_s);
-    builder = builder.initialization_script(&glance_s);
+    #[cfg(not(target_os = "linux"))]
+    { builder = builder.initialization_script(&glance_s); }
 
     let _webview = match window.add_child(
         builder,

@@ -294,3 +294,8 @@ Bound observer tracking to 16,384 distinct tokens per kind per document, send at
 
 - Linux find-in-page now returns a bounded count directly from the WebKit JavaScript evaluation callback, using a five-second timeout and typed result. No new remote message handler. The existing search behavior (`window.find`) and visible-text substring estimate are retained; the count is not necessarily identical to actual find results across frames, Unicode, or hidden DOM.
 - FindBar correlates replies to its initiating request, ignores obsolete queries/tab switches, and clears old counts. Windows keeps its result-event path with request correlation. Native WebKit runtime and exact match/index parity remain open.
+
+## P4 Linux Glance entry point (source implemented)
+
+- Add a WebKit native link context-menu item `Open in Glance` for ordinary browser views. The browser derives its target from the native hit test, restricts it to HTTP(S) without URL credentials, requires native menu action activation, and rechecks the originating view URI and live tab registration. Emits the existing `glance-request` event with native tab ID; existing workspace/filter construction is reused.
+- Do not inject the Windows-only Glance click interceptor on Linux, which previously consumed link clicks before trying unavailable WebView2 IPC. Linux Alt-click, pinned-tab previews, promotion-specific handlers and actual native context-menu/runtime acceptance remain OPEN. Context-menu entry is a deliberate alternative rather than exact input parity.

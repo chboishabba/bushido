@@ -199,3 +199,7 @@ Exercise initial/lazy video, removal, background tabs, active-tab switches and n
 ## Linux FindBar acceptance
 
 Search text, quoted/escaped strings and absent terms; test forward/backward and query clearing; issue rapid different queries and switch tabs while a result is outstanding. Linux callback returns the count to the initiating trusted command; do not accept unsolicited page messages as Linux search results. Count is a bounded visible-text estimate, not an exact native find-controller count. Validate runtime on WebKitGTK and Windows.
+
+## Linux Glance link context menu
+
+Right-click an HTTP(S) anchor in an ordinary tab and select Open in Glance. Verify the existing preview opens in the originating workspace and follows the existing filter policy. Check non-link menu, disallowed schemes and URL credentials, stale menu after navigation, closed source tab, normal Alt-click behavior without the Windows interceptor, and synthetic JavaScript messages. Native shortcut/pinned-tab automatic preview parity is still OPEN. No runtime acceptance yet.
