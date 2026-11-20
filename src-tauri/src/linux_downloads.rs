@@ -10,6 +10,7 @@ struct Transfer {
     cancelled: bool,
     // Only remove a path inside the private directory we created.
     owned_dir: Option<PathBuf>,
+    chooser: Option<gtk::FileChooserNative>,
 }
 thread_local! {
     static ACTIVE: RefCell<HashMap<String, Transfer>> = RefCell::new(HashMap::new());
@@ -27,10 +28,12 @@ fn safe_filename(name: &str) -> String {
     if clean.is_empty() || clean == "." || clean == ".." { "download".into() } else { clean }
 }
 
-fn destination(app: &AppHandle, id: &str, name: &str, mime: &str) -> Result<(PathBuf, PathBuf), String> {
-    use std::os::unix::fs::DirBuilderExt;
-    let settings = std::fs::read_to_string(super::settings_path(app)).ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).unwrap_or_default();
+fn download_settings(app: &AppHandle) -> serde_json::Value {
+    std::fs::read_to_string(super::settings_path(app)).ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).unwrap_or_default()
+}
+
+fn configured_root(settings: &serde_json::Value, mime: &str) -> Result<PathBuf, String> {
     let mut root = settings.get("downloadLocation").and_then(|v| v.as_str())
         .filter(|s| !s.is_empty()).map(PathBuf::from)
         .or_else(dirs::download_dir).ok_or("No download directory configured")?;
@@ -46,6 +49,23 @@ fn destination(app: &AppHandle, id: &str, name: &str, mime: &str) -> Result<(Pat
             }
         }
     }
+    Ok(root)
+}
+
+fn selected_target(path: &Path) -> Result<(PathBuf, String), String> {
+    let root = path.parent().filter(|p| p.is_absolute())
+        .ok_or("Choose an absolute local destination")?;
+    let name = path.file_name().and_then(|n| n.to_str())
+        .ok_or("Choose a valid UTF-8 filename")?;
+    // Do not silently rewrite an explicit user choice.
+    if safe_filename(name) != name {
+        return Err("Choose a filename of at most 200 UTF-8 bytes without control characters or separators".into());
+    }
+    Ok((root.to_owned(), name.to_owned()))
+}
+
+fn destination(root: &Path, id: &str, name: &str) -> Result<(PathBuf, PathBuf), String> {
+    use std::os::unix::fs::DirBuilderExt;
     if !root.is_absolute() { return Err("Download directory must be absolute".into()); }
     // The existing UI/backend path contract uses UTF-8 strings.
     if root.to_str().is_none() { return Err("Download directory is not valid UTF-8".into()); }
@@ -98,6 +118,99 @@ fn publish(app: &AppHandle, id: &str, event: &str, update: impl FnOnce(&mut DlIt
     if let Some(item) = snapshot { let _ = app.emit_to("main", event, item); }
 }
 
+fn may_stage(id: &str) -> bool {
+    ACTIVE.with(|active| active.borrow().get(id)
+        .is_some_and(|entry| !entry.cancelled && entry.owned_dir.is_none() && entry.chooser.is_none()))
+}
+
+fn fail_destination(app: &AppHandle, id: &str, download: &Download, error: String) {
+    publish(app, id, "download-failed", |item| {
+        item.state = DlState::Failed; item.error = Some(error); item.speed = 0;
+    });
+    download.cancel();
+}
+
+fn commit_destination(app: &AppHandle, id: &str, download: &Download, root: &Path, name: &str) {
+    if !may_stage(id) { return; }
+    let result = destination(root, id, name).and_then(|(dir, file)| {
+        let uri = match url::Url::from_file_path(&file) {
+            Ok(uri) => uri,
+            Err(_) => {
+                let _ = std::fs::remove_dir(&dir);
+                return Err("Invalid destination URI".to_owned());
+            }
+        };
+        ACTIVE.with(|active| {
+            if let Some(entry) = active.borrow_mut().get_mut(id) { entry.owned_dir = Some(dir); }
+        });
+        publish(app, id, "download-progress", |item| {
+            item.file_path = file.to_string_lossy().into_owned();
+            item.file_name = name.to_owned();
+        });
+        download.set_allow_overwrite(false);
+        download.set_destination(uri.as_str());
+        Ok(())
+    });
+    if let Err(error) = result { fail_destination(app, id, download, error); }
+}
+
+fn supports_deferred_destination(major: u32, minor: u32) -> bool {
+    major > 2 || (major == 2 && minor >= 40)
+}
+
+fn ask_destination(app: &AppHandle, id: &str, download: &Download, root: Option<&Path>, name: &str) {
+    // The decide-destination signal only supports asynchronous handling
+    // since WebKitGTK 2.40. These version functions are available on older builds.
+    let supported = unsafe { supports_deferred_destination(
+        webkit2gtk::ffi::webkit_get_major_version(), webkit2gtk::ffi::webkit_get_minor_version()) };
+    if !supported {
+        fail_destination(app, id, download, "Ask download location requires WebKitGTK 2.40 or newer".into());
+        return;
+    }
+    let parent = download.web_view().and_then(|view| view.toplevel())
+        .and_then(|widget| widget.downcast::<gtk::Window>().ok());
+    let chooser = gtk::FileChooserNative::new(
+        Some("Save download (existing names are kept)"), parent.as_ref(),
+        gtk::FileChooserAction::Save, Some("Save"), Some("Cancel"));
+    chooser.set_modal(true);
+    chooser.set_local_only(true);
+    chooser.set_do_overwrite_confirmation(false);
+    chooser.set_current_name(name);
+    if let Some(root) = root.filter(|p| p.is_absolute() && p.is_dir()) {
+        let _ = chooser.set_current_folder(root);
+    }
+    let handle = app.clone();
+    let transfer_id = id.to_owned();
+    chooser.connect_response(move |dialog, response| {
+        // Consume the matching live dialog exactly once; no references to
+        // the WebKit transfer or dialog are held by this callback itself.
+        let download = ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            let entry = active.get_mut(&transfer_id)?;
+            if entry.cancelled || entry.chooser.as_ref() != Some(dialog) { return None; }
+            entry.chooser.take();
+            if response != gtk::ResponseType::Accept { entry.cancelled = true; }
+            Some(entry.download.clone())
+        });
+        let Some(download) = download else { return; };
+        if response != gtk::ResponseType::Accept {
+            download.cancel();
+            return;
+        }
+        let result = dialog.filename().ok_or("No local destination selected".to_owned())
+            .and_then(|path| selected_target(&path));
+        match result {
+            Ok((root, name)) => commit_destination(&handle, &transfer_id, &download, &root, &name),
+            Err(error) => fail_destination(&handle, &transfer_id, &download, error),
+        }
+    });
+    // Hold the dialog alive until response, cancellation or terminal finish.
+    ACTIVE.with(|active| {
+        if let Some(entry) = active.borrow_mut().get_mut(id) { entry.chooser = Some(chooser.clone()); }
+    });
+    chooser.show();
+}
+
 fn start(app: &AppHandle, download: &Download) {
     let id = uuid::Uuid::new_v4().to_string();
     let url = download.request().and_then(|r| r.uri())
@@ -111,7 +224,7 @@ fn start(app: &AppHandle, download: &Download) {
         supports_range: false, native: true, segments: 0, priority: 0,
     };
     app.state::<DownloadManager>().downloads.lock().insert(id.clone(), item.clone());
-    ACTIVE.with(|active| active.borrow_mut().insert(id.clone(), Transfer { download: download.clone(), cancelled: false, owned_dir: None }));
+    ACTIVE.with(|active| active.borrow_mut().insert(id.clone(), Transfer { download: download.clone(), cancelled: false, owned_dir: None, chooser: None }));
     let _ = app.emit_to("main", "download-started", item);
 
     let handle = app.clone();
@@ -119,36 +232,23 @@ fn start(app: &AppHandle, download: &Download) {
     download.connect_decide_destination(move |download, suggested| {
         let mime = download.response().and_then(|r| r.mime_type()).map(|s| s.to_string()).unwrap_or_default();
         let total = download.response().and_then(|r| u64::try_from(r.content_length()).ok()).filter(|n| *n > 0);
-        // Never create a destination after cancellation or terminal removal.
-        let may_stage = ACTIVE.with(|active| active.borrow().get(&transfer_id)
-            .is_some_and(|entry| !entry.cancelled && entry.owned_dir.is_none()));
-        if !may_stage { download.cancel(); return true; }
-        let result = destination(&handle, &transfer_id, suggested, &mime).and_then(|(dir, file)| {
-            let uri = match url::Url::from_file_path(&file) {
-                Ok(uri) => uri,
-                Err(_) => {
-                    let _ = std::fs::remove_dir(&dir);
-                    return Err("Invalid destination URI".to_owned());
-                }
-            };
-            ACTIVE.with(|active| {
-                if let Some(entry) = active.borrow_mut().get_mut(&transfer_id) { entry.owned_dir = Some(dir); }
-            });
-            publish(&handle, &transfer_id, "download-progress", |item| {
-                item.file_path = file.to_string_lossy().into_owned();
-                item.file_name = safe_filename(suggested);
-                item.mime_type = mime;
-                item.total_bytes = total;
-            });
-            download.set_allow_overwrite(false);
-            download.set_destination(uri.as_str());
-            Ok(())
+        // Ignore duplicate destination signals, including pending dialogs.
+        if !may_stage(&transfer_id) { return true; }
+        let settings = download_settings(&handle);
+        let name = safe_filename(suggested);
+        let root = configured_root(&settings, &mime);
+        publish(&handle, &transfer_id, "download-progress", |item| {
+            item.file_name = name.clone();
+            item.mime_type = mime;
+            item.total_bytes = total;
         });
-        if let Err(error) = result {
-            publish(&handle, &transfer_id, "download-failed", |item| {
-                item.state = DlState::Failed; item.error = Some(error);
-            });
-            download.cancel();
+        if settings.get("askDownloadLocation").and_then(|v| v.as_bool()) == Some(true) {
+            ask_destination(&handle, &transfer_id, download, root.as_deref().ok(), &name);
+        } else {
+            match root {
+                Ok(root) => commit_destination(&handle, &transfer_id, download, &root, &name),
+                Err(error) => fail_destination(&handle, &transfer_id, download, error),
+            }
         }
         true
     });
@@ -180,6 +280,7 @@ fn start(app: &AppHandle, download: &Download) {
     download.connect_finished(move |download| {
         let entry = ACTIVE.with(|active| active.borrow_mut().remove(&id));
         let Some(entry) = entry else { return; };
+        if let Some(chooser) = entry.chooser.as_ref() { chooser.hide(); }
         let dm = handle.state::<DownloadManager>();
         // A cancel request can race with a successful finish. Success must
         // take precedence over the intent flag, or we could delete a file
@@ -262,10 +363,14 @@ pub async fn cancel(app: &AppHandle, id: String) -> Result<(), String> {
     app.run_on_main_thread(move || {
         let download = ACTIVE.with(|active| {
             let mut active = active.borrow_mut();
-            active.get_mut(&id).map(|entry| { entry.cancelled = true; entry.download.clone() })
+            active.get_mut(&id).map(|entry| {
+                entry.cancelled = true;
+                (entry.download.clone(), entry.chooser.take())
+            })
         });
-        if let Some(download) = download {
+        if let Some((download, chooser)) = download {
             // Never hold a RefCell borrow across a native signal emission.
+            if let Some(chooser) = chooser { chooser.hide(); }
             download.cancel();
         } else {
             let dm = handle.state::<DownloadManager>();
@@ -343,6 +448,26 @@ mod tests {
         let (owned, staged) = root.stage("private", "report", b"retain");
         assert!(publish_completed_file(&staged, &root.0.join("wrong")).is_err());
         assert_eq!(std::fs::read(&staged).unwrap(), b"retain");
+    }
+
+    #[test]
+    fn deferred_destination_version_boundary() {
+        assert!(!supports_deferred_destination(2, 38));
+        assert!(!supports_deferred_destination(2, 39));
+        assert!(supports_deferred_destination(2, 40));
+        assert!(supports_deferred_destination(2, 48));
+        assert!(supports_deferred_destination(3, 0));
+    }
+
+    #[test]
+    fn explicit_selected_target_is_not_silently_rewritten() {
+        assert_eq!(selected_target(Path::new("/tmp/my selected.txt")).unwrap(),
+            (PathBuf::from("/tmp"), "my selected.txt".into()));
+        assert!(selected_target(Path::new("relative.txt")).is_err());
+        assert!(selected_target(Path::new("/")).is_err());
+        assert!(selected_target(Path::new("/tmp/a\\b")).is_err());
+        assert!(selected_target(Path::new("/tmp/a\nb")).is_err());
+        assert!(selected_target(&PathBuf::from(format!("/tmp/{}", "界".repeat(100)))).is_err());
     }
 
     #[test]
