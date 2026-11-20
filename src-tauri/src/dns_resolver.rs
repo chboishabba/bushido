@@ -76,9 +76,19 @@ impl ResolverControl {
         if r.is_blocked(&hostname) { return Err("Blocked destination".into()); }
         // No cache or fallback in this narrower candidate lane.
         let reply = r.doh(PRIMARY, raw).await?;
-        Resolver::checked_response(&req, &reply.bytes)?;
-        let now = Instant::now();
-        let (addresses, expires) = dns_positive_cache::address_candidate(raw,&reply.bytes,reply.started,now)
+        self.candidate_from_wire(raw, &reply.bytes, snapshot, reply.started, Instant::now())
+    }
+
+    // Same constructor for the real primary response and the deterministic
+    // loopback acceptance witness. Private; no supplied response IPC.
+    fn candidate_from_wire(&self, raw: &[u8], response: &[u8], snapshot: Policy,
+                           started: Instant, now: Instant) -> Result<AddressCandidate, String> {
+        let r = &self.0;
+        let req = Resolver::checked_request(raw)?;
+        Resolver::checked_response(&req, response)?;
+        let hostname = req.queries()[0].name().to_ascii();
+        if r.is_blocked(&hostname) { return Err("Blocked destination".into()); }
+        let (addresses, expires) = dns_positive_cache::address_candidate(raw,response,started,now)
             .ok_or("Unsupported direct-address response")?;
         r.check_policy(snapshot)?;
         Ok(AddressCandidate { owner: Arc::downgrade(r), hostname, policy: snapshot, addresses, expires })

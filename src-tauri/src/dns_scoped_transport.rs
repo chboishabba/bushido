@@ -134,9 +134,38 @@ mod tests {
     use crate::dns_resolver::PrivacyLevel;
     use tokio::net::TcpListener;
 
+    fn fixture_wire(ip: IpAddr) -> (Vec<u8>,Vec<u8>) {
+        let IpAddr::V4(ip) = ip else { panic!("IPv4 fixture only") };
+        let mut query = vec![0,42,1,0,0,1,0,0,0,0,0,0,7];
+        query.extend_from_slice(b"fixture");
+        query.extend_from_slice(&[4]);
+        query.extend_from_slice(b"test");
+        query.extend_from_slice(&[0,0,1,0,1]);
+        let mut response = query.clone();
+        response[2]=0x81; response[3]=0x80; response[7]=1;
+        response.extend_from_slice(&[0xc0,0x0c,0,1,0,1,0,0,0,3,0,4]);
+        response.extend_from_slice(&ip.octets());
+        (query,response)
+    }
+
     fn candidate(control: &ResolverControl, ip: IpAddr, now: Instant) -> AddressCandidate {
-        AddressCandidate { owner:Arc::downgrade(&control.0), hostname:"fixture.test.".into(),
-            policy:*control.0.policy.read(), addresses:vec![ip], expires:now+Duration::from_secs(3) }
+        let (query,response)=fixture_wire(ip);
+        let snapshot=*control.0.policy.read();
+        control.candidate_from_wire(&query,&response,snapshot,now,now).unwrap()
+    }
+
+    #[test]
+    fn original_wire_constructor_rejects_mismatched_response() {
+        let control=control();
+        let now=Instant::now();
+        let (query,mut response)=fixture_wire("127.0.0.1".parse().unwrap());
+        let snapshot=*control.0.policy.read();
+        response[1]^=1;
+        assert!(control.candidate_from_wire(&query,&response,snapshot,now,now).is_err());
+        response[1]^=1;
+        assert!(control.candidate_from_wire(&query,&response,snapshot,now,now+Duration::from_secs(3)).is_err());
+        control.set_level("maximum").unwrap();
+        assert!(control.candidate_from_wire(&query,&response,snapshot,now,now).is_err());
     }
 
     fn control() -> ResolverControl {
@@ -171,7 +200,9 @@ mod tests {
             peer.read_exact(&mut data).await.unwrap();
             assert_eq!(&data,b"pong");
         };
-        let (receipt,_,_)=tokio::join!(lease.relay(client),server,browser);
+        let (receipt,_,_)=tokio::time::timeout(Duration::from_secs(5),async {
+            tokio::join!(lease.relay(client),server,browser)
+        }).await.expect("bounded loopback fixture");
         assert_eq!(receipt.unwrap(),(4,4));
     }
 
@@ -187,7 +218,9 @@ mod tests {
             control.set_level("maximum").unwrap();
             control.set_level("strict").unwrap();
         };
-        let (result,_)=tokio::join!(lease.guarded(std::future::pending::<()>()),revocation);
+        let (result,_)=tokio::time::timeout(Duration::from_secs(1),async {
+            tokio::join!(lease.guarded(std::future::pending::<()>()),revocation)
+        }).await.expect("policy notification must wake pending operation before TTL");
         assert!(result.is_err());
         assert!(lease.connect().await.is_err());
     }
