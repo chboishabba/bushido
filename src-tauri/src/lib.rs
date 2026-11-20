@@ -4179,6 +4179,9 @@ fn binary_updater_enabled() -> bool {
 struct ExternalActivation { url: Option<String> }
 
 #[tauri::command]
+fn external_activation_enabled() -> bool { cfg!(target_os = "linux") }
+
+#[tauri::command]
 fn take_external_activation(app: tauri::AppHandle, webview: tauri::Webview) -> Result<Option<ExternalActivation>, String> {
     // Child remote documents share the main window, but not its webview label.
     if webview.label() != "main" { return Err("Trusted browser chrome required".into()); }
@@ -4620,6 +4623,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             binary_updater_enabled,
+            external_activation_enabled,
             take_external_activation,
             create_tab,
             suspend_tab,

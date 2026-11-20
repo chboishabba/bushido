@@ -45,6 +45,14 @@ fn validate(raw: &str) -> Result<String, &'static str> {
     if raw.is_empty() || raw.len() > MAX_URL || raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err("Invalid external URL length or characters");
     }
+    // Reject shorthand and browser backslash repair at the external
+    // protocol boundary; require an explicit authority-bearing URL.
+    let (scheme, authority_and_rest) = raw.split_once("://").ok_or("Explicit HTTP(S) URL required")?;
+    let authority = authority_and_rest.split(['/', '?', '#']).next().unwrap_or("");
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        || authority.is_empty() || authority.contains('@') || raw.contains('\\') {
+        return Err("Invalid external URL authority");
+    }
     let parsed = url::Url::parse(raw).map_err(|_| "Invalid external URL")?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none()
         || !parsed.username().is_empty() || parsed.password().is_some() {
@@ -57,14 +65,21 @@ fn validate(raw: &str) -> Result<String, &'static str> {
 
 fn validate_batch(raw: Vec<String>) -> Result<Vec<String>, &'static str> {
     if raw.len() > MAX_URLS { return Err("Too many external URLs"); }
-    raw.iter().map(|url| validate(url)).collect()
+    let urls = raw.iter().map(|url| validate(url)).collect::<Result<Vec<_>, _>>()?;
+    if serde_json::to_vec(&urls).map_err(|_| "Cannot encode activation")?.len() > MAX_FRAME {
+        return Err("External activation frame too large");
+    }
+    Ok(urls)
 }
 
 fn arguments() -> Result<Vec<String>, &'static str> {
     let mut args = std::env::args_os().skip(1).peekable();
     if args.peek().is_some_and(|s| s == "--") { args.next(); }
-    let raw = args.map(|s| s.into_string().map_err(|_| "Invalid external argument"))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut raw = Vec::new();
+    for arg in args {
+        if raw.len() >= MAX_URLS { return Err("Too many external URLs"); }
+        raw.push(arg.into_string().map_err(|_| "Invalid external argument")?);
+    }
     validate_batch(raw)
 }
 
@@ -183,6 +198,11 @@ pub(crate) fn enter(root: &Path) -> Result<Option<Instance>, &'static str> {
     }
     let listener = UnixListener::bind(&socket).map_err(|_| "Cannot bind private activation socket (path length or permissions)")?;
     let instance = Instance { _lock: lock, socket, queue: ActivationQueue::default() };
+    // Private parent and peer UID already bound access; tighten the socket
+    // inode too, without changing the process-global umask.
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&instance.socket, fs::Permissions::from_mode(0o600))
+        .map_err(|_| "Cannot restrict activation socket permissions")?;
     if !urls.is_empty() { instance.queue.enqueue(urls)?; }
     let queue = instance.queue.clone();
     thread::Builder::new().name("bushido-activation".into()).spawn(move || serve(listener, queue))
@@ -197,7 +217,9 @@ mod tests {
     fn external_urls_are_bounded_and_never_privileged() {
         assert_eq!(validate("https://example.test/a?q=1").unwrap(), "https://example.test/a?q=1");
         for raw in ["--debug", "bushido://settings", "file:///tmp/a", "javascript:alert(1)",
-            "data:text/plain,x", "https://user:pass@example.test/", "https://example.test/\n", "https://example.test/a b"] {
+            "data:text/plain,x", "https://user:pass@example.test/", "https://@example.test/",
+            "https:example.test", "https:///example.test", "https://example.test\\a",
+            "https://example.test/\n", "https://example.test/a b"] {
             assert!(validate(raw).is_err(), "{raw}");
         }
         assert!(validate_batch(vec!["https://example.test/".into(); 9]).is_err());

@@ -1324,12 +1324,15 @@ export default function App() {
   }, [activeWorkspaceId, clearLoading, layoutOffset, topOffset]);
 
   // External activations are intent, not authority to choose a workspace.
-  // Wait for onboarding/session state, and ask in trusted browser chrome.
-  // Retain one in-flight poll across renders; no automatic navigation.
+  // A single poll survives ordinary same-workspace tab/list updates.
   const externalActivationBusy = useRef(false);
+  const externalAddTabRef = useRef(addTab);
+  externalAddTabRef.current = addTab;
+  const externalActivationReady = settings.onboardingComplete && !showOnboarding && !!activeWs;
   useEffect(() => {
-    if (!settings.onboardingComplete || showOnboarding || !activeWs) return;
+    if (!externalActivationReady) return;
     let disposed = false;
+    let timer: number | undefined;
     const poll = async () => {
       if (disposed || externalActivationBusy.current || glanceRef.current) return;
       const current = useTabStore.getState();
@@ -1351,17 +1354,20 @@ export default function App() {
           showError("External link cancelled because workspace changed. Open it again.");
           return;
         }
-        addTab(activation.url);
+        externalAddTabRef.current(activation.url);
       } catch {
         // Do not print activation URLs or request contents.
       } finally {
         externalActivationBusy.current = false;
       }
     };
-    const timer = window.setInterval(() => { void poll(); }, 1000);
-    void poll();
-    return () => { disposed = true; window.clearInterval(timer); };
-  }, [settings.onboardingComplete, showOnboarding, activeWs, activeWorkspaceId, addTab, showError]);
+    void invoke<boolean>("external_activation_enabled").then(enabled => {
+      if (!enabled || disposed) return;
+      timer = window.setInterval(() => { void poll(); }, 1000);
+      void poll();
+    }).catch(() => {});
+    return () => { disposed = true; if (timer !== undefined) window.clearInterval(timer); };
+  }, [externalActivationReady, activeWorkspaceId, showError]);
 
   const closeTab = useCallback((id: string) => {
     // if source tab of glance is being closed, close glance too
