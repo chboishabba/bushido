@@ -436,6 +436,90 @@ fn install_linux_shortcuts(app: &tauri::AppHandle, webview: &tauri::Webview) -> 
     }).map_err(|e| e.to_string())
 }
 
+#[cfg(target_os = "linux")]
+fn linux_glance_url(raw: &str) -> Option<url::Url> {
+    let target = url::Url::parse(raw).ok()?;
+    (matches!(target.scheme(), "http" | "https")
+        && target.host_str().is_some()
+        && target.username().is_empty() && target.password().is_none()).then_some(target)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_glance_alt_click(link_clicked: bool, user_gesture: bool, redirect: bool,
+    button: u32, modifiers: u32) -> bool {
+    use gtk::gdk::ModifierType as M;
+    let conflicting = (M::CONTROL_MASK | M::SHIFT_MASK | M::SUPER_MASK | M::META_MASK | M::HYPER_MASK).bits();
+    link_clicked && user_gesture && !redirect && button == 1
+        && modifiers & M::MOD1_MASK.bits() != 0 && modifiers & conflicting == 0
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_glance_input(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str) -> Result<(), String> {
+    let handle = app.clone();
+    let source_id = id.to_owned();
+    webview.with_webview(move |platform| {
+        use gtk::{glib::translate::ToGlibPtr, prelude::*};
+        use webkit2gtk::{ffi, WebViewExt};
+        let view = platform.inner();
+        wry::set_native_navigation_preview(&view, move |view, action, raw_target| {
+            if !view.has_focus() || !handle.state::<WebviewState>().tabs.lock().contains_key(&source_id) {
+                return false;
+            }
+            // Read the native action metadata synchronously; never retain its pointer.
+            let ptr: *mut ffi::WebKitNavigationAction = action.to_glib_none().0;
+            let preview = unsafe {
+                linux_glance_alt_click(
+                    ffi::webkit_navigation_action_get_navigation_type(ptr) == ffi::WEBKIT_NAVIGATION_TYPE_LINK_CLICKED,
+                    ffi::webkit_navigation_action_is_user_gesture(ptr) != 0,
+                    ffi::webkit_navigation_action_is_redirect(ptr) != 0,
+                    ffi::webkit_navigation_action_get_mouse_button(ptr),
+                    ffi::webkit_navigation_action_get_modifiers(ptr),
+                )
+            };
+            if !preview { return false; }
+            let Some(target) = linux_glance_url(raw_target) else { return false; };
+            let Some(source) = view.uri().and_then(|uri| linux_glance_url(uri.as_str())) else { return false; };
+            // No ordinary source-tab navigation or URL/history mutation.
+            // Invalidate a previous source retry; the existing Glance
+            // constructor enforces its own destination policy.
+            #[cfg(all(target_os = "linux", debug_assertions))]
+            handle.state::<Arc<NativeFilterUpdateState>>().begin_navigation(&source_id);
+            handle.emit_to("main", "glance-request", serde_json::json!({
+                "url": target.as_str(), "sourceTabId": source_id, "sourceUrl": source.as_str()
+            })).is_ok()
+        });
+    }).map_err(|e| e.to_string())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_glance_input_tests {
+    use super::*;
+    use gtk::gdk::ModifierType as M;
+    #[test]
+    fn only_direct_alt_left_link_gestures_preview() {
+        let alt = M::MOD1_MASK.bits();
+        assert!(linux_glance_alt_click(true, true, false, 1, alt));
+        assert!(linux_glance_alt_click(true, true, false, 1, alt | M::LOCK_MASK.bits()));
+        for (link, gesture, redirect, button, mods) in [
+            (false, true, false, 1, alt), (true, false, false, 1, alt),
+            (true, true, true, 1, alt), (true, true, false, 0, alt),
+            (true, true, false, 2, alt), (true, true, false, 1, 0),
+            (true, true, false, 1, alt | M::CONTROL_MASK.bits()),
+            (true, true, false, 1, alt | M::SHIFT_MASK.bits()),
+            (true, true, false, 1, alt | M::SUPER_MASK.bits()),
+        ] { assert!(!linux_glance_alt_click(link, gesture, redirect, button, mods)); }
+    }
+    #[test]
+    fn preview_url_requires_http_host_and_no_credentials() {
+        assert!(linux_glance_url("https://example.org/path").is_some());
+        assert!(linux_glance_url("http://localhost:8080/").is_some());
+        for raw in ["javascript:alert(1)", "file:///etc/passwd", "data:text/plain,a",
+            "https://user@example.org/", "https://user:pass@example.org/", "/relative"] {
+            assert!(linux_glance_url(raw).is_none());
+        }
+    }
+}
+
 // Glance is a browser action, not a remote-page IPC capability.
 // Use WebKit's link hit-test and a user-selected native menu action.
 #[cfg(target_os = "linux")]
@@ -448,15 +532,9 @@ fn install_linux_glance_menu(app: &tauri::AppHandle, webview: &tauri::Webview, i
         let view = platform.inner();
         view.connect_context_menu(move |view, menu, _, hit| {
             let Some(link) = hit.link_uri() else { return false; };
-            let Ok(target) = url::Url::parse(link.as_str()) else { return false; };
-            if !matches!(target.scheme(), "http" | "https")
-                || target.host_str().is_none()
-                || !target.username().is_empty() || target.password().is_some() {
-                return false;
-            }
+            let Some(target) = linux_glance_url(link.as_str()) else { return false; };
             let Some(source) = view.uri() else { return false; };
-            let Ok(source_url) = url::Url::parse(source.as_str()) else { return false; };
-            if !matches!(source_url.scheme(), "http" | "https") { return false; }
+            if linux_glance_url(source.as_str()).is_none() { return false; }
             let action = gtk::gio::SimpleAction::new("bushido-open-glance", None);
             let weak_view = view.downgrade();
             let app = handle.clone();
@@ -1231,6 +1309,11 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     #[cfg(target_os = "linux")]
     if let Err(e) = install_linux_glance_menu(&app, &webview, &id) {
         crash_log::log_error("linux-glance", &e);
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Err(e) = install_linux_glance_input(&app, &webview, &id) {
+        crash_log::log_error("linux-glance-input", &e);
     }
 
     #[cfg(target_os = "linux")]

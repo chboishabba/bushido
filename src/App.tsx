@@ -906,25 +906,35 @@ export default function App() {
       }),
       // vault save prompt from autofill script
       // glance: ephemeral link preview
-      listen<{ url: string; sourceTabId: string }>("glance-request", (e) => {
-        if (glanceRef.current) return; // already showing a glance
-        const glanceId = `glance-${Date.now()}`;
-        const g = { id: glanceId, url: e.payload.url, title: e.payload.url, sourceTabId: e.payload.sourceTabId };
+      listen<{ url: string; sourceTabId: string; sourceUrl?: string }>("glance-request", (e) => {
+        if (glanceRef.current) return;
+        const state = useTabStore.getState();
+        const src = state.tabs.find(t => t.id === e.payload.sourceTabId);
+        // Never default to another workspace for a stale source.
+        if (!src?.workspaceId || src.suspended || src.workspaceId !== state.activeWorkspaceId) return;
+        if (e.payload.sourceUrl) {
+          try {
+            if (new URL(src.url).href !== new URL(e.payload.sourceUrl).href) return;
+          } catch { return; }
+        }
+        const glanceId = `glance-${crypto.randomUUID()}`;
+        const g = { id: glanceId, url: e.payload.url, title: e.payload.url, sourceTabId: src.id };
         glanceRef.current = g;
         setGlance(g);
-        setTabs(prev => {
-          const src = prev.find(t => t.id === e.payload.sourceTabId);
-          invoke("open_glance", {
-            url: e.payload.url, glanceId, sidebarW: layoutOffsetRef.current,
-            topOffset, profileName: src?.workspaceId,
-            adBlocker: settingsRef.current.adBlocker,
-          }).catch(error => {
-            console.warn("[bushido] Glance creation failed", error);
-            useUiStore.getState().showError("Unable to open Glance");
-            glanceRef.current = null;
-            setGlance(null);
-          });
-          return prev;
+        invoke("open_glance", {
+          url: e.payload.url, glanceId, sidebarW: layoutOffsetRef.current,
+          topOffset, profileName: src.workspaceId,
+          adBlocker: settingsRef.current.adBlocker,
+        }).then(() => {
+          if (glanceRef.current?.id !== glanceId && !useTabStore.getState().tabs.some(t => t.id === glanceId)) {
+            invoke("close_glance", { glanceId }).catch(e => console.warn("[bushido]", e));
+          }
+        }).catch(error => {
+          console.warn("[bushido] Glance creation failed", error);
+          if (glanceRef.current?.id !== glanceId) return;
+          useUiStore.getState().showError("Unable to open Glance");
+          glanceRef.current = null;
+          setGlance(null);
         });
         // hide tab webviews so overlay is visible
         invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffsetRef.current, topOffset });

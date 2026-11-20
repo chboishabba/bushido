@@ -35,7 +35,7 @@ use std::{
 #[cfg(any(debug_assertions, feature = "devtools"))]
 use webkit2gtk::WebInspectorExt;
 use webkit2gtk::{
-  AutoplayPolicy, CookieManagerExt, InputMethodContextExt, LoadEvent, NavigationPolicyDecision,
+  AutoplayPolicy, CookieManagerExt, InputMethodContextExt, LoadEvent, NavigationAction, NavigationPolicyDecision,
   NavigationPolicyDecisionExt, NetworkProxyMode, NetworkProxySettings, PermissionRequestExt,
   PolicyDecisionType,
   PrintOperationExt, SettingsExt, URIRequest, URIRequestExt, UserContentInjectedFrames,
@@ -52,6 +52,35 @@ use webkit2gtk_sys::{
 use x11_dl::xlib::*;
 
 pub use web_context::WebContextImpl;
+
+// GTK-thread-only hooks keyed by the native view, not a reusable tab label.
+type NativeNavigationPreview = Rc<dyn Fn(&WebView, &NavigationAction, &str) -> bool>;
+thread_local! {
+  static NATIVE_NAVIGATION_PREVIEWS: std::cell::RefCell<HashMap<usize, NativeNavigationPreview>> =
+    std::cell::RefCell::new(HashMap::new());
+}
+
+/// Register a GTK-thread callback before Wry's ordinary navigation handler.
+/// Returning true consumes the navigation (WebKit policy ignore).
+pub fn set_native_navigation_preview(
+  view: &WebView,
+  callback: impl Fn(&WebView, &NavigationAction, &str) -> bool + 'static,
+) {
+  let key = view.as_ptr() as usize;
+  NATIVE_NAVIGATION_PREVIEWS.with(|hooks| {
+    hooks.borrow_mut().insert(key, Rc::new(callback));
+  });
+  view.connect_destroy(move |_| {
+    NATIVE_NAVIGATION_PREVIEWS.with(|hooks| { hooks.borrow_mut().remove(&key); });
+  });
+}
+
+fn consume_native_preview(view: &WebView, action: &NavigationAction, uri: &str) -> bool {
+  let key = view.as_ptr() as usize;
+  let hook = NATIVE_NAVIGATION_PREVIEWS.with(|hooks| hooks.borrow().get(&key).cloned());
+  // Release registry borrow before entering application code.
+  hook.is_some_and(|callback| callback(view, action, uri))
+}
 
 use crate::{
   proxy::ProxyConfig, web_context::WebContext, Error, NewWindowFeatures, NewWindowOpener,
@@ -643,7 +672,7 @@ impl InnerWebView {
 
     // Navigation handler
     if let Some(navigation_handler) = attributes.navigation_handler.take() {
-      webview.connect_decide_policy(move |_webview, policy_decision, policy_type| {
+      webview.connect_decide_policy(move |webview, policy_decision, policy_type| {
         let handler = match policy_type {
           PolicyDecisionType::NavigationAction => &navigation_handler,
           _ => return false,
@@ -653,6 +682,10 @@ impl InnerWebView {
           if let Some(nav_action) = policy.navigation_action() {
             if let Some(uri_req) = nav_action.request() {
               if let Some(uri) = uri_req.uri() {
+                if consume_native_preview(webview, &nav_action, uri.as_str()) {
+                  unsafe { webkit_policy_decision_ignore(policy_decision.as_ptr()); }
+                  return true;
+                }
                 let allow = handler(uri.to_string());
                 let pointer = policy_decision.as_ptr();
                 unsafe {

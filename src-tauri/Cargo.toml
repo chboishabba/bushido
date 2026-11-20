@@ -68,6 +68,7 @@ lz4_flex = "0.11"
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 gtk = "=0.18.2"
 javascriptcore-rs = "=1.1.2"
+wry = { version = "=0.54.1", default-features = false, features = ["os-webview"] }
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"
