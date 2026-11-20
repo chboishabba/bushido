@@ -17,7 +17,13 @@ thread_local! {
 
 fn safe_filename(name: &str) -> String {
     let basename = name.rsplit(['/', '\\']).next().unwrap_or("");
-    let clean: String = basename.chars().filter(|c| !c.is_control()).take(100).collect();
+    // Bound encoded filename size, not just character count; a Unicode
+    // scalar can occupy up to four bytes in a Linux pathname.
+    let mut clean = String::new();
+    for c in basename.chars().filter(|c| !c.is_control()) {
+        if clean.len() + c.len_utf8() > 200 { break; }
+        clean.push(c);
+    }
     if clean.is_empty() || clean == "." || clean == ".." { "download".into() } else { clean }
 }
 
@@ -79,7 +85,7 @@ fn start(app: &AppHandle, download: &Download) {
     let transfer_id = id.clone();
     download.connect_decide_destination(move |download, suggested| {
         let mime = download.response().and_then(|r| r.mime_type()).map(|s| s.to_string()).unwrap_or_default();
-        let total = download.response().map(|r| r.content_length()).filter(|n| *n > 0);
+        let total = download.response().and_then(|r| u64::try_from(r.content_length()).ok()).filter(|n| *n > 0);
         let result = destination(&handle, &transfer_id, suggested, &mime).and_then(|(dir, file)| {
             let uri = url::Url::from_file_path(&file).map_err(|_| "Invalid destination URI".to_owned())?;
             ACTIVE.with(|active| {
@@ -132,12 +138,9 @@ fn start(app: &AppHandle, download: &Download) {
         let entry = ACTIVE.with(|active| active.borrow_mut().remove(&id));
         let Some(entry) = entry else { return; };
         let dm = handle.state::<DownloadManager>();
-        if entry.cancelled {
-            dm.downloads.lock().remove(&id);
-            if let Some(dir) = entry.owned_dir { let _ = std::fs::remove_dir_all(dir); }
-            let _ = handle.emit_to("main", "download-cancelled", serde_json::json!({"id": id}));
-            return;
-        }
+        // A cancel request can race with a successful finish. Success must
+        // take precedence over the intent flag, or we could delete a file
+        // that WebKit finished before cancellation took effect.
         let completed = dm.downloads.lock().get(&id).is_some_and(|item|
             item.state == DlState::Downloading && !item.file_path.is_empty() && Path::new(&item.file_path).is_file());
         if completed {
@@ -145,6 +148,10 @@ fn start(app: &AppHandle, download: &Download) {
                 item.state = DlState::Completed; item.received_bytes = download.received_data_length();
                 item.total_bytes = Some(item.received_bytes); item.speed = 0;
             });
+        } else if entry.cancelled {
+            dm.downloads.lock().remove(&id);
+            if let Some(dir) = entry.owned_dir { let _ = std::fs::remove_dir_all(dir); }
+            let _ = handle.emit_to("main", "download-cancelled", serde_json::json!({"id": id}));
         } else {
             publish(&handle, &id, "download-failed", |item| {
                 item.state = DlState::Failed; item.speed = 0;
@@ -215,5 +222,7 @@ mod tests {
         assert_eq!(safe_filename("C:\\fakepath\\a.pdf"), "a.pdf");
         assert_eq!(safe_filename(".."), "download");
         assert_eq!(safe_filename("\n"), "download");
+        let unicode = "界".repeat(100);
+        assert!(safe_filename(&unicode).len() <= 200);
     }
 }

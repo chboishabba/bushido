@@ -207,3 +207,5 @@ Right-click an HTTP(S) anchor in an ordinary tab and select Open in Glance. Veri
 ## Linux native downloads
 
 Exercise simultaneous same-name downloads in one shared workspace and another workspace, authenticated and POST/blob downloads, a failure followed by a separate success, cancellation before/after destination selection, tab destruction, MIME routing and collision protection. Verify no cookie export or replay GET, exactly one record, native-only controls hidden and completed files preserved on record removal. Verify actual WebKit data counts and callback ordering; no runtime pass claimed.
+
+- Race cancellation against an already-successful finish: a completed destination must survive. Verify long multibyte suggested filenames and cancellation dispatch timeout versus eventual terminal result.
