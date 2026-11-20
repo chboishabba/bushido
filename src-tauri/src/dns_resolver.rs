@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use crate::dns_positive_cache::{self, PositiveCache};
@@ -81,7 +81,7 @@ impl ResolverControl {
         let (addresses, expires) = dns_positive_cache::address_candidate(raw,&reply.bytes,reply.started,now)
             .ok_or("Unsupported direct-address response")?;
         r.check_policy(snapshot)?;
-        Ok(AddressCandidate { hostname, policy: snapshot, addresses, expires })
+        Ok(AddressCandidate { owner: Arc::downgrade(r), hostname, policy: snapshot, addresses, expires })
     }
 
     pub fn set_level(&self, value: &str) -> Result<(), String> {
@@ -96,6 +96,7 @@ impl ResolverControl {
 /// Private candidate provenance. Not a socket capability and not serialized.
 #[allow(dead_code)]
 pub(crate) struct AddressCandidate {
+    owner: Weak<Resolver>,
     hostname: String,
     policy: Policy,
     addresses: Vec<IpAddr>,
@@ -108,6 +109,9 @@ impl AddressCandidate {
     #[allow(dead_code)]
     pub(crate) fn scoped_destination(&self, control: &ResolverControl,
         host: &str, approved: IpAddr, now: Instant) -> Result<SocketAddr, String> {
+        if !self.owner.upgrade().is_some_and(|owner| Arc::ptr_eq(&owner, &control.0)) {
+            return Err("Address candidate belongs to another resolver instance".into());
+        }
         if host != self.hostname || !self.addresses.contains(&approved) || now >= self.expires {
             return Err("Address candidate outside scope or expired".into());
         }
@@ -525,10 +529,12 @@ mod tests {
         let r = make_resolver(); let control = ResolverControl(r.clone());
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
         let t = Instant::now();
-        let candidate = AddressCandidate { hostname: "a.test.".into(),
+        let candidate = AddressCandidate { owner: Arc::downgrade(&r), hostname: "a.test.".into(),
             policy: *r.policy.read(), addresses: vec![ip], expires: t + Duration::from_secs(3) };
         assert_eq!(candidate.scoped_destination(&control,"a.test.",ip,t).unwrap(), SocketAddr::new(ip,443));
         assert!(candidate.scoped_destination(&control,"b.test.",ip,t).is_err());
+        let other = ResolverControl(make_resolver());
+        assert!(candidate.scoped_destination(&other,"a.test.",ip,t).is_err());
         assert!(candidate.scoped_destination(&control,"a.test.","127.0.0.1".parse().unwrap(),t).is_err());
         assert!(candidate.scoped_destination(&control,"a.test.",ip,t+Duration::from_secs(3)).is_err());
         control.set_level("maximum").unwrap(); control.set_level("strict").unwrap();

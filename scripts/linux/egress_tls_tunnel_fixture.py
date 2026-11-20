@@ -203,6 +203,16 @@ class Proxy:
             self.listener.close()
 
 
+def read_exact(sock, count):
+    out = bytearray()
+    while len(out) < count:
+        part = sock.recv(count-len(out))
+        if not part:
+            raise EOFError()
+        out.extend(part)
+    return bytes(out)
+
+
 class Tests(unittest.TestCase):
     def test_exact_authority(self):
         valid=("CONNECT "+AUTHORITY+" HTTP/1.1\r\nHost: "+AUTHORITY+"\r\n\r\n").encode()
@@ -224,9 +234,9 @@ class Tests(unittest.TestCase):
         with a,d:
             a.settimeout(2);d.settimeout(2)
             a.sendall(b"\x16\x03\x01fixture")
-            self.assertEqual(d.recv(64),b"\x16\x03\x01fixture")
+            self.assertEqual(read_exact(d,10),b"\x16\x03\x01fixture")
             d.sendall(b"opaque-reply")
-            self.assertEqual(a.recv(64),b"opaque-reply")
+            self.assertEqual(read_exact(a,12),b"opaque-reply")
             a.shutdown(socket.SHUT_WR);d.shutdown(socket.SHUT_WR)
         thread.join(4)
         self.assertEqual(result,[("eof",10,12)])

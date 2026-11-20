@@ -490,3 +490,5 @@ Native vault save dialog polling/read deadline and prior fill callback deadline 
 
 ### P2.4e opaque HTTPS positive control and direct-address candidate
 - Separate fixed-loopback CONNECT relay and synthetic TLS endpoint, exact authority, bounded relay, no arbitrary upstream or DNS. Original deny-only sentinel retained. Actual resolver private candidate producer reuses direct positive wire parser, binds exact query/response, primary upstream, policy epoch, expiry and independently approved address through numeric port-443 constructor; no dialing or IPC. Actual live resolver-to-transport weld, TLS/native trust and confinement OPEN. Five tests written, unexecuted; 20-stage local runner.
+
+- P2.4e follow-up: direct-address candidate binds exact original resolver instance via Weak/Arc pointer equality, not merely generation equality. Cross-instance negative control added to existing test; TCP fixture reads segmentation-independent bytes. No test execution or live DNS/tunnel weld.
