@@ -132,7 +132,10 @@ export default memo(function DownloadPanel({
                   <span className="download-paused-label">paused — {formatBytes(d.receivedBytes)}{d.totalBytes ? ` / ${formatBytes(d.totalBytes)}` : ""}</span>
                 )}
                 {d.state === "completed" && (
-                  <span className="download-done-label">{d.totalBytes ? formatBytes(d.totalBytes) : "done"}</span>
+                  <>
+                    <span className="download-done-label">{d.totalBytes ? formatBytes(d.totalBytes) : "done"}</span>
+                    {d.native && d.error && <span className="download-error-label" title={d.error}>{d.error}</span>}
+                  </>
                 )}
                 {d.state === "failed" && (
                   <span className="download-error-label">{d.error || "failed"}</span>

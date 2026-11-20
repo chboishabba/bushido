@@ -47,13 +47,46 @@ fn destination(app: &AppHandle, id: &str, name: &str, mime: &str) -> Result<(Pat
         }
     }
     if !root.is_absolute() { return Err("Download directory must be absolute".into()); }
+    // The existing UI/backend path contract uses UTF-8 strings.
+    if root.to_str().is_none() { return Err("Download directory is not valid UTF-8".into()); }
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     // A unique directory avoids filename collisions and restricts cleanup
     // to our own transfer, including simultaneous identical filenames.
-    let owned = root.join(format!("bushido-{id}"));
+    let owned = root.join(format!(".bushido-download-{id}"));
     std::fs::DirBuilder::new().mode(0o700).create(&owned).map_err(|e| e.to_string())?;
     let file = owned.join(safe_filename(name));
     Ok((owned, file))
+}
+
+// A completed file is published with an atomic no-replace directory entry.
+// Unlike exists()+rename(), hard_link never clobbers another transfer or a
+// dangling symlink. Staging and final destination are on the same filesystem.
+// Do not copy or overwrite if hard links are unsupported: keep the original.
+fn publish_completed_file(staged: &Path, owned: &Path) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind};
+    let root = owned.parent().ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Missing download root"))?;
+    if staged.parent() != Some(owned) || !std::fs::symlink_metadata(staged)?.file_type().is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "Expected regular staged download"));
+    }
+    let name = staged.file_name().and_then(|s| s.to_str())
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Invalid staged filename"))?;
+    let stem = staged.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let ext = staged.extension().and_then(|s| s.to_str());
+    for n in 0..10_000 {
+        let candidate = if n == 0 { name.to_owned() } else {
+            match ext {
+                Some(ext) => format!("{stem} ({n}).{ext}"),
+                None => format!("{stem} ({n})"),
+            }
+        };
+        let final_path = root.join(candidate);
+        match std::fs::hard_link(staged, &final_path) {
+            Ok(()) => return Ok(final_path),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::new(ErrorKind::AlreadyExists, "Download filename collision limit reached"))
 }
 
 fn publish(app: &AppHandle, id: &str, event: &str, update: impl FnOnce(&mut DlItem)) {
@@ -86,8 +119,18 @@ fn start(app: &AppHandle, download: &Download) {
     download.connect_decide_destination(move |download, suggested| {
         let mime = download.response().and_then(|r| r.mime_type()).map(|s| s.to_string()).unwrap_or_default();
         let total = download.response().and_then(|r| u64::try_from(r.content_length()).ok()).filter(|n| *n > 0);
+        // Never create a destination after cancellation or terminal removal.
+        let may_stage = ACTIVE.with(|active| active.borrow().get(&transfer_id)
+            .is_some_and(|entry| !entry.cancelled && entry.owned_dir.is_none()));
+        if !may_stage { download.cancel(); return true; }
         let result = destination(&handle, &transfer_id, suggested, &mime).and_then(|(dir, file)| {
-            let uri = url::Url::from_file_path(&file).map_err(|_| "Invalid destination URI".to_owned())?;
+            let uri = match url::Url::from_file_path(&file) {
+                Ok(uri) => uri,
+                Err(_) => {
+                    let _ = std::fs::remove_dir(&dir);
+                    return Err("Invalid destination URI".to_owned());
+                }
+            };
             ACTIVE.with(|active| {
                 if let Some(entry) = active.borrow_mut().get_mut(&transfer_id) { entry.owned_dir = Some(dir); }
             });
@@ -141,12 +184,37 @@ fn start(app: &AppHandle, download: &Download) {
         // A cancel request can race with a successful finish. Success must
         // take precedence over the intent flag, or we could delete a file
         // that WebKit finished before cancellation took effect.
-        let completed = dm.downloads.lock().get(&id).is_some_and(|item|
-            item.state == DlState::Downloading && !item.file_path.is_empty() && Path::new(&item.file_path).is_file());
-        if completed {
+        let staged = dm.downloads.lock().get(&id).and_then(|item| {
+            let path = PathBuf::from(&item.file_path);
+            (item.state == DlState::Downloading && !item.file_path.is_empty()
+                && std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()))
+                .then_some(path)
+        });
+        if let Some(staged) = staged {
+            let mut final_path = staged.clone();
+            let mut warning = None;
+            if let Some(owned) = entry.owned_dir.as_deref() {
+                match publish_completed_file(&staged, owned) {
+                    Ok(path) => {
+                        final_path = path;
+                        // Publication is committed already. Never roll it back
+                        // or recursively delete staging on a cleanup failure.
+                        if let Err(e) = std::fs::remove_file(&staged).and_then(|_| std::fs::remove_dir(owned)) {
+                            warning = Some(format!("Saved; staging cleanup failed: {e}"));
+                        }
+                    }
+                    Err(e) => warning = Some(format!("Saved in staging; folder publication failed: {e}")),
+                }
+            } else {
+                warning = Some("Saved without flat-directory publication".into());
+            }
             publish(&handle, &id, "download-complete", |item| {
                 item.state = DlState::Completed; item.received_bytes = download.received_data_length();
                 item.total_bytes = Some(item.received_bytes); item.speed = 0;
+                item.file_path = final_path.to_string_lossy().into_owned();
+                item.file_name = final_path.file_name().and_then(|s| s.to_str())
+                    .unwrap_or(&item.file_name).to_owned();
+                item.error = warning;
             });
         } else if entry.cancelled {
             dm.downloads.lock().remove(&id);
@@ -216,6 +284,67 @@ pub async fn cancel(app: &AppHandle, id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct TestRoot(PathBuf);
+    impl TestRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("bushido-publish-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+        fn stage(&self, id: &str, name: &str, data: &[u8]) -> (PathBuf, PathBuf) {
+            let owned = self.0.join(id);
+            std::fs::create_dir(&owned).unwrap();
+            let staged = owned.join(name);
+            std::fs::write(&staged, data).unwrap();
+            (owned, staged)
+        }
+    }
+    impl Drop for TestRoot {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn publication_no_overwrite_and_no_symlink_follow() {
+        use std::os::unix::fs::symlink;
+        let root = TestRoot::new();
+        std::fs::write(root.0.join("report.pdf"), b"original").unwrap();
+        symlink(root.0.join("missing"), root.0.join("report (1).pdf")).unwrap();
+        let (owned, staged) = root.stage("private", "report.pdf", b"new");
+        let published = publish_completed_file(&staged, &owned).unwrap();
+        assert_eq!(published, root.0.join("report (2).pdf"));
+        assert_eq!(std::fs::read(root.0.join("report.pdf")).unwrap(), b"original");
+        assert!(std::fs::symlink_metadata(root.0.join("report (1).pdf")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&published).unwrap(), b"new");
+        std::fs::remove_file(staged).unwrap();
+        std::fs::remove_dir(owned).unwrap();
+        assert_eq!(std::fs::read(published).unwrap(), b"new");
+    }
+
+    #[test]
+    fn simultaneous_publications_do_not_clobber() {
+        let root = TestRoot::new();
+        let jobs: Vec<_> = (0..12).map(|n| {
+            let (owned, staged) = root.stage(&format!("private-{n}"), "same", &[n]);
+            std::thread::spawn(move || {
+                let published = publish_completed_file(&staged, &owned).unwrap();
+                std::fs::remove_file(staged).unwrap();
+                std::fs::remove_dir(owned).unwrap();
+                assert_eq!(std::fs::read(&published).unwrap(), vec![n]);
+                published
+            })
+        }).collect();
+        let paths: std::collections::HashSet<_> = jobs.into_iter().map(|j| j.join().unwrap()).collect();
+        assert_eq!(paths.len(), 12);
+    }
+
+    #[test]
+    fn failed_publication_preserves_original() {
+        let root = TestRoot::new();
+        let (owned, staged) = root.stage("private", "report", b"retain");
+        assert!(publish_completed_file(&staged, &root.0.join("wrong")).is_err());
+        assert_eq!(std::fs::read(&staged).unwrap(), b"retain");
+    }
+
     #[test]
     fn safe_names() {
         assert_eq!(safe_filename("../../secret"), "secret");
