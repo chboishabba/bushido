@@ -103,7 +103,7 @@ pub(crate) async fn preview(app: &tauri::AppHandle, tab_id: &str)
             let resources=epochs.resource_snapshot(&id,&current_owner,&native,&current_doc)
                 .ok_or("Native resource observation lost")?;
             Ok(serde_json::json!({
-                "version":"bushido.egress.scope_preview.v3",
+                "version":"bushido.egress.scope_preview.v4",
                 "resource_observation":resources,
                 "state":"proposal_only",
                 "non_authoritative":true,

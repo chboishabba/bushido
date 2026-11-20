@@ -508,3 +508,6 @@ Native vault save dialog polling/read deadline and prior fill callback deadline 
 - v3 preview uses same native document epoch observer, resource-load-started and per-resource URI/failed/TLS/finished callbacks; fixed categories, bounded hooks and omission counts, old epoch excluded. No frame identity, dispatch/redirect proof or CONNECT binding; nullable sent-request argument deferred pending pinned binding verification. Three Rust tests authored, not run. Native coverage, attribution and live scope issuance OPEN.
 
 - P2.4e matching independent HTTPS route matrix: original TLS fixture now has nine exact synthetic fixed routes with aggregate origin arrivals and missing positives; same category names as native resource v3 preview, no identity join asserted. One Python test authored, not run. No dependencies or runner stages added.
+
+### P2.4e nullable sent-request and fixed redirect witness
+- Native v4 resource observer uses GLib checked GValues with Option<URIResponse>, no generated nonnullable reference. Original object/epoch sequence and exact fixed 302 route edge; explicit malformed/unlinked/omission counters, 16 events per tracked resource. Three Rust tests authored, not run. Web extension pre-send API has page but no frame/type argument. Pinned native build, actual callback, arbitrary redirect/physical correlation and trusted extension admission OPEN.
