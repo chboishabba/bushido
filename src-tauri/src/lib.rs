@@ -7,6 +7,8 @@ mod downloads;
 mod linux_downloads;
 #[cfg(target_os = "linux")]
 mod linux_find;
+#[cfg(target_os = "linux")]
+mod linux_vault;
 mod import;
 mod screenshot;
 mod sync;
@@ -1317,6 +1319,7 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                 let _ = wv.eval(&inject_fingerprint);
                 #[cfg(debug_assertions)]
                 { let _ = wv.eval(&inject_fp_verify); }
+                #[cfg(not(target_os = "linux"))]
                 let _ = wv.eval(&inject_vault);
                 #[cfg(not(target_os = "linux"))]
                 let _ = wv.eval(&inject_glance);
@@ -1379,7 +1382,8 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     builder = builder.initialization_script(&fingerprint_script);
     // fingerprint_verify.js is injected ONLY via on_page_load (not initialization_script)
     // because window.chrome.webview may not be available at initialization_script time
-    builder = builder.initialization_script(&vault_script);
+    #[cfg(not(target_os = "linux"))]
+    { builder = builder.initialization_script(&vault_script); }
     #[cfg(not(target_os = "linux"))]
     { builder = builder.initialization_script(&glance_script); }
     builder = builder.initialization_script(&bs.preload_script);
@@ -1431,6 +1435,11 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
         }
         if let Err(e) = install_linux_glance_input(&app, &webview, &id) {
             crash_log::log_error("linux-glance-input", &e);
+        }
+        if !disable_autofill {
+            if let Err(e) = linux_vault::install(&app, &webview, &id) {
+                crash_log::log_error("linux-vault", &e);
+            }
         }
     }
 
@@ -2877,7 +2886,8 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
     { builder = builder.initialization_script(&shortcut_s); }
     builder = builder.initialization_script(&media_s);
     builder = builder.initialization_script(&fingerprint_s);
-    builder = builder.initialization_script(&vault_s);
+    #[cfg(not(target_os = "linux"))]
+    { builder = builder.initialization_script(&vault_s); }
     #[cfg(not(target_os = "linux"))]
     { builder = builder.initialization_script(&glance_s); }
 
@@ -3018,6 +3028,11 @@ struct PaneRectArg {
 
 #[tauri::command]
 async fn vault_retry_autofill(app: tauri::AppHandle) -> Result<(), String> {
+    // Linux never broadcasts credentials or auto-fills on vault unlock.
+    #[cfg(target_os = "linux")]
+    { let _ = app; return Ok(()); }
+    #[cfg(not(target_os = "linux"))]
+    {
     let vs = app.state::<crate::vault::VaultState>();
     if vs.derived_key.lock().is_none() {
         return Ok(());
@@ -3033,6 +3048,7 @@ async fn vault_retry_autofill(app: tauri::AppHandle) -> Result<(), String> {
         }
     }
     Ok(())
+    }
 }
 
 #[tauri::command]

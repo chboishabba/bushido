@@ -74,6 +74,7 @@ impl VaultState {
     fn decrypt_password(&self, enc: &[u8], nonce: &[u8]) -> Result<String, String> {
         let key = self.get_key()?;
         let unwrapped = dpapi_decrypt(enc)?;
+        if nonce.len() != 12 { return Err("invalid vault nonce".into()); }
         let nonce_arr = GenericArray::from_slice(nonce);
         let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&key));
         let decrypted = cipher.decrypt(nonce_arr, unwrapped.as_ref())
@@ -108,6 +109,32 @@ pub fn has_master_password_sync(state: &VaultState) -> bool {
         [],
         |row| row.get::<_, bool>(0),
     ).unwrap_or(false)
+}
+
+// Linux native selection lists only metadata; no bulk decryption.
+#[cfg(target_os = "linux")]
+pub(crate) fn native_choices(state: &VaultState, origin: &str) -> Result<Vec<(String, String)>, String> {
+    if state.derived_key.lock().is_none() { return Err("Unlock the vault in Settings first".into()); }
+    let conn = state.open_db()?;
+    let mut stmt = conn.prepare("SELECT id, username FROM vault_entries WHERE domain = ?1 ORDER BY updated_at DESC LIMIT 51")
+        .map_err(|_| "Vault query failed".to_owned())?;
+    let choices = stmt.query_map([origin], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|_| "Vault query failed".to_owned())?
+        .collect::<Result<Vec<(String, String)>, _>>().map_err(|_| "Vault query failed".to_owned())?;
+    if choices.len() > 50 { return Err("Too many matching accounts; use vault Settings".into()); }
+    Ok(choices)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn native_selected(state: &VaultState, origin: &str, id: &str) -> Result<(String, zeroize::Zeroizing<String>), String> {
+    let conn = state.open_db()?;
+    let (username, enc, nonce): (String, Vec<u8>, Vec<u8>) = conn.query_row(
+        "SELECT username, password_enc, nonce FROM vault_entries WHERE domain = ?1 AND id = ?2",
+        rusqlite::params![origin, id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    ).map_err(|_| "Selected account no longer exists".to_owned())?;
+    let password = zeroize::Zeroizing::new(state.decrypt_password(&enc, &nonce)?);
+    if password.is_empty() { return Err("Selected credential is empty".into()); }
+    Ok((username, password))
 }
 
 // sync helper for postMessage handler (no async)

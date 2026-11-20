@@ -1,6 +1,6 @@
 # Bushido native Linux port — execution roadmap
 
-**Updated:** 2026-11-17  
+**Updated:** 2026-11-20  
 **Working branch:** `linux-port-pr4-source`  
 **Development PR:** [chboishabba/bushido#1](https://github.com/chboishabba/bushido/pull/1) (draft)  
 **Original contribution:** [visualstudioblyat/bushido#4](https://github.com/visualstudioblyat/bushido/pull/4), AdithyaaSivamal, `f83d133`.
@@ -345,3 +345,29 @@ WebKit bug [325421](https://bugs.webkit.org/show_bug.cgi?id=325421) documents ol
 
 ### PiP local test receipt and pending request guard
 Local Linux Node v22.16.0 mocked DOM run: 9/9 passed (128.26 ms test runner total); tested Git blobs linux_pip.js 1923ffcd772640a5b5aadcc58827cfd870e2fbd5 and test-pip-policy.cjs d1cbd1491d3f4397de25c12c4a98c0aa4a45357e. Guard repeated toggles and 15s prompt timeout while an accepted trusted activation still awaits engine promise; do not permit another entry request through that same live prompt. No claim against hostile page mutation or unresolved promises; navigation can reset the document. Added the mock suite to existing local preflight, not hosted CI. Cargo/rustc and WebKitGTK development packages unavailable in execution host; native acceptance remains OPEN.
+
+## A0–A4 Rust MCP / local native acceptance — reuse options
+
+Maintain these as explicit options, not mandatory new dependencies. For detailed architecture and benchmarks see [MCP_AUTOMATION.md](MCP_AUTOMATION.md).
+
+| Option | Role | Selection gate |
+| --- | --- | --- |
+| [Tauri Driver](https://github.com/tauri-apps/tauri/tree/dev/crates/tauri-driver) + WebKitWebDriver | Official external native Tauri driver | First executable spike; real Bushido child WebViews |
+| [Bruster](https://github.com/aliilyas/bruster) | Rust native browser, WebKitGTK/WebView2/WKWebView, MCP and JSON-lines | Strong reference/reuse candidate; isolate driver layer, do not substitute its browser |
+| [Rust Browser MCP](https://github.com/EmilLindfors/rust-browser-mcp) | Existing Rust W3C WebDriver MCP implementation | Evaluate Tauri session launcher compatibility |
+| [rmcp](https://github.com/modelcontextprotocol/rust-sdk) | Official Rust MCP SDK | Thin stdio adapter if existing servers cannot be reused |
+| [Fantoccini](https://github.com/jonhoo/fantoccini) | Rust W3C WebDriver client | Reuse transport with rmcp if needed |
+| [tauri-webdriver](https://docs.rs/crate/tauri-webdriver/latest) | Embedded driver fallback | Dev-only, only if external child-view targeting fails; security review |
+
+| Gate | Deliverable | State |
+| --- | --- | --- |
+| A0 | Reuse options, compact scenario contract, native test boundary | DOCUMENTED |
+| A1 | Local real Bushido driver, isolated profile, child-view addressing | DEFERRED until native build |
+| A2 | Reuse/adapter selection and separate pinned Rust dependency graph | DEFERRED |
+| A3 | Bounded semantic snapshots, typed batched actions, deterministic receipts, call/bytes/time/RSS benchmark | DEFERRED |
+| A4 | Hosted CI integration after local acceptance | DEFERRED |
+
+Prioritize implementation now; local policy tests permitted. No hosted CI work, production MCP listener, or Chromium surrogate for actual WebKitGTK acceptance. Prefer scenario execution over individual agent tool calls. Do not claim efficiency savings until measured.
+
+## P3/P4 Linux explicit native saved-login fill (partial source)
+- Remove legacy page vault script and unlock-triggered broadcast on Linux. Add ordinary-tab native context-menu action when autofill is enabled. Require actual loaded HTTPS URI with clean TLS flags, exact origin lookup including port, live tab outside panel, native account selection, isolated script world and per-document one-use ticket. Probe only one empty visible username/password pair in an unambiguous same-origin POST form. Revalidate URI, navigation generation, policy, lock, ticket and same form before filling. No auto-submit, page-supplied hostname, bulk password broadcast, or generic remote IPC. Read metadata first, decrypt only selected account using existing vault on worker, zeroize owned password/script buffers on drop. Existing vault DB is global; explicit user-approved fill is not a workspace-partitioned vault. Store exact HTTPS origin in existing domain field; no hostname fallback or silent migration. Automatic save, lock-versus-dispatch atomic revocation, native script/credential memory lifetime, preloaded/promoted Glance, cross-frame and multi-step login, native build/runtime, true workspace-specific vault schema and UI migration remain OPEN. Windows legacy path unchanged.
