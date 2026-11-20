@@ -105,7 +105,7 @@ pub(crate) async fn preview(app: &tauri::AppHandle, tab_id: &str)
             let extension=epochs.extension_snapshot(&id,&current_owner,&native)
                 .ok_or("Native extension observation lost")?;
             Ok((serde_json::json!({
-                "version":"bushido.egress.scope_preview.v7",
+                "version":"bushido.egress.scope_preview.v8",
                 "extension_policy_snapshot":fixture.extension_policy(),
                 "extension_policy_delivery_verified":false,
                 "extension_observation":extension,
@@ -138,7 +138,7 @@ pub(crate) async fn preview(app: &tauri::AppHandle, tab_id: &str)
             Err(e)=>{let _=tx.send(Err(e));return;}
         };
         let callback_view=native.clone();
-        crate::linux_extension_ack::probe(&native,expected,move |status| {
+        crate::linux_extension_ack::probe(&native,expected,move |ack| {
             let _slot=slot;
             if tx.is_closed() {return;}
             let epochs=app.state::<DocumentEpochs>();
@@ -148,8 +148,9 @@ pub(crate) async fn preview(app: &tauri::AppHandle, tab_id: &str)
                 return;
             }
             receipt["extension_policy_ack"]=serde_json::json!({
-                "status":status,
-                "matching_reply_observed":status=="matching_reply_observed",
+                "status":ack.status,
+                "matching_reply_observed":ack.status=="matching_reply_observed",
+                "applied_policy_observation":ack.trace,
                 "document_observation_rechecked":true,
                 "runtime_binary_linkage_verified":false,
                 "applied_request_policy_verified":false

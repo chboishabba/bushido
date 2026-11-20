@@ -522,3 +522,6 @@ Native vault save dialog polling/read deadline and prior fill callback deadline 
 
 ### P2.4e fresh native policy challenge
 - v2 immutable generation+table initialization; original WebView-to-WebPage request/reply with fresh nonce, actual parsed table and launch UUID, exact response/nonpayload-FD checks, native owner/document recheck, bounded single outstanding per view. No reusable authority or binary/application attestation. v7 scope receipt records matching reply only; four Rust tests authored, not run. Physical reply, process replacement, original enforcement and dynamic policy update OPEN.
+
+### P2.4e applied policy prefix v8
+- Same per-page native cancellation state records bounded 128 ordered fixed-route decisions and previous-response presence, saturating omission, page UUID. Fresh v2 challenge returns actual generation/table and prefix; Rust validates each row, explicit empty/truncated/malformed/mismatch. No join by aggregate counts, no document/frame/physical identity or execution authority. Two additional tests, three updated; none run. Native acceptance and independent A/B reconciliation OPEN.

@@ -7,8 +7,9 @@
 #define ROOT "https://bushido-tunnel.test/"
 #define MAX_MESSAGES 128
 #define PREFIX "bushido.fixture.policy.v2:"
-#define QUERY "bushido.fixture.policy.challenge.v1"
-#define REPLY "bushido.fixture.policy.reply.v1"
+#define QUERY "bushido.fixture.policy.challenge.v2"
+#define REPLY "bushido.fixture.policy.reply.v2"
+#define MAX_EVENTS 128
 static gchar received[sizeof(PREFIX)+32+1+4];
 static gboolean initialized = FALSE;
 static gchar decisions[4] = {'X','X','X','X'};
@@ -19,6 +20,10 @@ typedef struct {
     gboolean initialized;
     gchar received[sizeof(received)];
     gchar decisions[sizeof(decisions)];
+    gchar page_id[33];
+    gchar events[MAX_EVENTS*3+1];
+    guint event_count;
+    guint64 omitted;
 } PageState;
 
 static void observe(WebKitWebPage *page, PageState *state, const gchar *name)
@@ -45,6 +50,14 @@ static gboolean on_send(WebKitWebPage *page, WebKitURIRequest *request,
     };
     for (guint i=0;i<4;i++) {
         if (strcmp(uri,routes[i])!=0) continue;
+        /* Fixed route index, actual decision, prior response presence.
+         * Array position is the monotonically increasing event ordinal. */
+        if (state->event_count<MAX_EVENTS) {
+            guint offset=3*state->event_count++;
+            state->events[offset]=(gchar)('0'+i);
+            state->events[offset+1]=state->decisions[i];
+            state->events[offset+2]=previous?'R':'I';
+        } else if (state->omitted<G_MAXUINT64) state->omitted++;
         if (state->decisions[i]=='D') {
             const gchar *name = i==1 ? "bushido.fixture.v1.deny_direct" :
                 i==3 ? (previous ? "bushido.fixture.v1.deny_redirect" :
@@ -85,7 +98,8 @@ static gboolean on_challenge(WebKitWebPage *page, WebKitUserMessage *message, gp
         webkit_user_message_get_fd_list(message)) return TRUE;
     const gchar *nonce=g_variant_get_string(param,NULL);
     if (strlen(nonce)!=32 || !lower_hex(nonce,32)) return TRUE;
-    gchar *payload=g_strdup_printf("%s:%s",nonce,state->initialized?state->received:"invalid");
+    gchar *payload=g_strdup_printf("%s|%s|%s|%" G_GUINT64_FORMAT "|%s",nonce,
+        state->initialized?state->received:"invalid",state->page_id,state->omitted,state->events);
     webkit_user_message_send_reply(message,
         webkit_user_message_new(REPLY,g_variant_new_string(payload)));
     g_free(payload);
@@ -99,6 +113,10 @@ static void page_created(WebKitWebExtension *extension, WebKitWebPage *page,
     (void)unused;
     PageState *state = g_new0(PageState, 1);
     if (g_object_get_data(G_OBJECT(page),"bushido-fixture-state")) {g_free(state);return;}
+    gchar *id=g_uuid_string_random();
+    guint j=0;
+    for (const gchar *p=id;*p;p++) if (*p!=\'-\' && j<32) state->page_id[j++]=*p;
+    g_free(id);
     state->initialized=initialized;
     memcpy(state->received,received,sizeof(state->received));
     memcpy(state->decisions,decisions,sizeof(state->decisions));
