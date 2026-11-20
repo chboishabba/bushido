@@ -4502,6 +4502,7 @@ pub fn run() {
             vault::vault_unlock,
             vault::vault_lock,
             vault::vault_is_unlocked,
+            vault::vault_state_snapshot,
             vault::vault_save_entry,
             vault::vault_save_manual_entry,
             vault::vault_get_entries,

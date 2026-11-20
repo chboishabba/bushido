@@ -196,6 +196,12 @@ export default function App() {
   const [pendingUpdate, setPendingUpdate] = useState<{ version: string; downloading: boolean } | null>(null);
 
   const vaultUnlockedRef = useRef(false);
+  const vaultStateEpoch = useRef(-1);
+  const applyVaultState = useCallback((status: { epoch: number; unlocked: boolean }) => {
+    if (status.epoch < vaultStateEpoch.current) return;
+    vaultStateEpoch.current = status.epoch;
+    setVaultUnlocked(status.unlocked);
+  }, [setVaultUnlocked]);
   const vaultSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const glanceRef = useRef<typeof glance>(null);
   const glanceReadyRef = useRef<string | null>(null);
@@ -954,6 +960,7 @@ export default function App() {
         if (vaultSaveTimer.current) clearTimeout(vaultSaveTimer.current);
         vaultSaveTimer.current = setTimeout(() => setVaultSavePrompt(null), 30000);
       }),
+      listen<{ epoch: number; unlocked: boolean }>("vault-state-changed", e => applyVaultState(e.payload)),
       // vault unlock needed — page has login form but vault is locked
       listen<{ domain: string; tabId: string }>("vault-unlock-needed", () => {
         if (!vaultUnlockedRef.current) {
@@ -986,7 +993,7 @@ export default function App() {
     }).catch(e => console.warn("[bushido]", e));
 
     // check vault lock state
-    invoke<boolean>("vault_is_unlocked").then(setVaultUnlocked).catch(e => console.warn("[bushido]", e));
+    invoke<{ epoch: number; unlocked: boolean }>("vault_state_snapshot").then(applyVaultState).catch(() => {});
 
     return () => { promises.forEach(p => p.then(u => u())); };
   }, []);
@@ -1053,12 +1060,12 @@ export default function App() {
     if (!settings.vaultAutoLock || !settings.vaultLockTimeout || !vaultUnlocked) return;
     const timeoutMs = settings.vaultLockTimeout * 60_000;
     let timer = setTimeout(() => {
-      invoke("vault_lock").then(() => setVaultUnlocked(false)).catch(e => console.warn("[bushido]", e));
+      invoke("vault_lock").catch(e => console.warn("[bushido] vault lock", e));
     }, timeoutMs);
     const reset = () => {
       clearTimeout(timer);
       timer = setTimeout(() => {
-        invoke("vault_lock").then(() => setVaultUnlocked(false)).catch(e => console.warn("[bushido]", e));
+        invoke("vault_lock").catch(e => console.warn("[bushido] vault lock", e));
       }, timeoutMs);
     };
     // reset timer on user activity signals
@@ -2868,14 +2875,25 @@ export default function App() {
             e.preventDefault();
             const form = e.target as HTMLFormElement;
             const pw = (form.elements.namedItem("vaultpw") as HTMLInputElement).value;
-            if (vaultMasterModal === "setup") {
-              const confirm = (form.elements.namedItem("vaultpw2") as HTMLInputElement).value;
-              if (pw !== confirm) { showError("Passwords don't match"); return; }
-              await invoke("vault_setup", { masterPassword: pw }).catch((err: any) => { showError(String(err)); return; });
-            } else {
-              await invoke("vault_unlock", { masterPassword: pw }).catch((err: any) => { showError(String(err)); return; });
+            try {
+              if (vaultMasterModal === "setup") {
+                const confirm = (form.elements.namedItem("vaultpw2") as HTMLInputElement).value;
+                if (pw !== confirm) { showError("Passwords don't match"); return; }
+                await invoke("vault_setup", { masterPassword: pw });
+              } else {
+                await invoke("vault_unlock", { masterPassword: pw });
+              }
+              const status = await invoke<{ epoch: number; unlocked: boolean }>("vault_state_snapshot");
+              applyVaultState(status);
+              if (!status.unlocked || status.epoch < vaultStateEpoch.current) {
+                showError("Vault state changed; unlock again"); return;
+              }
+            } catch (error) {
+              showError(typeof error === "string" ? error : "Vault unlock failed");
+              return;
+            } finally {
+              form.reset();
             }
-            setVaultUnlocked(true);
             setVaultMasterModal(null);
             // retry autofill on all tabs now that vault is unlocked
             invoke("vault_retry_autofill").catch(e => console.warn("[bushido]", e));

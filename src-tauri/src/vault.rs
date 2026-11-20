@@ -108,12 +108,55 @@ impl VaultState {
         Ok(action())
     }
 
-    fn replace_key(&self, key: Option<[u8; 32]>) {
+    // Capture a transition generation even while locked, before costly
+    // password verification. A newer lock or unlock must win.
+    fn generation(&self) -> u64 {
+        let _guard = self.derived_key.lock();
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    fn status(&self) -> VaultSessionStatus {
+        let guard = self.derived_key.lock();
+        VaultSessionStatus { epoch: self.epoch.load(Ordering::Relaxed), unlocked: guard.is_some() }
+    }
+
+    fn replace_key(&self, key: Option<[u8; 32]>) -> VaultSessionStatus {
         let mut guard = self.derived_key.lock();
         if let Some(old) = guard.as_mut() { old.zeroize(); }
         *guard = key;
-        self.epoch.fetch_add(1, Ordering::Relaxed);
+        let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        VaultSessionStatus { epoch, unlocked: guard.is_some() }
     }
+
+    fn install_if_current(&self, expected: u64, key: &Zeroizing<[u8; 32]>,
+        before_install: impl FnOnce() -> Result<(), String>) -> Result<VaultSessionStatus, String> {
+        let mut guard = self.derived_key.lock();
+        if self.epoch.load(Ordering::Relaxed) != expected {
+            return Err("Vault state changed; retry unlock".into());
+        }
+        // Initial setup commits its two metadata rows under this admission
+        // guard. Failed commit or stale transition does not install a key.
+        before_install()?;
+        if let Some(old) = guard.as_mut() { old.zeroize(); }
+        *guard = Some(**key);
+        let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        Ok(VaultSessionStatus { epoch, unlocked: true })
+    }
+}
+
+#[derive(Serialize, Clone)]
+pub struct VaultSessionStatus {
+    epoch: u64,
+    unlocked: bool,
+}
+
+fn publish_status(app: &tauri::AppHandle, status: VaultSessionStatus) {
+    let _ = app.emit_to("main", "vault-state-changed", status);
+}
+
+#[tauri::command]
+pub async fn vault_state_snapshot(state: tauri::State<'_, VaultState>) -> Result<VaultSessionStatus, String> {
+    Ok(state.status())
 }
 
 // argon2 derive key from master password + salt
@@ -202,7 +245,8 @@ pub async fn vault_has_master_password(state: tauri::State<'_, VaultState>) -> R
 }
 
 #[tauri::command]
-pub async fn vault_setup(state: tauri::State<'_, VaultState>, master_password: String) -> Result<(), String> {
+pub async fn vault_setup(app: tauri::AppHandle, state: tauri::State<'_, VaultState>, master_password: String) -> Result<(), String> {
+    let expected = state.generation();
     let master_password = Zeroizing::new(master_password);
     if master_password.len() < 8 {
         return Err("password must be at least 8 characters".into());
@@ -231,14 +275,16 @@ pub async fn vault_setup(state: tauri::State<'_, VaultState>, master_password: S
         [salt.as_str().as_bytes()],
     ).map_err(|e| format!("save salt: {}", e))?;
 
-    tx.commit().map_err(|_| "Vault setup commit failed".to_owned())?;
-    state.replace_key(Some(*key));
+    let status = state.install_if_current(expected, &key, ||
+        tx.commit().map_err(|_| "Vault setup commit failed".to_owned()))?;
+    publish_status(&app, status);
 
     Ok(())
 }
 
 #[tauri::command]
-pub async fn vault_unlock(state: tauri::State<'_, VaultState>, master_password: String) -> Result<(), String> {
+pub async fn vault_unlock(app: tauri::AppHandle, state: tauri::State<'_, VaultState>, master_password: String) -> Result<(), String> {
+    let expected = state.generation();
     let master_password = Zeroizing::new(master_password);
     let conn = state.open_db()?;
 
@@ -267,17 +313,17 @@ pub async fn vault_unlock(state: tauri::State<'_, VaultState>, master_password: 
         .verify_password(master_password.as_bytes(), &parsed_hash)
         .map_err(|_| "wrong password".to_string())?;
 
-    let key = derive_key(&master_password, salt_str.as_bytes())?;
-    state.replace_key(Some(key));
+    let key = Zeroizing::new(derive_key(&master_password, salt_str.as_bytes())?);
+    let status = state.install_if_current(expected, &key, || Ok(()))?;
+    publish_status(&app, status);
 
     Ok(())
 }
 
 #[tauri::command]
 pub async fn vault_lock(app: tauri::AppHandle, state: tauri::State<'_, VaultState>) -> Result<(), String> {
-    state.replace_key(None);
-    // No sensitive payload. UI drops any selected plaintext immediately.
-    let _ = app.emit_to("main", "vault-locked", ());
+    let status = state.replace_key(None);
+    publish_status(&app, status);
     Ok(())
 }
 
@@ -478,6 +524,21 @@ mod session_tests {
         state.replace_key(Some([1; 32]));
         assert_ne!(old, state.session().unwrap());
         assert!(state.with_session(old, || panic!("revoked")).is_err());
+    }
+
+    #[test]
+    fn newer_lock_wins_against_pending_unlock_or_setup() {
+        let state = VaultState::new(PathBuf::from("unused"));
+        let key = Zeroizing::new([1; 32]);
+        let pending = state.generation();
+        state.replace_key(None);
+        assert!(state.install_if_current(pending, &key, || panic!("stale commit")).is_err());
+        assert!(state.session().is_err());
+        let fresh = state.generation();
+        assert!(state.install_if_current(fresh, &key, || Err("commit failed".into())).is_err());
+        assert!(state.session().is_err());
+        assert!(state.install_if_current(fresh, &key, || Ok(())).is_ok());
+        assert!(state.install_if_current(fresh, &key, || panic!("duplicate")).is_err());
     }
 
     #[test]

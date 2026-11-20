@@ -215,6 +215,7 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
   const [vaultReveal, setVaultReveal] = useState<{ id: string; password: string } | null>(null);
   const vaultRevealRequest = useRef(0);
   const vaultListRequest = useRef(0);
+  const vaultStateEpoch = useRef(-1);
   const invalidateVaultReveal = useCallback(() => {
     vaultRevealRequest.current++;
     setVaultReveal(null);
@@ -792,19 +793,27 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
 
   useEffect(() => {
     let alive = true;
-    const listener = listen("vault-locked", () => { if (alive) clearVaultUi(); });
+    const listener = listen<{ epoch: number; unlocked: boolean }>("vault-state-changed", e => {
+      if (!alive || e.payload.epoch <= vaultStateEpoch.current) return;
+      vaultStateEpoch.current = e.payload.epoch;
+      // Any new session invalidates a previous plaintext reveal/list reply.
+      clearVaultUi();
+      setVaultUnlocked(e.payload.unlocked);
+      if (e.payload.unlocked && activeTab === "passwords") refreshVaultList().catch(() => {});
+    });
     return () => { alive = false; listener.then(unlisten => unlisten()); };
-  }, [clearVaultUi]);
+  }, [clearVaultUi, activeTab, refreshVaultList]);
 
   useEffect(() => {
     let alive = true;
     if (activeTab === "passwords") {
       invoke<boolean>("vault_has_master_password").then(value => { if (alive) setVaultHasMaster(value); }).catch(() => {});
       const request = ++vaultListRequest.current;
-      invoke<boolean>("vault_is_unlocked").then(u => {
-        if (!alive || request !== vaultListRequest.current) return;
-        setVaultUnlocked(u);
-        if (u) refreshVaultList().catch(() => {});
+      invoke<{ epoch: number; unlocked: boolean }>("vault_state_snapshot").then(status => {
+        if (!alive || request !== vaultListRequest.current || status.epoch < vaultStateEpoch.current) return;
+        vaultStateEpoch.current = status.epoch;
+        setVaultUnlocked(status.unlocked);
+        if (status.unlocked) refreshVaultList().catch(() => {});
       }).catch(() => {});
     }
     return () => {
@@ -1248,16 +1257,23 @@ export default memo(function SettingsPage({ settings, onUpdate, onReloadAllTabs,
   const vaultUnlock = async (pw: string) => {
     try {
       await invoke("vault_unlock", { masterPassword: pw });
-      setVaultUnlocked(true);
-      await refreshVaultList();
+      const status = await invoke<{ epoch: number; unlocked: boolean }>("vault_state_snapshot");
+      if (status.epoch < vaultStateEpoch.current) return;
+      vaultStateEpoch.current = status.epoch;
+      setVaultUnlocked(status.unlocked);
+      if (status.unlocked) await refreshVaultList();
     } catch (e) { useUiStore.getState().showError(String(e)); }
   };
 
   const vaultSetup = async (pw: string) => {
     try {
       await invoke("vault_setup", { masterPassword: pw });
-      setVaultUnlocked(true);
+      const status = await invoke<{ epoch: number; unlocked: boolean }>("vault_state_snapshot");
+      if (status.epoch < vaultStateEpoch.current) return;
+      vaultStateEpoch.current = status.epoch;
+      setVaultUnlocked(status.unlocked);
       setVaultHasMaster(true);
+      if (status.unlocked) await refreshVaultList();
     } catch (e) { useUiStore.getState().showError(String(e)); }
   };
 
