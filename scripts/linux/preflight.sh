@@ -26,6 +26,7 @@ python3 scripts/linux/test-source-candidate.py
 python3 scripts/linux/witness-receipt.py --self-test
 python3 scripts/linux/itir-evidence-check.py --self-test
 python3 scripts/linux/network_fixture.py test
+python3 scripts/linux/egress_proxy_fixture.py test
 python3 scripts/linux/compile_webkit_subset.py --test
 npm ci
 npm run build

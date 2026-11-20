@@ -391,6 +391,9 @@ impl InnerWebView {
         let mut settings = NetworkProxySettings::new(Some(proxy_uri.as_str()), &[]);
         website_data_manager
           .set_network_proxy_settings(NetworkProxyMode::Custom, Some(&mut settings));
+      } else {
+        // Do not silently construct a direct-network view if proxy was explicitly requested.
+        return Err(Error::MissingManager);
       }
     }
 

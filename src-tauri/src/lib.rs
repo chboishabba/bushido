@@ -20,6 +20,8 @@ mod import;
 mod screenshot;
 #[cfg(target_os = "linux")]
 mod linux_desktop_actions;
+#[cfg(target_os = "linux")]
+mod linux_egress_fixture;
 mod sync;
 mod vault;
 
@@ -1227,9 +1229,11 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
     // directories are the supported isolation mechanism.
     #[cfg(target_os = "linux")]
     {
-        builder = builder.data_directory(
+        let fixture = app.state::<linux_egress_fixture::EgressFixture>();
+        builder = builder.data_directory(fixture.profile_directory(
             linux_workspace_data_directory(profile_name.as_deref())
-        );
+        ));
+        if let Some(proxy) = fixture.proxy() { builder = builder.proxy_url(proxy); }
     }
 
     if is_panel {
@@ -2871,9 +2875,11 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
     // Glance must share only its originating workspace's storage.
     #[cfg(target_os = "linux")]
     {
-        builder = builder.data_directory(
+        let fixture = app.state::<linux_egress_fixture::EgressFixture>();
+        builder = builder.data_directory(fixture.profile_directory(
             linux_workspace_data_directory(Some(&workspace))
-        );
+        ));
+        if let Some(proxy) = fixture.proxy() { builder = builder.proxy_url(proxy); }
     }
     // Glance can navigate independently after creation. Keep its native
     // filter aligned with each destination BEFORE approving the request.
@@ -4248,6 +4254,11 @@ fn linux_permission_observation(webview: tauri::Webview) -> Result<serde_json::V
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
+    let egress_fixture = match linux_egress_fixture::EgressFixture::from_environment() {
+        Ok(f) => f,
+        Err(e) => { eprintln!("Bushido egress fixture: {e}"); std::process::exit(2); }
+    };
+    #[cfg(target_os = "linux")]
     let instance = {
         // Match the existing early startup data root. No fallback to cwd:
         // the same XDG data root must have one process before any services.
@@ -4468,6 +4479,8 @@ pub fn run() {
             #[cfg(all(target_os = "linux", debug_assertions))]
             app.manage(Arc::new(NativeFilterUpdateState::default()));
             app.manage(DnsControl(dns_control.clone()));
+            #[cfg(target_os = "linux")]
+            app.manage(egress_fixture);
 
             #[cfg(windows)]
             {

@@ -113,6 +113,7 @@ def execute(root, out):
     stage("source_candidate_fixture", [sys.executable, "scripts/linux/test-source-candidate.py"])
     stage("witness_receipt_fixture", [sys.executable, "scripts/linux/witness-receipt.py", "--self-test"])
     stage("itir_evidence_fixture", [sys.executable, "scripts/linux/itir-evidence-check.py", "--self-test"])
+    stage("egress_proxy_fixture", [sys.executable, "scripts/linux/egress_proxy_fixture.py", "test"])
     stage("npm_install", ["npm", "ci"], ("node", "npm"))
     stage("frontend_build", ["npm", "run", "build"], ("npm_install",))
     stage("frontend_test", ["npm", "test"], ("npm_install",))
