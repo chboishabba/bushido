@@ -289,3 +289,6 @@ python3 scripts/linux/accept-local.py --self-test
 python3 scripts/linux/accept-local.py
 ```
 The runner creates a private /tmp/bushido-acceptance-* directory; retain it before reboot, review logs for sensitive information before sharing, and report receipt.json plus failing stage logs. Exit 0 means the listed local P0 stages completed, not native GUI/security acceptance; exit 1 indicates a failed stage or changed checkout; exit 2 indicates blocked prerequisites or setup failure. Incomplete receipts must never be considered accepted. The runner invokes npm ci/build/test and locked Cargo check/test on the original checkout; it does not install OS packages, launch Bushido, change defaults, or access its profile. Continue with manual native cases above or external driver once P0 passes. Existing preflight remains available.
+
+### P5.1 source candidate
+Run python3 scripts/linux/test-source-candidate.py; generate two fresh directories from the same clean commit, compare receipt and archive hashes, inspect notice paths and inventory. Negative controls: export-ignore, export-subst, dirty checkout, symlink and existing destination. No native build needed. Verify actual binary/source association and independent license/source review before distribution. Tests written, not yet executed in this packet.
