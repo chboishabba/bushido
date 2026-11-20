@@ -1258,21 +1258,36 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
             // shortcuts, vault access, navigation and general Tauri IPC.
             let weak_media_view = gtk::prelude::ObjectExt::downgrade(&view);
             let last_media = std::cell::Cell::new(None::<std::time::Instant>);
+            let last_video = std::cell::Cell::new(None::<std::time::Instant>);
             manager.connect_script_message_received(Some("bushidoMedia"), move |_, message| {
                 let Some(view) = weak_media_view.upgrade() else { return; };
                 let Some(uri) = view.uri() else { return; };
                 let Ok(url) = url::Url::parse(uri.as_str()) else { return; };
                 if !matches!(url.scheme(), "http" | "https") { return; }
                 let now = std::time::Instant::now();
-                if last_media.get().is_some_and(|last| now.duration_since(last).as_millis() < 200) {
-                    return;
-                }
                 let Some(value) = message.js_value() else { return; };
                 let raw = value.to_string();
                 if raw.len() > 8192 { return; }
                 let Ok(msg) = serde_json::from_str::<serde_json::Value>(&raw) else { return; };
-                if msg.get("__bushido").and_then(|v| v.as_str()) != Some("media")
-                    || msg.get("url").and_then(|v| v.as_str()) != Some(uri.as_str()) {
+                if msg.get("url").and_then(|v| v.as_str()) != Some(uri.as_str()) { return; }
+                let kind = msg.get("__bushido").and_then(|v| v.as_str());
+                if kind == Some("video") {
+                    if last_video.get().is_some_and(|last| now.duration_since(last).as_millis() < 200) {
+                        return;
+                    }
+                    let (Some(has), Some(supported), Some(active)) = (
+                        msg.get("hasVideo").and_then(|v| v.as_bool()),
+                        msg.get("pipSupported").and_then(|v| v.as_bool()),
+                        msg.get("pipActive").and_then(|v| v.as_bool()),
+                    ) else { return; };
+                    last_video.set(Some(now));
+                    let _ = media_app.emit_to("main", "tab-has-video", serde_json::json!({
+                        "id": media_id, "hasVideo": has, "pipSupported": supported, "pipActive": active
+                    }));
+                    return;
+                }
+                if kind != Some("media") { return; }
+                if last_media.get().is_some_and(|last| now.duration_since(last).as_millis() < 200) {
                     return;
                 }
                 let Some(state) = msg.get("state").and_then(|v| v.as_str()) else { return; };
@@ -1676,7 +1691,9 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
                                     Some("video") => {
                                         let has = msg.get("hasVideo").and_then(|v| v.as_bool()).unwrap_or(false);
                                         let _ = app_ref.emit_to("main", "tab-has-video", serde_json::json!({
-                                            "id": *tab_ref, "hasVideo": has
+                                            "id": *tab_ref, "hasVideo": has,
+                                            "pipSupported": msg.get("pipSupported").and_then(|v| v.as_bool()),
+                                            "pipActive": msg.get("pipActive").and_then(|v| v.as_bool())
                                         }));
                                     }
                                     Some("match-count") => {
@@ -2901,11 +2918,9 @@ async fn find_in_page(app: tauri::AppHandle, id: String, query: String, forward:
 
 #[tauri::command]
 async fn detect_video(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    if let Some(wv) = app.get_webview(&id) {
-        let js = r#"(function(){var videos=document.querySelectorAll('video');var has=false;videos.forEach(function(v){if(v.readyState>=2||v.src||v.querySelector('source'))has=true});if(window.chrome&&window.chrome.webview){window.chrome.webview.postMessage(JSON.stringify({__bushido:'video',hasVideo:has}))}})()"#;
-        wv.eval(js).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    let wv = app.get_webview(&id).ok_or("Unknown WebView")?;
+    wv.eval("if(typeof window.__bushidoReportVideo === 'function') window.__bushidoReportVideo();")
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2937,7 +2952,7 @@ async fn toggle_reader(app: tauri::AppHandle, id: String, font_size: u32, font: 
 #[tauri::command]
 async fn toggle_pip(app: tauri::AppHandle, id: String) -> Result<(), String> {
     if let Some(wv) = app.get_webview(&id) {
-        let js = r#"(function(){if(document.pictureInPictureElement){document.exitPictureInPicture();return}var existing=document.getElementById('__bushido_pip_host');if(existing){existing.remove();return}var v=document.querySelector('video');if(!v)return;v.removeAttribute('disablePictureInPicture');v.removeAttribute('disablepictureinpicture');var host=document.createElement('div');host.id='__bushido_pip_host';host.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483647;pointer-events:none';var shadow=host.attachShadow({mode:'closed'});var btn=document.createElement('div');btn.innerHTML='<svg width="18" height="18" viewBox="0 0 16 16" fill="none" style="vertical-align:middle;margin-right:6px"><rect x="1" y="2.5" width="14" height="11" rx="1.5" stroke="white" stroke-width="1.3"/><rect x="8" y="7" width="6" height="5" rx="1" fill="white" opacity="0.4" stroke="white" stroke-width="1"/></svg>Picture in Picture';btn.style.cssText='position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.9);color:#fff;padding:14px 24px;border-radius:10px;cursor:pointer;font:600 15px system-ui;box-shadow:0 8px 32px rgba(0,0,0,0.6);pointer-events:auto;display:flex;align-items:center;border:1px solid rgba(255,255,255,0.15);backdrop-filter:blur(12px);transition:background 0.15s';btn.onmouseenter=function(){btn.style.background='rgba(99,102,241,0.9)'};btn.onmouseleave=function(){btn.style.background='rgba(0,0,0,0.9)'};btn.onclick=function(e){e.stopPropagation();v.requestPictureInPicture().then(function(){host.remove()}).catch(function(){btn.innerHTML='PiP not available';btn.style.background='rgba(239,68,68,0.9)';setTimeout(function(){host.remove()},2000)})};shadow.appendChild(btn);document.documentElement.appendChild(host)})()"#;
+        let js = r#"(function(){if(document.pictureInPictureElement){if(typeof document.exitPictureInPicture==='function')document.exitPictureInPicture().catch(function(){});return}var existing=document.getElementById('__bushido_pip_host');if(existing){existing.remove();return}var v=Array.from(document.querySelectorAll('video')).find(function(v){return typeof v.requestPictureInPicture==='function'&&!v.disablePictureInPicture});if(!v||document.pictureInPictureEnabled!==true)return;var host=document.createElement('div');host.id='__bushido_pip_host';host.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483647;pointer-events:none';var shadow=host.attachShadow({mode:'closed'});var btn=document.createElement('div');btn.innerHTML='<svg width="18" height="18" viewBox="0 0 16 16" fill="none" style="vertical-align:middle;margin-right:6px"><rect x="1" y="2.5" width="14" height="11" rx="1.5" stroke="white" stroke-width="1.3"/><rect x="8" y="7" width="6" height="5" rx="1" fill="white" opacity="0.4" stroke="white" stroke-width="1"/></svg>Picture in Picture';btn.style.cssText='position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.9);color:#fff;padding:14px 24px;border-radius:10px;cursor:pointer;font:600 15px system-ui;box-shadow:0 8px 32px rgba(0,0,0,0.6);pointer-events:auto;display:flex;align-items:center;border:1px solid rgba(255,255,255,0.15);backdrop-filter:blur(12px);transition:background 0.15s';btn.onmouseenter=function(){btn.style.background='rgba(99,102,241,0.9)'};btn.onmouseleave=function(){btn.style.background='rgba(0,0,0,0.9)'};btn.onclick=function(e){e.stopPropagation();if(!e.isTrusted)return;v.requestPictureInPicture().then(function(){host.remove()}).catch(function(){btn.innerHTML='PiP not available';btn.style.background='rgba(239,68,68,0.9)';setTimeout(function(){host.remove()},2000)})};shadow.appendChild(btn);document.documentElement.appendChild(host)})()"#;
         wv.eval(js).map_err(|e| e.to_string())?;
     }
     Ok(())

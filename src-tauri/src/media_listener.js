@@ -3,6 +3,35 @@
   Object.defineProperty(window, '__bushidoMedia', { value: true, writable: false, configurable: false });
   var lastState = '';
   var lastTime = 0;
+  // Query the actual document rather than infer PiP from a command attempt.
+  function videoStatus() {
+    var videos = document.querySelectorAll('video');
+    var has = Array.prototype.some.call(videos, function(v) {
+      return v.readyState >= 2 || !!v.currentSrc || !!v.src || !!v.srcObject || !!v.querySelector('source');
+    });
+    var supported = document.pictureInPictureEnabled === true &&
+      Array.prototype.some.call(videos, function(v) {
+        return typeof v.requestPictureInPicture === 'function' && !v.disablePictureInPicture;
+      });
+    return {__bushido: 'video', url: location.href, hasVideo: has,
+      pipSupported: supported, pipActive: !!document.pictureInPictureElement};
+  }
+  function reportVideo() {
+    var msg = videoStatus();
+    try {
+      if (window.webkit && window.webkit.messageHandlers &&
+          window.webkit.messageHandlers.bushidoMedia) {
+        window.webkit.messageHandlers.bushidoMedia.postMessage(JSON.stringify(msg));
+      } else if (window.chrome && window.chrome.webview) {
+        window.chrome.webview.postMessage(JSON.stringify(msg));
+      }
+    } catch (_) {}
+  }
+  window.__bushidoReportVideo = reportVideo;
+  document.addEventListener('enterpictureinpicture', reportVideo, true);
+  document.addEventListener('leavepictureinpicture', reportVideo, true);
+  // Periodic snapshots recover from late registration and dropped events.
+  setInterval(reportVideo, 1500);
 
   function getMetadata() {
     var meta = {};

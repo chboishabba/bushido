@@ -283,3 +283,7 @@ Bound observer tracking to 16,384 distinct tokens per kind per document, send at
 - GTK and JavaScriptCore direct dependencies are pinned to existing lockfile versions; fix owned WebView downgrade and use GTK gio/glib types in existing native IPC. Key mapping is intentionally bounded; shifted digits, arbitrary custom keys, main-window focus/propagation, auto-repeat and Wayland/plugin initialization require native tests. Not a global-shortcut parity claim.
 
 - Focused shortcut mapping additionally rejects bare letters and shift-only text entry, even if a custom map contains such a binding. The native key handler still needs real GTK focus and propagation acceptance.
+
+## P4 video presence and standard PiP telemetry (source implemented)
+
+- Reuse media channel for bounded video snapshots with independent rate limit and native tab identity. Periodic reports include document video presence, standard PiP API support and actual active element state. Existing Windows event carries optional fields too. Frontend projects only selected-tab snapshots, clears on navigation, and requests initial detection immediately. PiP command checks API and respects disablePictureInPicture; confirmation requires trusted click in the page overlay. No claimed OS-level detached window fallback or WebKit PiP runtime support.

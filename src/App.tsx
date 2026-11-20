@@ -159,6 +159,9 @@ export default function App() {
   const setHasVideo = useFeatureStore(s => s.setHasVideo);
   const pipActive = useFeatureStore(s => s.pipActive);
   const setPipActive = useFeatureStore(s => s.setPipActive);
+  const videoByTab = useRef(new Map<string, {hasVideo: boolean; pipSupported?: boolean; pipActive?: boolean}>());
+  const [pipSupported, setPipSupported] = useState<boolean | undefined>(undefined);
+  const [videoSnapshotVersion, setVideoSnapshotVersion] = useState(0);
   const panels = useFeatureStore(s => s.panels);
   const setPanels = useFeatureStore(s => s.setPanels);
   const activePanelId = useFeatureStore(s => s.activePanelId);
@@ -680,6 +683,8 @@ export default function App() {
   useEffect(() => {
     const promises = [
       listen<{ id: string; url: string }>("tab-url-changed", (e) => {
+        videoByTab.current.delete(e.payload.id);
+        setVideoSnapshotVersion(v => v + 1);
         let favicon: string | undefined;
         let domain = "";
         try {
@@ -736,8 +741,11 @@ export default function App() {
           t.id === e.payload.id ? { ...t, blockedCount: e.payload.count } : t
         ));
       }),
-      listen<{ id: string; hasVideo: boolean }>("tab-has-video", (e) => {
-        setHasVideo(e.payload.hasVideo);
+      listen<{ id: string; hasVideo: boolean; pipSupported?: boolean; pipActive?: boolean }>("tab-has-video", (e) => {
+        videoByTab.current.set(e.payload.id, e.payload);
+        // Current-tab projection is refreshed by the effect below and
+        // by snapshots; background views never change the toolbar.
+        setVideoSnapshotVersion(v => v + 1);
       }),
       listen<{ id: string; state: string; title: string; artist?: string; currentTime?: number; duration?: number; playbackRate?: number; metaTitle?: string }>("tab-media-state", (e) => {
         setTabs(prev => prev.map(t =>
@@ -2039,8 +2047,27 @@ export default function App() {
   // --- picture in picture ---
   const togglePip = useCallback(() => {
     if (!activeTab) return;
-    invoke("toggle_pip", { id: activeTab });
-  }, [activeTab]);
+    if (pipSupported === false) {
+      useUiStore.getState().showError("Picture-in-picture is not available for this video");
+      return;
+    }
+    invoke("toggle_pip", { id: activeTab }).catch(() =>
+      useUiStore.getState().showError("Unable to request picture-in-picture"));
+  }, [activeTab, pipSupported]);
+
+  useEffect(() => {
+    const snapshot = videoByTab.current.get(activeTab);
+    setHasVideo(snapshot?.hasVideo ?? false);
+    setPipActive(snapshot?.pipActive === true);
+    setPipSupported(snapshot?.pipSupported ?? undefined);
+  }, [activeTab, videoSnapshotVersion]);
+
+  useEffect(() => {
+    const live = new Set(tabs.map(t => t.id));
+    for (const id of videoByTab.current.keys()) {
+      if (!live.has(id)) videoByTab.current.delete(id);
+    }
+  }, [tabs]);
 
   // detect videos on current page
   useEffect(() => {
@@ -2054,6 +2081,7 @@ export default function App() {
     const detectVideo = () => {
       invoke("detect_video", { id: activeTab });
     };
+    detectVideo();
     // poll every 3s for up to 30s — YouTube/video sites load lazily
     const interval = setInterval(detectVideo, 3000);
     const stop = setTimeout(() => clearInterval(interval), 30000);

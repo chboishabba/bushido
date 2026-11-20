@@ -191,3 +191,7 @@ Exercise playing/paused/ended and metadata updates against the existing frontend
 ## Linux native shortcut acceptance
 
 Test Ctrl+T, Ctrl+W, Ctrl+Shift+T, Ctrl+= and F11 in main, tab and Glance views; verify one frontend action per key sequence, unbound keys reach the page, rebind uses the live map, focus-out clears held keys, and synthetic JS keyboard events cannot reach the native GTK handler. Test Wayland and X11 independently; global plugin initialization remains an open compatibility check. Pure mapping tests added but not executed.
+
+## Video and PiP acceptance
+
+Exercise initial/lazy video, removal, background tabs, active-tab switches and navigation reset. Confirm unsupported PiP is reported, disabled video is respected, synthetic overlay clicks cannot activate PiP, and confirmed enter/leave states—not requested toggles—drive the toolbar. Test real WebKitGTK standard API availability; no native detached PiP fallback yet. Frame provenance and URL-level stale messages remain open.
