@@ -107,6 +107,9 @@ PAGE = b"""<!doctype html><meta charset=utf-8><title>Bushido TLS origin fixture<
 <script>
 fetch('/fetch').catch(()=>{});
 fetch('/redirect').catch(()=>{});
+fetch('/extension-allow').catch(()=>{});
+fetch('/extension-deny').catch(()=>{});
+fetch('/extension-redirect-deny').catch(()=>{});
 try { new Worker('/worker.js'); } catch (_) {}
 </script><p>Opaque TLS tunnel positive controls</p>"""
 ROUTES = {
@@ -121,6 +124,15 @@ ROUTES = {
     "/redirect-target": ("redirect_target_route",200,"text/plain",b"fixture redirected"),
 }
 REQUIRED_ROUTES = sorted(route[0] for route in ROUTES.values())
+# Optional A/B controls; baseline must receive all four, extension run
+# must retain allow and redirect-source while denying both target routes.
+EXTENSION_ROUTES = {
+    "/extension-allow": ("extension_allow_route",200,"text/plain",b"allow control"),
+    "/extension-deny": ("extension_deny_route",200,"text/plain",b"baseline deny control"),
+    "/extension-redirect-deny": ("extension_redirect_route",302,"text/plain",b"redirect control"),
+    "/extension-redirect-deny-target": ("extension_redirect_target_route",200,"text/plain",b"baseline redirect target"),
+}
+ROUTES.update(EXTENSION_ROUTES)
 
 
 def origin_route(path, hosts):
@@ -145,7 +157,7 @@ class OriginHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control","no-store")
         self.send_header("Connection","close")
         if status==302:
-            self.send_header("Location","/redirect-target")
+            self.send_header("Location","/extension-redirect-deny-target" if category=="extension_redirect_route" else "/redirect-target")
         self.end_headers()
         self.wfile.write(body)
 
@@ -195,6 +207,8 @@ class Proxy:
                 "origin_http_observed":sum(routes.values()),
                 "origin_routes":routes,
                 "missing_origin_routes":[k for k in REQUIRED_ROUTES if not routes.get(k)],
+                "extension_control_routes":{r[0]:routes.get(r[0],0) for r in EXTENSION_ROUTES.values()},
+                "extension_enforcement_verified":False,
                 "native_resource_correlation_verified":False}
 
     def write_receipt(self):
@@ -259,6 +273,7 @@ def read_exact(sock, count):
 class Tests(unittest.TestCase):
     def test_origin_route_allowlist(self):
         self.assertEqual(len(REQUIRED_ROUTES),9)
+        self.assertEqual(len(EXTENSION_ROUTES),4)
         for path,route in ROUTES.items():
             self.assertEqual(origin_route(path,[HOST]),route)
         for path in ('/?private=1','/unknown','http://'+HOST+'/','/redirect-target?x=1'):

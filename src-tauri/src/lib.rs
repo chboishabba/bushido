@@ -23,6 +23,8 @@ mod linux_desktop_actions;
 #[cfg(target_os = "linux")]
 mod linux_egress_fixture;
 #[cfg(target_os = "linux")]
+mod linux_extension_fixture;
+#[cfg(target_os = "linux")]
 mod linux_destination_scope;
 #[cfg(all(target_os = "linux", debug_assertions))]
 mod linux_document_epoch;
@@ -1240,6 +1242,7 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
             linux_workspace_data_directory(profile_name.as_deref())
         ));
         if let Some(proxy) = fixture.proxy() { builder = builder.proxy_url(proxy); }
+        if let Some(path) = fixture.extension_path()? { builder = builder.extensions_path(path); }
     }
 
     if is_panel {
@@ -2895,6 +2898,7 @@ async fn open_glance(app: tauri::AppHandle, url: String, glance_id: String, side
             linux_workspace_data_directory(Some(&workspace))
         ));
         if let Some(proxy) = fixture.proxy() { builder = builder.proxy_url(proxy); }
+        if let Some(path) = fixture.extension_path()? { builder = builder.extensions_path(path); }
     }
     // Glance can navigate independently after creation. Keep its native
     // filter aligned with each destination BEFORE approving the request.

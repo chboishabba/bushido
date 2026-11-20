@@ -511,3 +511,6 @@ Native vault save dialog polling/read deadline and prior fill callback deadline 
 
 ### P2.4e nullable sent-request and fixed redirect witness
 - Native v4 resource observer uses GLib checked GValues with Option<URIResponse>, no generated nonnullable reference. Original object/epoch sequence and exact fixed 302 route edge; explicit malformed/unlinked/omission counters, 16 events per tracked resource. Three Rust tests authored, not run. Web extension pre-send API has page but no frame/type argument. Pinned native build, actual callback, arbitrary redirect/physical correlation and trusted extension admission OPEN.
+
+### P2.4e debug web-process extension source and loader
+- Original extensions_path chain reused; explicit private single ELF and SHA-256 check, optional separate clean source build receipt, isolated debug scope only. Native C page-created/send-request exact synthetic direct/redirect target cancellation; bounded fixed messages, independent A/B origin control routes and missing baseline rules. UI message receiver, extension build/loading and request enforcement acceptance OPEN; source/binary attestation and TOCTOU OPEN. One Rust test authored, not run.
