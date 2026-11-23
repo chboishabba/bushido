@@ -34,7 +34,9 @@ pub(crate) fn launch_snapshot(engine:&Engine)->String {
 }
 
 pub(crate) fn snapshot(engine:&Engine)->String {
-    let table:String=ROUTES.iter().map(|route|decision(engine,&format!("{ROOT}{route}"))).collect();
+    let table:String=ROUTES.iter().map(|route| {
+        decision(engine,&format!("{ROOT}{route}"))
+    }).collect();
     format!("bushido.fixture.policy.v1:{table}")
 }
 
@@ -49,8 +51,8 @@ mod tests {
     }
     #[test]
     fn exact_rules_and_allow_controls() {
-        let e=engine(&["|https://bushido-tunnel.test/extension-deny|",
-            "|https://bushido-tunnel.test/extension-redirect-deny-target|"]);
+        let e=engine(&["|https://bushido-tunnel.test/extension-deny|$all",
+            "|https://bushido-tunnel.test/extension-redirect-deny-target|$all"]);
         assert_eq!(snapshot(&e),"bushido.fixture.policy.v1:ADAD");
         assert_eq!(decision(&e,"https://bushido-tunnel.test/extension-deny?extra=1"),'A');
     }
