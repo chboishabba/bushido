@@ -16,6 +16,8 @@ mod linux_find;
 mod linux_vault;
 #[cfg(target_os = "linux")]
 mod linux_vault_save;
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod linux_native_filter;
 mod import;
 mod screenshot;
 #[cfg(target_os = "linux")]
@@ -3680,7 +3682,8 @@ async fn change_linux_webview_filter(
     id: &str,
     enabled: bool,
 ) -> Result<bool, String> {
-    use webkit2gtk::{UserContentFilterStore, UserContentFilterStoreExt, UserContentManagerExt, WebViewExt};
+    use crate::linux_native_filter::{add_filter, UserContentFilterStore};
+    use webkit2gtk::{UserContentManagerExt, WebViewExt};
     let view = app.get_webview(id).ok_or_else(|| format!("Unknown WebView: {id}"))?;
     let updates = app.state::<Arc<NativeFilterUpdateState>>().inner().clone();
     let ticket = updates.issue(id);
@@ -3738,7 +3741,7 @@ async fn change_linux_webview_filter(
             match result {
                 Ok(filter) => {
                     manager.remove_all_filters();
-                    manager.add_filter(&filter);
+                    add_filter(&manager, &filter);
                     updates_for_callback.mark_applied(&id_for_callback, ticket, true);
                     let _ = tx.send(Ok(true));
                 }

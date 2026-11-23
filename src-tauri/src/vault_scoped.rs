@@ -67,7 +67,7 @@ pub(super) fn save_admitted(state: &VaultState, workspace: &str, origin: &str, u
     let cipher = seal(&key, &nonce, &aad(&id, workspace, origin, user), pass)?;
     let wrapped = dpapi_encrypt(&cipher)?;
     let conn = state.open_db()?;
-    state.with_session(epoch, || {
+    state.with_session(epoch, || -> Result<(), String> {
         if !permitted() { return Err("Login save authorization expired".into()); }
         let count = conn.execute(
             "INSERT INTO vault_scoped_v2 (id,workspace,origin,username,password_enc,nonce,updated_at)

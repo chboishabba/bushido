@@ -39,7 +39,7 @@ use webkit2gtk::{
   NavigationPolicyDecisionExt, NetworkProxyMode, NetworkProxySettings, PermissionRequestExt,
   PolicyDecisionType,
   PrintOperationExt, SettingsExt, URIRequest, URIRequestExt, UserContentInjectedFrames,
-  UserContentManager, UserContentManagerExt, UserContentFilterStore, UserContentFilterStoreExt,
+  UserContentManager, UserContentManagerExt,
   UserScript, UserScriptInjectionTime,
   WebContextExt as Webkit2gtkWeContextExt, WebView, WebViewExt, WebsiteDataManagerExt,
   WebsiteDataManagerExtManual, WebsitePolicies,
@@ -94,6 +94,91 @@ use crate::{
 
 use self::web_context::WebContextExt;
 
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod native_content_filter {
+  use gtk::{gio, glib};
+  use glib::translate::{FromGlibPtrFull, ToGlibPtr};
+  use std::{ffi::CString, ptr::NonNull};
+  use webkit2gtk::UserContentManager;
+  use webkit2gtk_sys as ffi;
+
+  glib::wrapper! {
+    pub struct UserContentFilter(Object<ffi::WebKitUserContentFilter>);
+
+    match fn {
+      type_ => || ffi::webkit_user_content_filter_get_type(),
+    }
+  }
+
+  glib::wrapper! {
+    pub struct UserContentFilterStore(Object<ffi::WebKitUserContentFilterStore>);
+
+    match fn {
+      type_ => || ffi::webkit_user_content_filter_store_get_type(),
+    }
+  }
+
+  impl UserContentFilterStore {
+    pub fn new(path: &str) -> Self {
+      let path = CString::new(path).expect("filter store path cannot contain NUL");
+      unsafe { glib::translate::from_glib_full(ffi::webkit_user_content_filter_store_new(path.as_ptr())) }
+    }
+
+    pub fn save<P: FnOnce(Result<UserContentFilter, glib::Error>) + 'static>(
+      &self,
+      identifier: &str,
+      source: &glib::Bytes,
+      cancellable: Option<&gio::Cancellable>,
+      callback: P,
+    ) {
+      let user_data = Box::new(glib::thread_guard::ThreadGuard::new(callback));
+
+      unsafe extern "C" fn trampoline<P: FnOnce(Result<UserContentFilter, glib::Error>) + 'static>(
+        source_object: *mut glib::gobject_ffi::GObject,
+        result: *mut gio::ffi::GAsyncResult,
+        user_data: glib::ffi::gpointer,
+      ) {
+        let mut error = std::ptr::null_mut();
+        let filter = ffi::webkit_user_content_filter_store_save_finish(
+          source_object as *mut ffi::WebKitUserContentFilterStore,
+          result,
+          &mut error,
+        );
+        let result = if error.is_null() {
+          NonNull::new(filter)
+            .map(|ptr| UserContentFilter::from_glib_full(ptr.as_ptr()))
+            .ok_or_else(|| glib::Error::new(glib::FileError::Failed, "WebKitGTK returned no filter"))
+        } else {
+          Err(glib::translate::from_glib_full(error))
+        };
+        let callback: Box<glib::thread_guard::ThreadGuard<P>> = Box::from_raw(user_data as *mut _);
+        callback.into_inner()(result);
+      }
+
+      let identifier = CString::new(identifier).expect("filter identifier cannot contain NUL");
+      unsafe {
+        ffi::webkit_user_content_filter_store_save(
+          self.to_glib_none().0,
+          identifier.as_ptr(),
+          source.to_glib_none().0,
+          cancellable.to_glib_none().0,
+          Some(trampoline::<P>),
+          Box::into_raw(user_data) as _,
+        );
+      }
+    }
+  }
+
+  pub fn add_filter(manager: &UserContentManager, filter: &UserContentFilter) {
+    unsafe {
+      ffi::webkit_user_content_manager_add_filter(
+        manager.to_glib_none().0,
+        filter.to_glib_none().0,
+      );
+    }
+  }
+}
+
 const WEBVIEW_ID: &str = "webview_id";
 
 // Developer-only native WebKitGTK network enforcement probe.
@@ -107,13 +192,14 @@ const WEBVIEW_ID: &str = "webview_id";
 #[cfg(all(target_os = "linux", debug_assertions))]
 thread_local! {
   static LINUX_PROBE_FILTER_CACHE:
-    std::cell::RefCell<Option<(Vec<u8>, webkit2gtk::UserContentFilter)>> =
+    std::cell::RefCell<Option<(Vec<u8>, native_content_filter::UserContentFilter)>> =
     std::cell::RefCell::new(None);
 }
 
 #[cfg(all(target_os = "linux", debug_assertions))]
 fn install_linux_fixture_filter(webview: &WebView) -> Result<()> {
   use std::io;
+  use native_content_filter::{UserContentFilterStore, add_filter};
   let Some(source_path) = std::env::var_os("BUSHIDO_LINUX_FILTER_JSON") else {
     return Ok(());
   };
@@ -132,7 +218,7 @@ fn install_linux_fixture_filter(webview: &WebView) -> Result<()> {
       if previous == &content { Some(filter.clone()) } else { None }
     })
   }) {
-    manager.add_filter(&cached);
+    add_filter(&manager, &cached);
     return Ok(());
   }
   let cache = dirs::cache_dir().ok_or_else(|| {
@@ -151,7 +237,7 @@ fn install_linux_fixture_filter(webview: &WebView) -> Result<()> {
   loop {
     match receiver.try_recv() {
       Ok(Ok(filter)) => {
-        manager.add_filter(&filter);
+        add_filter(&manager, &filter);
         LINUX_PROBE_FILTER_CACHE.with(|cache| {
           *cache.borrow_mut() = Some((content.clone(), filter));
         });

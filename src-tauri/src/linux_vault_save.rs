@@ -178,8 +178,11 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
                 }
             });
         });
+        let handler = Rc::new(RefCell::new(Some(handler)));
         if !manager.register_script_message_handler_in_world(&channel, WORLD) {
-            manager.disconnect(handler);
+            if let Some(handler) = handler.borrow_mut().take() {
+                manager.disconnect(handler);
+            }
             return;
         }
         let load_state = state.clone();
@@ -196,11 +199,14 @@ pub(crate) fn install(app: &tauri::AppHandle, webview: &tauri::Webview, id: &str
         let destroy_state = state.clone();
         let destroy_gen = generation.clone();
         let destroy_channel = channel.clone();
+        let destroy_handler = handler.clone();
         view.connect_destroy(move |_| {
             destroy_gen.fetch_add(1, Ordering::SeqCst);
             destroy_state.borrow_mut().take();
             manager.unregister_script_message_handler_in_world(&destroy_channel, WORLD);
-            manager.disconnect(handler);
+            if let Some(handler) = destroy_handler.borrow_mut().take() {
+                manager.disconnect(handler);
+            }
         });
         arm(&view, &channel, &state);
     }).map_err(|e| e.to_string())

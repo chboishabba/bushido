@@ -67,6 +67,7 @@ lz4_flex = "0.11"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "=0.2.180"
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+webkit2gtk-sys = "=2.0.2"
 gtk = "=0.18.2"
 javascriptcore-rs = "=1.1.2"
 wry = { version = "=0.54.1", default-features = false, features = ["os-webview"] }

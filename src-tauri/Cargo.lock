@@ -578,6 +578,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "webkit2gtk",
+ "webkit2gtk-sys",
  "webview2-com",
  "windows",
  "windows-core 0.61.2",
