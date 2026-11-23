@@ -19,6 +19,7 @@ import threading
 import time
 import unittest
 import uuid
+import re
 
 HOST = "bushido-tunnel.test"
 AUTHORITY = HOST + ":443"
@@ -185,6 +186,22 @@ class Origin(HTTPServer):
             raise
 
 
+def process_claim(sock):
+    """Producer claim of /proc identity, revalidated by independent witness."""
+    pid=os.getpid()
+    raw=Path(f"/proc/{pid}/stat").read_text()
+    tail=raw.rpartition(") ")[2].split()
+    if len(tail)<20:
+        raise ValueError("Invalid proc stat")
+    link=os.readlink(f"/proc/self/fd/{sock.fileno()}")
+    match=re.fullmatch(r"socket:\\[(\\d+)\\]",link)
+    if match is None:
+        raise ValueError("No listener socket inode")
+    return {"pid":pid,"start_ticks":int(tail[19]),
+            "netns":os.readlink("/proc/self/ns/net"),
+            "listener_inode":int(match[1])}
+
+
 class Proxy:
     def __init__(self, origin_port, receipt=None, origin=None):
         if type(origin_port) is not int or not 1024 <= origin_port <= 65535:
@@ -199,6 +216,7 @@ class Proxy:
         self.listener.bind(("127.0.0.1",0))
         self.listener.listen(8)
         self.listener.settimeout(0.5)
+        self.process_claim=process_claim(self.listener)
         self.stop=threading.Event()
 
     def snapshot(self):
@@ -206,6 +224,8 @@ class Proxy:
         return {"schema":1,"fixture":"fixed_loopback_tls_tunnel_v3",
                 "fixture_run_id":self.run_id,"finalized":self.finalized,
                 "origin_port":self.destination[1],
+                "proxy_port":self.listener.getsockname()[1],
+                "proxy_process":self.process_claim,
                 "state":"proposal_only","native_acceptance":"OPEN",
                 "external_forwarding":False,"dns_bound":False,
                 "counts":dict(self.counts),
@@ -324,6 +344,7 @@ class Tests(unittest.TestCase):
                 self.assertIn(b"403",s.recv(1024))
         finally:
             proxy.stop.set();thread.join(4)
+        self.assertGreater(proxy.process_claim["listener_inode"],0)
         self.assertEqual(proxy.counts["denied"],1)
         self.assertEqual(proxy.counts["connect_established"],0)
 
