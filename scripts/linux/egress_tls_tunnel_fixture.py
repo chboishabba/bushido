@@ -194,7 +194,7 @@ def process_claim(sock):
     if len(tail)<20:
         raise ValueError("Invalid proc stat")
     link=os.readlink(f"/proc/self/fd/{sock.fileno()}")
-    match=re.fullmatch(r"socket:\\[(\\d+)\\]",link)
+    match=re.fullmatch(r"socket:\[(\d+)\]",link)
     if match is None:
         raise ValueError("No listener socket inode")
     return {"pid":pid,"start_ticks":int(tail[19]),
