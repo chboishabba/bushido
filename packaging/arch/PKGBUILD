@@ -15,7 +15,7 @@ makedepends=('rust' 'cargo' 'nodejs' 'npm' 'pkgconf' 'librsvg'
              'libxdo' 'libayatana-appindicator')
 source=('bushido-source.tar.gz')
 sha256sums=('__LOCAL_SOURCE_SHA256__')
-options=('!debug')
+options=('!debug' '!lto')
 
 prepare() {
   cd "$srcdir/bushido-source"
