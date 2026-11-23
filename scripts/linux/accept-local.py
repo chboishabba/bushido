@@ -116,6 +116,7 @@ def execute(root, out):
     stage("egress_proxy_fixture", [sys.executable, "scripts/linux/egress_proxy_fixture.py", "test"])
     stage("egress_tls_tunnel_fixture", [sys.executable, "scripts/linux/egress_tls_tunnel_fixture.py", "test"])
     stage("extension_ab_reconciler", [sys.executable, "scripts/linux/reconcile-extension-ab.py", "--self-test"])
+    stage("itir_bushido_candidate_bridge", [sys.executable, "scripts/linux/itir-bushido-ab.py", "--self-test"])
     stage("npm_install", ["npm", "ci"], ("node", "npm"))
     stage("frontend_build", ["npm", "run", "build"], ("npm_install",))
     stage("frontend_test", ["npm", "test"], ("npm_install",))
