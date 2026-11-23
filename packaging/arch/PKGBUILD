@@ -35,8 +35,11 @@ build() {
   export CARGO_HOME="${CARGO_HOME:-$srcdir/bushido-cargo-home}"
   npm ci --no-audit --no-fund
   npm run build
-  cargo build --locked --release --bin bushido-browser \
-    --manifest-path src-tauri/Cargo.toml
+  # The CachyOS/LLD release link currently drops bundled mimalloc/SQLite
+  # symbols under ThinLTO; keep this package candidate linkable until that
+  # upstream release-profile issue is resolved.
+  cargo rustc --locked --release --bin bushido-browser \
+    --manifest-path src-tauri/Cargo.toml -- -C lto=off
 }
 
 check() {
