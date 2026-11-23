@@ -87,6 +87,8 @@ def self_test():
         out = pathlib.Path(tmp) / 'fixture.deb'
         for path in ('DEBIAN', 'usr/bin', 'usr/share/applications', 'usr/share/icons/hicolor/32x32/apps', 'usr/share/doc/bushido'):
             (root / path).mkdir(parents=True)
+        # dpkg-deb requires the package control directory to be traversable.
+        (root / 'DEBIAN').chmod(0o755)
         shutil.copy2('/bin/true', root / 'usr/bin/bushido-browser')
         (root / 'usr/share/icons/hicolor/32x32/apps/bushido.png').write_bytes(b'fixture')
         (root / 'usr/share/doc/bushido/LICENSE').write_text('fixture license')
