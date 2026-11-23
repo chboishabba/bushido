@@ -119,6 +119,7 @@ def execute(root, out):
     stage("itir_bushido_candidate_bridge", [sys.executable, "scripts/linux/itir-bushido-ab.py", "--self-test"])
     stage("proc_socket_witness", [sys.executable, "scripts/linux/proc-socket-witness.py", "--self-test"])
     stage("proc_provenance_join", [sys.executable, "scripts/linux/bind-proc-provenance.py", "--self-test"])
+    stage("itir_socket_candidate", [sys.executable, "scripts/linux/itir-bushido-socket.py", "--self-test"])
     stage("npm_install", ["npm", "ci"], ("node", "npm"))
     stage("frontend_build", ["npm", "run", "build"], ("npm_install",))
     stage("frontend_test", ["npm", "test"], ("npm_install",))
