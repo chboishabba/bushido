@@ -111,6 +111,7 @@ def execute(root, out):
     ):
         stage(name, [sys.executable, "scripts/linux/" + file, flag])
     stage("source_candidate_fixture", [sys.executable, "scripts/linux/test-source-candidate.py"])
+    stage("arch_package_fixture", [sys.executable, "scripts/linux/check-arch-package.py", "--self-test"])
     stage("witness_receipt_fixture", [sys.executable, "scripts/linux/witness-receipt.py", "--self-test"])
     stage("itir_evidence_fixture", [sys.executable, "scripts/linux/itir-evidence-check.py", "--self-test"])
     stage("egress_proxy_fixture", [sys.executable, "scripts/linux/egress_proxy_fixture.py", "test"])

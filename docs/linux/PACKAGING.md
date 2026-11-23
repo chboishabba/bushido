@@ -1,4 +1,4 @@
-# Linux package candidate (P5.1)
+# Linux packaging candidates (P5.1)
 
 Status: source configuration and local static package-check tooling only. No Bushido Linux package has been built or installed by this packet.
 
@@ -58,3 +58,22 @@ Local independent Linux process/socket reference checks: 11/11 PASS. This is not
 
 ### Source distribution candidate
 See [SOURCE_DISTRIBUTION.md](SOURCE_DISTRIBUTION.md) for the exact-commit candidate generator, dependency/notice inventory, receipt and outstanding review. It does not authorize redistribution or substitute for the build-specific corresponding-source package.
+
+
+## Arch/CachyOS first — local native makepkg candidate (P5.2)
+
+Arch/CachyOS is the first native packaging target. Debian remains an independent cross-distro package contract; never install a Debian archive on Arch. This Arch source candidate is not an AUR submission or a release.
+
+From a **clean, committed** Linux checkout on a non-root Arch host with `base-devel`, `pacman`, `libarchive`, `nodejs`, `npm`, `rust`, `cargo`, `webkit2gtk-4.1` (2.40+), GTK3, libsoup3, OpenSSL and the listed `PKGBUILD` dependencies:
+
+```sh
+scripts/linux/build-arch.sh
+```
+
+The wrapper creates a private temporary build directory, `git archive` of exact HEAD, and a local SHA256-pinned copy of `packaging/arch/PKGBUILD`. It invokes `makepkg --noconfirm --cleanbuild` **without** `--syncdeps`, `--install`, sudo, AUR submission or publication. Build uses `npm ci`, locked Cargo release, and source-tree local forks; `check()` runs Cargo and frontend tests. The source checksum placeholder in the committed template is intentionally **not** a runnable bypass: only the wrapper resolves it against the actual staged source tarball. A Git commit alone does not make a signed/reproducible source distribution. This candidate depends on configured npm/Cargo sources unless caches are present.
+
+Static validation checks source checksum, safe archive layout, package identity, launcher/icon/license, desktop policy, package file list. Output includes package and local build receipt in a newly created private directory, printed by the wrapper. The installed path is `/usr/bin/bushido-browser`; no implicit default-browser registration, URL/MIME handlers or auto-updater. The original desktop template icon placeholder is replaced only in the package copy. No post-install hooks.
+
+Manual acceptance after reviewing the artifact: first inspect `pacman -Qip /path/to/*.pkg.tar.zst` and `pacman -Qlp ...`; use a **disposable VM/profile** for `sudo pacman -U`, verify Wayland and X11 launches, storage/keyring, browser tab behavior and permissions, then `sudo pacman -R bushido-browser` and verify neither user data nor default-browser associations changed. Live package installation/removal, library closure review, source/legal notices, reproducibility and production security remain OPEN. AUR submission only after those gates.
+
+Sources: ArchWiki PKGBUILD and official makepkg/pacman documentation. No proprietary downloaded runtime is used.
