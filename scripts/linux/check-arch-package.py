@@ -29,7 +29,7 @@ def source_check(pkgbuild, archive):
     with tarfile.open(archive,"r:gz") as tar:
         names=tar.getnames()
         if not names or len(names)>20000 or any(
-            not n.startswith("bushido-source/") or
+            (n != "bushido-source" and not n.startswith("bushido-source/")) or
             any(p in ("..","") for p in n.rstrip("/").split("/")) for n in names
         ):raise ValueError("Unexpected source path")
         for member in tar:
