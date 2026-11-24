@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bushido geometry fixture</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}body{background-color:#e5eef8;background-image:linear-gradient(#839cb8 1px,transparent 1px),linear-gradient(90deg,#839cb8 1px,transparent 1px);background-size:50px 50px;border-top:8px solid red;border-left:8px solid #00c000;border-right:8px solid blue;border-bottom:8px solid orange;font:16px monospace}main{margin:20px;background:white;padding:12px;width:max-content;max-width:90%}pre{white-space:pre-wrap}#corner{position:fixed;bottom:12px;right:12px;background:white}
+</style>
+<main><strong>TOP LEFT — native viewport fixture</strong><pre id="metrics"></pre><a id="next">Navigate to identical document</a> <button id="full">Fullscreen</button></main><div id="corner">BOTTOM RIGHT</div>
+<script>
+const q=new URLSearchParams(location.search);
+document.getElementById('next').href='?page='+(q.get('page')==='B'?'A':'B');
+function measure(){const v=window.visualViewport;document.getElementById('metrics').textContent=JSON.stringify({page:q.get('page')||'A',inner:[innerWidth,innerHeight],dpr:devicePixelRatio,scroll:[scrollX,scrollY],visual:v&&{width:v.width,height:v.height,offsetLeft:v.offsetLeft,offsetTop:v.offsetTop,scale:v.scale}},null,2)}
+addEventListener('resize',measure);addEventListener('scroll',measure);visualViewport?.addEventListener('resize',measure);visualViewport?.addEventListener('scroll',measure);document.getElementById('full').onclick=()=>document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen();measure();
+</script></html>
