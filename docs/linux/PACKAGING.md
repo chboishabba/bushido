@@ -77,3 +77,7 @@ Static validation checks source checksum, safe archive layout, package identity,
 Manual acceptance after reviewing the artifact: first inspect `pacman -Qip /path/to/*.pkg.tar.zst` and `pacman -Qlp ...`; use a **disposable VM/profile** for `sudo pacman -U`, verify Wayland and X11 launches, storage/keyring, browser tab behavior and permissions, then `sudo pacman -R bushido-browser` and verify neither user data nor default-browser associations changed. Live package installation/removal, library closure review, source/legal notices, reproducibility and production security remain OPEN. AUR submission only after those gates.
 
 Sources: ArchWiki PKGBUILD and official makepkg/pacman documentation. No proprietary downloaded runtime is used.
+
+
+### Arch baseline vs current issue #7 source
+User-reported Arch/CachyOS acceptance for the earlier package: successful native `.pkg.tar.zst` build and metadata inspection, 134 Rust tests, 30 frontend tests, and direct GUI navigation to YouTube. The observed issue #7 was native child WebKit painting over the React sidebar/titlebar. Geometry repairs now exist on the PR branch but have **not** been rebuilt or verified on the user's local system. The already installed pacman package may not contain any newer source repair. Prefer direct current release binary smoke, then package/reinstall only after viewport acceptance.
