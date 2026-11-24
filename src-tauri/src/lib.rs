@@ -3294,6 +3294,17 @@ mod linux_webview_layout_tests {
     }
 
     #[test]
+    fn stale_layout_sequences_and_legacy_replays() {
+        use super::accept_linux_layout_sequence;
+        assert!(accept_linux_layout_sequence(0, Some(11)));
+        assert!(!accept_linux_layout_sequence(11, Some(11)));
+        assert!(!accept_linux_layout_sequence(11, Some(10)));
+        assert!(!accept_linux_layout_sequence(11, None));
+        assert!(accept_linux_layout_sequence(11, Some(12)));
+        assert!(!accept_linux_layout_sequence(0, Some(0)));
+    }
+
+    #[test]
     fn invalid_or_outside_geometry_never_paints() {
         assert_eq!(bounded_linux_pane(&pane(f64::NAN, 0.0, 200.0, 400.0), 300.0, 40.0, 1300.0, 740.0), None);
         assert_eq!(bounded_linux_pane(&pane(1100.0, 0.0, 200.0, 400.0), 300.0, 40.0, 1300.0, 740.0), None);
@@ -3302,18 +3313,32 @@ mod linux_webview_layout_tests {
 }
 
 #[cfg(target_os = "linux")]
+static NATIVE_LAYOUT_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[cfg(target_os = "linux")]
 static NATIVE_LAYOUT_EPOCH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static NATIVE_CHROME_INSETS: parking_lot::Mutex<(f64, f64)> =
+    parking_lot::Mutex::new((0.0, 0.0));
+
+#[cfg(target_os = "linux")]
+fn accept_linux_layout_sequence(previous: u64, incoming: Option<u64>) -> bool {
+    match incoming { Some(n) => n > previous, None => previous == 0 }
+}
 
 #[tauri::command]
 async fn layout_webviews(
     app: tauri::AppHandle, panes: Vec<PaneRectArg>, focused_tab_id: String,
     sidebar_w: f64, top_offset: f64, sequence: Option<u64>,
 ) -> Result<(), String> {
+    // Serialize sequence admission AND dispatch of geometry messages.
     #[cfg(target_os = "linux")]
-    if let Some(sequence) = sequence {
-        if sequence == 0 { return Err("invalid layout sequence".into()); }
-        if NATIVE_LAYOUT_EPOCH.fetch_max(sequence, Ordering::SeqCst) >= sequence { return Ok(()); }
+    let _serial = NATIVE_LAYOUT_SERIAL.lock().await;
+    #[cfg(target_os = "linux")]
+    {
+        let previous = NATIVE_LAYOUT_EPOCH.load(Ordering::SeqCst);
+        if !accept_linux_layout_sequence(previous, sequence) { return Ok(()); }
+        if let Some(n) = sequence { NATIVE_LAYOUT_EPOCH.store(n, Ordering::SeqCst); }
     }
     let state = app.state::<WebviewState>();
     let panel_state = app.state::<PanelState>();
@@ -3326,6 +3351,13 @@ async fn layout_webviews(
         let scale = window.scale_factor().map_err(|e| e.to_string())?;
         (size.width as f64 / scale, size.height as f64 / scale)
     };
+    #[cfg(target_os = "linux")]
+    {
+        if ![sidebar_w, top_offset].iter().all(|v| v.is_finite()) || sidebar_w < 0.0 || top_offset < 0.0 {
+            return Err("invalid native chrome insets".into());
+        }
+        *NATIVE_CHROME_INSETS.lock() = (sidebar_w, top_offset);
+    }
     for (tab_id, _) in &tabs {
         if panel_ids.contains(tab_id) { continue; }
         if let Some(wv) = app.get_webview(tab_id) {
@@ -3687,9 +3719,40 @@ async fn unregister_panel(app: tauri::AppHandle, id: String) -> Result<(), Strin
 
 #[tauri::command]
 async fn position_panel(app: tauri::AppHandle, id: String, x: f64, y: f64, w: f64, h: f64) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    let _serial = NATIVE_LAYOUT_SERIAL.lock().await;
     if let Some(wv) = app.get_webview(&id) {
-        let _ = wv.set_position(tauri::LogicalPosition::new(x, y));
-        let _ = wv.set_size(tauri::LogicalSize::new(w, h));
+        #[cfg(target_os = "linux")]
+        {
+            // Explicit offscreen hides are allowed. Visible panels use the
+            // same atomic, bounded native geometry as ordinary tabs.
+            if x < 0.0 || y < 0.0 || w <= 0.0 || h <= 0.0 {
+                wv.set_position(tauri::LogicalPosition::new(-9999.0, -9999.0))
+                    .map_err(|e| e.to_string())?;
+            } else {
+                let window = app.get_window("main").ok_or("no main window")?;
+                let size = window.inner_size().map_err(|e| e.to_string())?;
+                let scale = window.scale_factor().map_err(|e| e.to_string())?;
+                let (sidebar, top) = *NATIVE_CHROME_INSETS.lock();
+                let pane = PaneRectArg { tab_id: id, x: x - sidebar, y: y - top, w, h };
+                if let Some((px, py, pw, ph)) = bounded_linux_pane(
+                    &pane, sidebar, top, size.width as f64 / scale, size.height as f64 / scale,
+                ) {
+                    wv.set_bounds(tauri::Rect {
+                        position: tauri::LogicalPosition::new(px, py).into(),
+                        size: tauri::LogicalSize::new(pw, ph).into(),
+                    }).map_err(|e| e.to_string())?;
+                } else {
+                    wv.set_position(tauri::LogicalPosition::new(-9999.0, -9999.0))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = wv.set_position(tauri::LogicalPosition::new(x, y));
+            let _ = wv.set_size(tauri::LogicalSize::new(w, h));
+        }
     }
     Ok(())
 }
