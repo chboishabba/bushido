@@ -63,7 +63,9 @@ Local installation using an existing ITIR environment with MCP SDK, or a separat
 ```sh
 python3 -m venv ~/.local/share/bushido-mcp/venv
 ~/.local/share/bushido-mcp/venv/bin/pip install 'mcp>=1.12,<2'
-codex mcp add bushido -- ~/.local/share/bushido-mcp/venv/bin/python /absolute/bushido-linux-port/scripts/linux/bushido-mcp.py --pid PID --log /tmp/bushido-geometry.log --output /absolute/private/bushido-artifacts --allow-capture
+codex mcp add bushido -- ~/.local/share/bushido-mcp/venv/bin/python /absolute/bushido-linux-port/scripts/linux/bushido-mcp.py --pid PID --log /tmp/bushido-geometry.log --output /absolute/private/bushido-artifacts --allow-capture --allow-image-return
 codex mcp list
 ```
 Replace PID and absolute paths; restart Codex session as needed. Dependency range is provisional, exact lock/SDK transport smoke and local registration OPEN. Never claim screenshot target verified merely from the selected PID. Use isolated test profile. Next: pinned SDK handshake/tools/list/call, KWin consent-based target selection/input (no xdotool fallback on Wayland), non-mutating internal screenshot export, GTK owner/view identity join, automated fixture actions and pixel comparison. Existing native binary can be inspected without rebuilding; changed native code still needs incremental compile for confirmation.
+
+- A1.1 image return follow-up: `view_capture(sha256)` returns MCP PNG image content from session-produced captures only, with separate `--allow-image-return` opt-in, 8 MiB cap and hash recheck. PID start ticks and executable path pinned at startup. SDK import/transport and actual image delivery unverified; no local SDK in assistant runtime. Active-window identity remains operator-verified, Wayland actions remain open.
