@@ -3294,6 +3294,14 @@ mod linux_webview_layout_tests {
     }
 
     #[test]
+    fn side_panel_is_clipped_to_chrome_and_right_edge() {
+        // position_panel converts absolute coordinates to chrome-relative panes.
+        assert_eq!(bounded_linux_pane(
+            &pane(-100.0, -60.0, 460.0, 900.0), 300.0, 40.0, 1300.0, 740.0,
+        ), Some((300.0, 40.0, 360.0, 700.0)));
+    }
+
+    #[test]
     fn stale_layout_sequences_and_legacy_replays() {
         use super::accept_linux_layout_sequence;
         assert!(accept_linux_layout_sequence(0, Some(11)));
