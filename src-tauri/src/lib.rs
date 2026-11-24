@@ -3267,6 +3267,40 @@ fn bounded_linux_pane(pane: &PaneRectArg, sidebar: f64, top: f64, width: f64, he
     Some((left, upper, right - left, lower - upper))
 }
 
+#[cfg(all(target_os = "linux", test))]
+mod linux_webview_layout_tests {
+    use super::{bounded_linux_pane, PaneRectArg};
+
+    fn pane(x: f64, y: f64, w: f64, h: f64) -> PaneRectArg {
+        PaneRectArg { tab_id: "fixture".into(), x, y, w, h }
+    }
+
+    #[test]
+    fn full_pane_keeps_chrome_clear() {
+        assert_eq!(bounded_linux_pane(&pane(0.0, 0.0, 1000.0, 700.0), 300.0, 40.0, 1300.0, 740.0),
+                   Some((300.0, 40.0, 1000.0, 700.0)));
+    }
+
+    #[test]
+    fn oversized_pane_cannot_cover_chrome_or_leave_window() {
+        assert_eq!(bounded_linux_pane(&pane(-150.0, -100.0, 1600.0, 900.0), 300.0, 40.0, 1300.0, 740.0),
+                   Some((300.0, 40.0, 1000.0, 700.0)));
+    }
+
+    #[test]
+    fn split_pane_preserves_local_geometry() {
+        assert_eq!(bounded_linux_pane(&pane(500.0, 0.0, 500.0, 700.0), 300.0, 40.0, 1300.0, 740.0),
+                   Some((800.0, 40.0, 500.0, 700.0)));
+    }
+
+    #[test]
+    fn invalid_or_outside_geometry_never_paints() {
+        assert_eq!(bounded_linux_pane(&pane(f64::NAN, 0.0, 200.0, 400.0), 300.0, 40.0, 1300.0, 740.0), None);
+        assert_eq!(bounded_linux_pane(&pane(1100.0, 0.0, 200.0, 400.0), 300.0, 40.0, 1300.0, 740.0), None);
+        assert_eq!(bounded_linux_pane(&pane(0.0, 0.0, 200.0, 0.0), 300.0, 40.0, 1300.0, 740.0), None);
+    }
+}
+
 #[cfg(target_os = "linux")]
 static NATIVE_LAYOUT_EPOCH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
