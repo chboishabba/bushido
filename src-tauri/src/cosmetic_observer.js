@@ -10,19 +10,21 @@
     var styleEl = null;
     var appliedSelectors = new Set();
     var flushTimer = null;
+    var MAX_BATCH = 64;
+    var MAX_TRACKED = 16384;
 
     function collectFromElement(el) {
         if (!el || el.nodeType !== 1) return;
         if (el.classList) {
             for (var i = 0; i < el.classList.length; i++) {
                 var c = el.classList[i];
-                if (c && !sentClasses.has(c)) {
+                if (c && c.length <= 128 && sentClasses.size < MAX_TRACKED && !sentClasses.has(c)) {
                     sentClasses.add(c);
                     pendingClasses.push(c);
                 }
             }
         }
-        if (el.id && !sentIds.has(el.id)) {
+        if (el.id && el.id.length <= 128 && sentIds.size < MAX_TRACKED && !sentIds.has(el.id)) {
             sentIds.add(el.id);
             pendingIds.push(el.id);
         }
@@ -38,15 +40,40 @@
     }
 
     function flush() {
-        if (pendingClasses.length === 0 && pendingIds.length === 0) return;
+        if (!pendingClasses.length && !pendingIds.length) return;
         var msg = {
             __bushido: 'cosmetic-probe',
-            classes: pendingClasses.splice(0),
-            ids: pendingIds.splice(0)
+            url: location.href,
+            classes: pendingClasses.slice(0, MAX_BATCH),
+            ids: pendingIds.slice(0, MAX_BATCH)
         };
+        // JSON escaping can expand a token: bound actual UTF-8 bytes too.
+        var raw = JSON.stringify(msg);
+        while (new TextEncoder().encode(raw).length > 32768) {
+            if (msg.classes.length + msg.ids.length <= 1) {
+                pendingClasses.splice(0, msg.classes.length);
+                pendingIds.splice(0, msg.ids.length);
+                scheduleFlush();
+                return;
+            }
+            if (msg.classes.length >= msg.ids.length) msg.classes.pop();
+            else msg.ids.pop();
+            raw = JSON.stringify(msg);
+        }
         try {
-            window.chrome.webview.postMessage(JSON.stringify(msg));
+            if (window.webkit && window.webkit.messageHandlers &&
+                window.webkit.messageHandlers.bushidoCosmetic) {
+                window.webkit.messageHandlers.bushidoCosmetic.postMessage(raw);
+            } else if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage(raw);
+            } else {
+                scheduleFlush();
+                return;
+            }
+            pendingClasses.splice(0, msg.classes.length);
+            pendingIds.splice(0, msg.ids.length);
         } catch(e) {}
+        if (pendingClasses.length || pendingIds.length) scheduleFlush();
     }
 
     function scheduleFlush() {

@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/nicoverbruggen/tauri-plugin-theme/main/.schema/config.schema.json",
+  "$schema": "https://schema.tauri.app/config/2",
   "productName": "Bushido",
   "version": "0.14.0",
   "identifier": "app.bushido-browser.desktop",
@@ -26,17 +26,12 @@
       "devCsp": "default-src 'self' 'unsafe-inline' 'unsafe-eval'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src ipc: http://ipc.localhost http://localhost:* ws://localhost:* https: wss:; img-src 'self' asset: http://asset.localhost blob: data: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
     }
   },
-  "plugins": {
-    "updater": {
-      "endpoints": [
-        "https://github.com/visualstudioblyat/bushido/releases/latest/download/latest.json"
-      ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNFNjY0MjRGMEUxNEE4MjQKUldRa3FCUU9UMEptUHRJTDRHNDRsRGFxTklVMnI3dnlvVDlzZTVvajF2NTRUWUkzdHhmQTM5azkK"
-    }
-  },
+  "plugins": {},
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -47,7 +42,7 @@
     "publisher": "Bushido Browser",
     "copyright": "Copyright 2026 Bushido Browser contributors. Licensed under GPL-3.0.",
     "shortDescription": "A privacy-first web browser",
-    "longDescription": "Bushido is a fast, private web browser with workspaces, split view, ad blocking, fingerprint protection, and LAN sync. Built with Tauri and WebView2.",
+    "longDescription": "Bushido is a workspace-oriented web browser built with Tauri. The Linux port uses WebKitGTK and remains an acceptance candidate; platform privacy and feature parity differ.",
     "windows": {
       "nsis": {
         "displayLanguageSelector": false,

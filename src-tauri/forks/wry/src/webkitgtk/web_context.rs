@@ -26,6 +26,8 @@ pub struct WebContextImpl {
   context: WebContext,
   automation: bool,
   app_info: Option<ApplicationInfo>,
+  fixture_initialization: Option<(PathBuf,String)>,
+  used_for_view: bool,
 }
 
 impl WebContextImpl {
@@ -80,6 +82,8 @@ impl WebContextImpl {
       context,
       automation,
       app_info: Some(app_info),
+      fixture_initialization: None,
+      used_for_view: false,
     }
   }
 
@@ -87,6 +91,26 @@ impl WebContextImpl {
     self.automation = flag;
     self.context.set_automation_allowed(flag);
   }
+
+  pub fn configure_fixture_extension(&mut self,path:&Path,data:&str) -> crate::Result<()> {
+    use gtk::glib::variant::ToVariant;
+    let requested=(path.to_owned(),data.to_owned());
+    if self.fixture_initialization.as_ref()==Some(&requested) { return Ok(()); }
+    if self.used_for_view || self.fixture_initialization.is_some() || !cfg!(debug_assertions)
+      || !data.strip_prefix("bushido.fixture.policy.v2:").and_then(|s|s.split_once(':'))
+        .is_some_and(|(generation,table)| generation.len()==32 &&
+          generation.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) &&
+          table.len()==4 && table.bytes().all(|b|matches!(b,b'A'|b'D'|b'X')))  {
+      return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+        "Extension fixture context already used or invalid initialization")));
+    }
+    self.set_web_extensions_directory(path);
+    self.context.set_web_extensions_initialization_user_data(&data.to_variant());
+    self.fixture_initialization=Some(requested);
+    Ok(())
+  }
+
+  pub fn mark_view_created(&mut self) { self.used_for_view=true; }
 
   pub fn set_web_extensions_directory(&mut self, path: &Path) {
     self

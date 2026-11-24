@@ -1,0 +1,66 @@
+# Maintained local Arch/CachyOS source-package candidate for Bushido.
+# The source tarball must come from scripts/linux/build-arch.sh at a clean
+# committed HEAD; wrapper substitutes its actual sha256 in a private copy.
+# Deliberately no install script, MIME handlers, updater or default-browser hook.
+pkgname=bushido-browser
+pkgver=0.14.0
+pkgrel=1
+pkgdesc='Workspace-oriented WebKitGTK browser (Linux preview candidate)'
+arch=('x86_64')
+url='https://github.com/chboishabba/bushido'
+license=('GPL-3.0-or-later')
+depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'openssl' 'libsecret'
+         'xdg-utils' 'ca-certificates')
+makedepends=('rust' 'cargo' 'nodejs' 'npm' 'pkgconf' 'librsvg'
+             'libxdo' 'libayatana-appindicator')
+source=('bushido-source.tar.gz')
+sha256sums=('__LOCAL_SOURCE_SHA256__')
+options=('!debug' '!lto')
+
+prepare() {
+  cd "$srcdir/bushido-source"
+  [[ -f src-tauri/Cargo.lock && -f package-lock.json ]] ||
+    { printf '%s\n' 'Missing source lockfiles' >&2; return 1; }
+  local version
+  version="$(node -p 'require("./package.json").version')"
+  [[ "$version" == "$pkgver" ]] ||
+    { printf '%s\n' 'Package version differs from source version' >&2; return 1; }
+  pkg-config --atleast-version=2.40 webkit2gtk-4.1
+  pkg-config --exists gtk+-3.0 libsoup-3.0 openssl
+}
+
+build() {
+  cd "$srcdir/bushido-source"
+  export CARGO_TARGET_DIR="$srcdir/bushido-cargo-target"
+  export CARGO_HOME="${CARGO_HOME:-$srcdir/bushido-cargo-home}"
+  npm ci --no-audit --no-fund
+  npm run build
+  # Keep bundled static libraries reachable through Cachy's --as-needed link.
+  # This is needed for both mimalloc and SQLite with the pinned release stack.
+  env LDFLAGS= cargo rustc --locked --release --bin bushido-browser \
+    --manifest-path src-tauri/Cargo.toml -- -C lto=off \
+    -C link-arg=-Wl,--no-as-needed
+}
+
+check() {
+  cd "$srcdir/bushido-source"
+  export CARGO_TARGET_DIR="$srcdir/bushido-cargo-target"
+  export CARGO_HOME="${CARGO_HOME:-$srcdir/bushido-cargo-home}"
+  cargo test --locked --lib --manifest-path src-tauri/Cargo.toml
+  npm test
+}
+
+package() {
+  cd "$srcdir/bushido-source"
+  install -Dm755 "$srcdir/bushido-cargo-target/release/bushido-browser" \
+    "$pkgdir/usr/bin/bushido-browser"
+  install -Dm644 src-tauri/icons/icon.png \
+    "$pkgdir/usr/share/pixmaps/bushido-browser.png"
+  install -Dm644 LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 src-tauri/linux/bushido.desktop \
+    "$pkgdir/usr/share/applications/bushido-browser.desktop"
+  sed -i 's/^Icon={{icon}}$/Icon=bushido-browser/' \
+    "$pkgdir/usr/share/applications/bushido-browser.desktop"
+  # Explicitly do not add MimeType= or URL/file placeholders to Exec=.
+}

@@ -132,7 +132,10 @@ export default memo(function DownloadPanel({
                   <span className="download-paused-label">paused — {formatBytes(d.receivedBytes)}{d.totalBytes ? ` / ${formatBytes(d.totalBytes)}` : ""}</span>
                 )}
                 {d.state === "completed" && (
-                  <span className="download-done-label">{d.totalBytes ? formatBytes(d.totalBytes) : "done"}</span>
+                  <>
+                    <span className="download-done-label">{d.totalBytes ? formatBytes(d.totalBytes) : "done"}</span>
+                    {d.native && d.error && <span className="download-error-label" title={d.error}>{d.error}</span>}
+                  </>
                 )}
                 {d.state === "failed" && (
                   <span className="download-error-label">{d.error || "failed"}</span>
@@ -152,12 +155,12 @@ export default memo(function DownloadPanel({
             <div className="download-actions">
               {d.state === "downloading" && (
                 <>
-                  <button className="download-action-btn" onClick={() => onPause(d.id)} title="pause">
+                  {!d.native && <button className="download-action-btn" onClick={() => onPause(d.id)} title="pause">
                     <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
                       <rect x="2" y="1" width="3" height="10" rx="0.5" fill="currentColor"/>
                       <rect x="7" y="1" width="3" height="10" rx="0.5" fill="currentColor"/>
                     </svg>
-                  </button>
+                  </button>}
                   <button className="download-action-btn danger" onClick={() => onCancel(d.id)} title="cancel">
                     <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
                       <path d="M2 2L10 10M10 2L2 10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
@@ -198,11 +201,11 @@ export default memo(function DownloadPanel({
               )}
               {d.state === "failed" && (
                 <>
-                  <button className="download-action-btn" onClick={() => onRetry(d.id)} title="retry">
+                  {!d.native && <button className="download-action-btn" onClick={() => onRetry(d.id)} title="retry">
                     <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
                       <path d="M10 6A4 4 0 1 1 6 2M10 2V6H6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
                     </svg>
-                  </button>
+                  </button>}
                   <button className="download-action-btn danger" onClick={() => onCancel(d.id)} title="remove">
                     <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
                       <path d="M2 2L10 10M10 2L2 10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>

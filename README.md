@@ -75,7 +75,11 @@ For a production build:
 npm run tauri build
 ```
 
-The installer lands in `src-tauri/target/release/bundle/`.
+The Windows installer lands in `src-tauri/target/release/bundle/`.
+
+### Linux port (acceptance candidate)
+
+On a supported Debian-family Linux build host, use `scripts/linux/build-deb.sh` for the lockfile-controlled candidate build. See [Linux packaging and acceptance](docs/linux/PACKAGING.md) for prerequisites, package checks and outstanding native gates. This branch does not yet establish equivalent Windows/WebKitGTK privacy or feature guarantees; the Windows-specific feature descriptions above are upstream provenance, not Linux release claims. Linux updates are package-managed/local builds, not the upstream binary updater.
 
 ## Contributing
 

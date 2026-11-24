@@ -3,6 +3,36 @@
   Object.defineProperty(window, '__bushidoMedia', { value: true, writable: false, configurable: false });
   var lastState = '';
   var lastTime = 0;
+  // Query the actual document rather than infer PiP from a command attempt.
+  function videoStatus() {
+    var videos = document.querySelectorAll('video');
+    var has = Array.prototype.some.call(videos, function(v) {
+      return v.readyState >= 2 || !!v.currentSrc || !!v.src || !!v.srcObject || !!v.querySelector('source');
+    });
+    var supported = document.pictureInPictureEnabled === true &&
+      Array.prototype.some.call(videos, function(v) {
+        return v.isConnected && v.readyState > 0 && v.videoWidth > 0 &&
+          typeof v.requestPictureInPicture === 'function' && !v.disablePictureInPicture;
+      });
+    return {__bushido: 'video', url: location.href, hasVideo: has,
+      pipSupported: supported, pipActive: !!document.pictureInPictureElement};
+  }
+  function reportVideo() {
+    var msg = videoStatus();
+    try {
+      if (window.webkit && window.webkit.messageHandlers &&
+          window.webkit.messageHandlers.bushidoMedia) {
+        window.webkit.messageHandlers.bushidoMedia.postMessage(JSON.stringify(msg));
+      } else if (window.chrome && window.chrome.webview) {
+        window.chrome.webview.postMessage(JSON.stringify(msg));
+      }
+    } catch (_) {}
+  }
+  window.__bushidoReportVideo = reportVideo;
+  document.addEventListener('enterpictureinpicture', reportVideo, true);
+  document.addEventListener('leavepictureinpicture', reportVideo, true);
+  // Periodic snapshots recover from late registration and dropped events.
+  setInterval(reportVideo, 1500);
 
   function getMetadata() {
     var meta = {};
@@ -34,11 +64,24 @@
 
     var stateKey = state + '|' + Math.floor(msg.currentTime);
     if (!force && stateKey === lastState) return;
-    lastState = stateKey;
-
-    if (window.chrome && window.chrome.webview) {
-      window.chrome.webview.postMessage(JSON.stringify(msg));
-    }
+    try {
+      if (window.webkit && window.webkit.messageHandlers &&
+          window.webkit.messageHandlers.bushidoMedia) {
+        // Only forward fields consumed by the existing browser UI.
+        delete msg.artwork;
+        delete msg.album;
+        msg.url = location.href;
+        ['title', 'artist', 'metaTitle'].forEach(function(key) {
+          if (typeof msg[key] === 'string') msg[key] = msg[key].slice(0, 256);
+        });
+        window.webkit.messageHandlers.bushidoMedia.postMessage(JSON.stringify(msg));
+      } else if (window.chrome && window.chrome.webview) {
+        window.chrome.webview.postMessage(JSON.stringify(msg));
+      } else {
+        return; // keep the state eligible for a later poll
+      }
+      lastState = stateKey;
+    } catch (_) {}
   }
 
   // Event listeners on media elements

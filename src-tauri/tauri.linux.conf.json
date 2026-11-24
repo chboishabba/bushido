@@ -1,0 +1,28 @@
+{
+  "bundle": {
+    "targets": [
+      "deb"
+    ],
+    "createUpdaterArtifacts": false,
+    "category": "Utility",
+    "shortDescription": "Workspace browser (Linux acceptance candidate)",
+    "longDescription": "Bushido Linux port using WebKitGTK. This is a development acceptance candidate, not a certified privacy or feature-parity release.",
+    "linux": {
+      "deb": {
+        "section": "web",
+        "priority": "optional",
+        "depends": [
+          "libwebkit2gtk-4.1-0 (>= 2.40)",
+          "libsecret-tools",
+          "xdg-utils",
+          "ca-certificates",
+          "libssl3 | libssl3t64"
+        ],
+        "desktopTemplate": "linux/bushido.desktop",
+        "files": {
+          "/usr/share/doc/bushido/LICENSE": "../LICENSE"
+        }
+      }
+    }
+  }
+}

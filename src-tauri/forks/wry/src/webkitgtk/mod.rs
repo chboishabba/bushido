@@ -35,10 +35,12 @@ use std::{
 #[cfg(any(debug_assertions, feature = "devtools"))]
 use webkit2gtk::WebInspectorExt;
 use webkit2gtk::{
-  AutoplayPolicy, CookieManagerExt, InputMethodContextExt, LoadEvent, NavigationPolicyDecision,
-  NavigationPolicyDecisionExt, NetworkProxyMode, NetworkProxySettings, PolicyDecisionType,
+  AutoplayPolicy, CookieManagerExt, InputMethodContextExt, LoadEvent, NavigationAction, NavigationPolicyDecision,
+  NavigationPolicyDecisionExt, NetworkProxyMode, NetworkProxySettings, PermissionRequestExt,
+  PolicyDecisionType,
   PrintOperationExt, SettingsExt, URIRequest, URIRequestExt, UserContentInjectedFrames,
-  UserContentManager, UserContentManagerExt, UserScript, UserScriptInjectionTime,
+  UserContentManager, UserContentManagerExt,
+  UserScript, UserScriptInjectionTime,
   WebContextExt as Webkit2gtkWeContextExt, WebView, WebViewExt, WebsiteDataManagerExt,
   WebsiteDataManagerExtManual, WebsitePolicies,
 };
@@ -51,6 +53,40 @@ use x11_dl::xlib::*;
 
 pub use web_context::WebContextImpl;
 
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod permission_observation;
+#[cfg(all(target_os = "linux", debug_assertions))]
+pub use permission_observation::permission_denial_count;
+
+// GTK-thread-only hooks keyed by the native view, not a reusable tab label.
+type NativeNavigationPreview = Rc<dyn Fn(&WebView, &NavigationAction, &str) -> bool>;
+thread_local! {
+  static NATIVE_NAVIGATION_PREVIEWS: std::cell::RefCell<HashMap<usize, NativeNavigationPreview>> =
+    std::cell::RefCell::new(HashMap::new());
+}
+
+/// Register a GTK-thread callback before Wry's ordinary navigation handler.
+/// Returning true consumes the navigation (WebKit policy ignore).
+pub fn set_native_navigation_preview(
+  view: &WebView,
+  callback: impl Fn(&WebView, &NavigationAction, &str) -> bool + 'static,
+) {
+  let key = view.as_ptr() as usize;
+  NATIVE_NAVIGATION_PREVIEWS.with(|hooks| {
+    hooks.borrow_mut().insert(key, Rc::new(callback));
+  });
+  view.connect_destroy(move |_| {
+    NATIVE_NAVIGATION_PREVIEWS.with(|hooks| { hooks.borrow_mut().remove(&key); });
+  });
+}
+
+fn consume_native_preview(view: &WebView, action: &NavigationAction, uri: &str) -> bool {
+  let key = view.as_ptr() as usize;
+  let hook = NATIVE_NAVIGATION_PREVIEWS.with(|hooks| hooks.borrow().get(&key).cloned());
+  // Release registry borrow before entering application code.
+  hook.is_some_and(|callback| callback(view, action, uri))
+}
+
 use crate::{
   proxy::ProxyConfig, web_context::WebContext, Error, NewWindowFeatures, NewWindowOpener,
   NewWindowResponse, PageLoadEvent, Rect, Result, WebViewAttributes, RGBA,
@@ -58,7 +94,201 @@ use crate::{
 
 use self::web_context::WebContextExt;
 
+// Observation only: do not trigger layout or capture page content here.
+fn trace_geometry(view: &WebView, event: &str, requested: Option<&Rect>) {
+  static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  let a = view.allocation();
+  let parent = view.parent();
+  let fixed = parent.as_ref().and_then(|p| p.downcast_ref::<gtk::Fixed>());
+  let fixed_xy = fixed.map(|p| (
+    p.child_property::<i32>(view, "x"),
+    p.child_property::<i32>(view, "y"),
+  ));
+  let parent_rect = parent.as_ref().map(|p| {
+    let a = p.allocation();
+    (a.x(), a.y(), a.width(), a.height())
+  });
+  let requested = requested.map(|r| {
+    let scale = view.scale_factor() as f64;
+    let xy: (i32, i32) = r.position.to_logical::<i32>(scale).into();
+    let wh: (i32, i32) = r.size.to_logical::<i32>(scale).into();
+    (xy, wh)
+  });
+  eprintln!("BUSHIDO_GEOMETRY seq={} view={:p} event={} requested_logical={:?} allocation=({},{},{},{}) fixed_xy={:?} size_request=({},{}) parent={:?} scale={} mapped={}",
+    seq, view.as_ptr(), event, requested, a.x(), a.y(), a.width(), a.height(),
+    fixed_xy, view.width_request(), view.height_request(), parent_rect,
+    view.scale_factor(), view.is_mapped());
+}
+
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod native_content_filter {
+  use gtk::{gio, glib};
+  use glib::translate::{FromGlibPtrFull, ToGlibPtr};
+  use std::{ffi::CString, ptr::NonNull};
+  use webkit2gtk::UserContentManager;
+  use webkit2gtk_sys as ffi;
+
+  glib::wrapper! {
+    pub struct UserContentFilter(Object<ffi::WebKitUserContentFilter>);
+
+    match fn {
+      type_ => || ffi::webkit_user_content_filter_get_type(),
+    }
+  }
+
+  glib::wrapper! {
+    pub struct UserContentFilterStore(Object<ffi::WebKitUserContentFilterStore>);
+
+    match fn {
+      type_ => || ffi::webkit_user_content_filter_store_get_type(),
+    }
+  }
+
+  impl UserContentFilterStore {
+    pub fn new(path: &str) -> Self {
+      let path = CString::new(path).expect("filter store path cannot contain NUL");
+      unsafe { glib::translate::from_glib_full(ffi::webkit_user_content_filter_store_new(path.as_ptr())) }
+    }
+
+    pub fn save<P: FnOnce(Result<UserContentFilter, glib::Error>) + 'static>(
+      &self,
+      identifier: &str,
+      source: &glib::Bytes,
+      cancellable: Option<&gio::Cancellable>,
+      callback: P,
+    ) {
+      let user_data = Box::new(glib::thread_guard::ThreadGuard::new(callback));
+
+      unsafe extern "C" fn trampoline<P: FnOnce(Result<UserContentFilter, glib::Error>) + 'static>(
+        source_object: *mut glib::gobject_ffi::GObject,
+        result: *mut gio::ffi::GAsyncResult,
+        user_data: glib::ffi::gpointer,
+      ) {
+        let mut error = std::ptr::null_mut();
+        let filter = ffi::webkit_user_content_filter_store_save_finish(
+          source_object as *mut ffi::WebKitUserContentFilterStore,
+          result,
+          &mut error,
+        );
+        let result = if error.is_null() {
+          NonNull::new(filter)
+            .map(|ptr| UserContentFilter::from_glib_full(ptr.as_ptr()))
+            .ok_or_else(|| glib::Error::new(glib::FileError::Failed, "WebKitGTK returned no filter"))
+        } else {
+          Err(glib::translate::from_glib_full(error))
+        };
+        let callback: Box<glib::thread_guard::ThreadGuard<P>> = Box::from_raw(user_data as *mut _);
+        callback.into_inner()(result);
+      }
+
+      let identifier = CString::new(identifier).expect("filter identifier cannot contain NUL");
+      unsafe {
+        ffi::webkit_user_content_filter_store_save(
+          self.to_glib_none().0,
+          identifier.as_ptr(),
+          source.to_glib_none().0,
+          cancellable.to_glib_none().0,
+          Some(trampoline::<P>),
+          Box::into_raw(user_data) as _,
+        );
+      }
+    }
+  }
+
+  pub fn add_filter(manager: &UserContentManager, filter: &UserContentFilter) {
+    unsafe {
+      ffi::webkit_user_content_manager_add_filter(
+        manager.to_glib_none().0,
+        filter.to_glib_none().0,
+      );
+    }
+  }
+}
+
 const WEBVIEW_ID: &str = "webview_id";
+
+// Developer-only native WebKitGTK network enforcement probe.
+// Compiles WebKit's content extension JSON and installs the resulting filter
+// BEFORE the first page load. This deliberately does not claim equivalence
+// with Bushido's Rust adblock engine / EasyList semantics.
+// Compiled WebKit filters are GObject handles; keep one on the GTK thread and
+// reuse it across tab/Glance WebViews instead of recompiling thousands of
+// hostname rules for every new tab. Exact byte comparison prevents stale
+// cache reuse after regenerating source rules.
+#[cfg(all(target_os = "linux", debug_assertions))]
+thread_local! {
+  static LINUX_PROBE_FILTER_CACHE:
+    std::cell::RefCell<Option<(Vec<u8>, native_content_filter::UserContentFilter)>> =
+    std::cell::RefCell::new(None);
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn install_linux_fixture_filter(webview: &WebView) -> Result<()> {
+  use std::io;
+  use native_content_filter::{UserContentFilterStore, add_filter};
+  let Some(source_path) = std::env::var_os("BUSHIDO_LINUX_FILTER_JSON") else {
+    return Ok(());
+  };
+  let content = std::fs::read(std::path::PathBuf::from(source_path))?;
+  if content.is_empty() {
+    return Err(Error::Io(io::Error::new(io::ErrorKind::InvalidData, "Empty WebKitGTK filter JSON")));
+  }
+  let manager = webview.user_content_manager().ok_or_else(|| {
+    Error::Io(io::Error::other("WebKitGTK UserContentManager unavailable"))
+  })?;
+  // Avoid a second asynchronous compile for every tab, and do not trust a
+  // filename or modification timestamp as the cache identity.
+  if let Some(cached) = LINUX_PROBE_FILTER_CACHE.with(|cache| {
+    let borrow = cache.borrow();
+    borrow.as_ref().and_then(|(previous, filter)| {
+      if previous == &content { Some(filter.clone()) } else { None }
+    })
+  }) {
+    add_filter(&manager, &cached);
+    return Ok(());
+  }
+  let cache = dirs::cache_dir().ok_or_else(|| {
+    Error::Io(io::Error::other("No Linux user cache directory for content filter store"))
+  })?.join("bushido-browser").join("webkit-content-filter-probe");
+  std::fs::create_dir_all(&cache)?;
+  let store = UserContentFilterStore::new(&cache.to_string_lossy());
+  // Keep the source bytes for the exact-content cache key after GBytes
+  // takes ownership of its allocation.
+  let bytes = gtk::glib::Bytes::from_owned(content.clone());
+  let (sender, receiver) = std::sync::mpsc::channel();
+  store.save("bushido-development-probe", &bytes, None::<&Cancellable>, move |result| {
+    let _ = sender.send(result);
+  });
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+  loop {
+    match receiver.try_recv() {
+      Ok(Ok(filter)) => {
+        add_filter(&manager, &filter);
+        LINUX_PROBE_FILTER_CACHE.with(|cache| {
+          *cache.borrow_mut() = Some((content.clone(), filter));
+        });
+        return Ok(());
+      }
+      Ok(Err(err)) => return Err(Error::GlibError(err)),
+      Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+        return Err(Error::Io(io::Error::other("WebKitGTK filter compilation callback lost")));
+      }
+      Err(std::sync::mpsc::TryRecvError::Empty) => {}
+    }
+    if std::time::Instant::now() >= deadline {
+      return Err(Error::Io(io::Error::new(io::ErrorKind::TimedOut,
+        "WebKitGTK content filter compilation timed out")));
+    }
+    if gtk::events_pending() {
+      gtk::main_iteration();
+    } else {
+      std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+  }
+}
+
 
 mod drag_drop;
 mod synthetic_mouse_events;
@@ -275,13 +505,25 @@ impl InnerWebView {
         let mut settings = NetworkProxySettings::new(Some(proxy_uri.as_str()), &[]);
         website_data_manager
           .set_network_proxy_settings(NetworkProxyMode::Custom, Some(&mut settings));
+      } else {
+        // Do not silently construct a direct-network view if proxy was explicitly requested.
+        return Err(Error::MissingManager);
       }
     }
 
     // Extension loading
-    if let Some(extension_path) = &pl_attrs.extension_path {
+    if let Some(data)=attributes.linux_extension_initialization.as_deref() {
+      let path=pl_attrs.extension_path.as_ref().ok_or_else(||Error::Io(
+        std::io::Error::new(std::io::ErrorKind::InvalidInput,"Missing extension fixture path")))?;
+      if pl_attrs.related_view.is_some() {
+        return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+          "Related view extension fixture identity unresolved")));
+      }
+      web_context.os.configure_fixture_extension(path,data)?;
+    } else if let Some(extension_path) = &pl_attrs.extension_path {
       web_context.os.set_web_extensions_directory(extension_path);
     }
+    web_context.os.mark_view_created();
 
     let webview = Self::create_webview(web_context, &attributes, &pl_attrs);
 
@@ -300,6 +542,13 @@ impl InnerWebView {
     // Webview Settings
     Self::set_webview_settings(&webview, &attributes);
 
+    // In debug Linux builds, install the native filter BEFORE navigation.
+    // Fail the WebView creation if its requested rule set cannot compile.
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    if attributes.native_content_filter_enabled {
+      install_linux_fixture_filter(&webview)?;
+    }
+
     // Webview handlers
     Self::attach_handlers(&webview, web_context, &mut attributes);
 
@@ -314,6 +563,13 @@ impl InnerWebView {
     web_context.register_automation(webview.clone());
 
     let is_in_fixed_parent = Self::add_to_container(&webview, container, &attributes);
+    if std::env::var_os("BUSHIDO_GEOMETRY_TRACE").is_some() {
+      trace_geometry(&webview, "created", None);
+      webview.connect_size_allocate(|view, _| trace_geometry(view, "gtk-size-allocate", None));
+      webview.connect_load_changed(|view, event| {
+        trace_geometry(view, &format!("load-{event:?}"), None);
+      });
+    }
 
     #[cfg(any(debug_assertions, feature = "devtools"))]
     let is_inspector_open = Self::attach_inspector_handlers(&webview);
@@ -438,9 +694,7 @@ impl InnerWebView {
       settings.set_user_agent(attributes.user_agent.as_deref());
 
       // Devtools
-      if attributes.devtools {
-        settings.set_enable_developer_extras(true);
-      }
+      settings.set_enable_developer_extras(attributes.devtools);
 
       if attributes.javascript_disabled {
         settings.set_enable_javascript(false);
@@ -455,6 +709,20 @@ impl InnerWebView {
   ) {
     // window.close()
     webview.connect_close(move |webview| unsafe { webview.destroy() });
+
+    // Linux privacy boundary: a prompt mediator is not yet wired into
+    // Bushido's Tauri command/state layer. Never let a native WebKit
+    // permission request fall through to an implicit platform decision.
+    // This applies to embedded child views and newly created popup views.
+    // P3.3 remains open until allow/deny/remember has origin-scoped tests.
+    #[cfg(target_os = "linux")]
+    webview.connect_permission_request(|_webview, request| {
+      request.deny();
+      // Observation only, after the existing fail-closed control action.
+      #[cfg(debug_assertions)]
+      permission_observation::observe_denial();
+      true // handled; do not propagate to another permissive handler
+    });
 
     // Synthetic mouse events
     synthetic_mouse_events::setup(webview);
@@ -543,7 +811,7 @@ impl InnerWebView {
 
     // Navigation handler
     if let Some(navigation_handler) = attributes.navigation_handler.take() {
-      webview.connect_decide_policy(move |_webview, policy_decision, policy_type| {
+      webview.connect_decide_policy(move |webview, policy_decision, policy_type| {
         let handler = match policy_type {
           PolicyDecisionType::NavigationAction => &navigation_handler,
           _ => return false,
@@ -553,6 +821,10 @@ impl InnerWebView {
           if let Some(nav_action) = policy.navigation_action() {
             if let Some(uri_req) = nav_action.request() {
               if let Some(uri) = uri_req.uri() {
+                if consume_native_preview(webview, &nav_action, uri.as_str()) {
+                  unsafe { webkit_policy_decision_ignore(policy_decision.as_ptr()); }
+                  return true;
+                }
                 let allow = handler(uri.to_string());
                 let pointer = policy_decision.as_ptr();
                 unsafe {
@@ -632,7 +904,7 @@ impl InnerWebView {
       .expect("WebView does not have UserContentManager");
 
     // Connect before registering as recommended by the docs
-    manager.connect_script_message_received(None, move |_m, msg| {
+    manager.connect_script_message_received(Some("ipc"), move |_m, msg| {
       #[cfg(feature = "tracing")]
       let _span = tracing::info_span!(parent: None, "wry::ipc::handle").entered();
 
@@ -801,18 +1073,48 @@ impl InnerWebView {
   }
 
   pub fn clear_all_browsing_data(&self) -> Result<()> {
-    if let Some(context) = self.webview.context() {
-      if let Some(data_manger) = context.website_data_manager() {
-        data_manger.clear(
-          webkit2gtk::WebsiteDataTypes::ALL,
-          gtk::glib::TimeSpan::from_seconds(0),
-          None::<&Cancellable>,
-          |_| {},
-        );
+    // WebKitGTK performs this asynchronously. Wait for the real completion
+    // callback instead of claiming that merely scheduling the clear worked.
+    // Keep processing the GTK main context so its callback can run.
+    let context = self.webview.context().ok_or_else(|| {
+      crate::Error::Io(std::io::Error::other("WebKitGTK context unavailable"))
+    })?;
+    let manager = context.website_data_manager().ok_or_else(|| {
+      crate::Error::Io(std::io::Error::other("WebKitGTK data manager unavailable"))
+    })?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    manager.clear(
+      webkit2gtk::WebsiteDataTypes::ALL,
+      gtk::glib::TimeSpan::from_seconds(0),
+      None::<&Cancellable>,
+      move |result| {
+        let _ = tx.send(result);
+      },
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+      match rx.try_recv() {
+        Ok(result) => return result.map_err(crate::Error::from),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+          return Err(crate::Error::Io(std::io::Error::other(
+            "WebKitGTK data-clearing callback disconnected",
+          )));
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+      }
+      if std::time::Instant::now() >= deadline {
+        return Err(crate::Error::Io(std::io::Error::new(
+          std::io::ErrorKind::TimedOut,
+          "WebKitGTK data clearing did not complete within 15 seconds",
+        )));
+      }
+      if gtk::events_pending() {
+        gtk::main_iteration();
+      } else {
+        std::thread::sleep(std::time::Duration::from_millis(5));
       }
     }
-
-    Ok(())
   }
 
   pub fn bounds(&self) -> Result<Rect> {
@@ -845,6 +1147,9 @@ impl InnerWebView {
   }
 
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
+    if std::env::var_os("BUSHIDO_GEOMETRY_TRACE").is_some() {
+      trace_geometry(&self.webview, "set-bounds-before", Some(&bounds));
+    }
     let scale_factor = self.webview.scale_factor() as f64;
     let (width, height) = bounds.size.to_logical::<i32>(scale_factor).into();
     let (x, y) = bounds.position.to_logical::<i32>(scale_factor).into();
@@ -863,6 +1168,9 @@ impl InnerWebView {
       self
         .webview
         .size_allocate(&gtk::Allocation::new(x, y, width, height));
+    }
+    if std::env::var_os("BUSHIDO_GEOMETRY_TRACE").is_some() {
+      trace_geometry(&self.webview, "set-bounds-after", Some(&bounds));
     }
 
     Ok(())

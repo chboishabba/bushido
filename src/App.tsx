@@ -73,8 +73,8 @@ const PANEL_W = 350;
 let tabCounter = Date.now();
 const genId = (prefix = "tab") => `${prefix}-${++tabCounter}`;
 
-let wsCounter = 0;
-const genWsId = () => `ws-${++wsCounter}`;
+// Never recycle a deleted workspace's cookie/credential identity.
+const genWsId = () => `ws-${crypto.randomUUID()}`;
 
 const PERM_LABELS: Record<string, string> = {
   microphone: "microphone", camera: "camera", geolocation: "location",
@@ -103,6 +103,23 @@ function frecencyScore(visitCount: number, lastVisitMs: number): number {
   const w = ageHours < 4 ? 100 : ageHours < 24 ? 70 : ageHours < 72 ? 50 : ageHours < 336 ? 30 : 10;
   return visitCount * w;
 }
+
+// Report command admission errors; a returned print dialog is not print completion.
+function invokeDesktopAction(command: "print_tab" | "toggle_devtools", id: string) {
+  if (!id) return;
+  if (command === "toggle_devtools" && useDataStore.getState().settings.disableDevTools) {
+    window.alert("Developer tools are disabled in Security settings.");
+    return;
+  }
+  invoke(command, { id }).catch(e => window.alert(String(e)));
+}
+
+// A single epoch for all React-issued native layouts, including modal hides.
+// A shell reload must not reset to an epoch lower than the native process's
+// previous layout counter. Millisecond epoch * 1024 remains JS-safe.
+let nativeLayoutEpoch = Date.now() * 1024;
+const layoutNative = (args: Record<string, unknown>) =>
+  invoke("layout_webviews", { ...args, sequence: ++nativeLayoutEpoch });
 
 export default function App() {
   // --- Zustand stores ---
@@ -159,6 +176,9 @@ export default function App() {
   const setHasVideo = useFeatureStore(s => s.setHasVideo);
   const pipActive = useFeatureStore(s => s.pipActive);
   const setPipActive = useFeatureStore(s => s.setPipActive);
+  const videoByTab = useRef(new Map<string, {hasVideo: boolean; pipSupported?: boolean; pipActive?: boolean}>());
+  const [pipSupported, setPipSupported] = useState<boolean | undefined>(undefined);
+  const [videoSnapshotVersion, setVideoSnapshotVersion] = useState(0);
   const panels = useFeatureStore(s => s.panels);
   const setPanels = useFeatureStore(s => s.setPanels);
   const activePanelId = useFeatureStore(s => s.activePanelId);
@@ -193,8 +213,16 @@ export default function App() {
   const [pendingUpdate, setPendingUpdate] = useState<{ version: string; downloading: boolean } | null>(null);
 
   const vaultUnlockedRef = useRef(false);
+  const vaultStateEpoch = useRef(-1);
+  const applyVaultState = useCallback((status: { epoch: number; unlocked: boolean }) => {
+    if (status.epoch < vaultStateEpoch.current) return;
+    vaultStateEpoch.current = status.epoch;
+    setVaultUnlocked(status.unlocked);
+  }, [setVaultUnlocked]);
   const vaultSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const glanceRef = useRef<typeof glance>(null);
+  const glanceReadyRef = useRef<string | null>(null);
+  const glancePromotingRef = useRef<string | null>(null);
   const syncToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const urlBarRef = useRef<HTMLInputElement>(null);
   const initialized = useRef(false);
@@ -204,6 +232,9 @@ export default function App() {
   const bookmarksLoaded = useRef(false);
   const bookmarkBulkRef = useRef(false);
   const prevSettingsRef = useRef<BushidoSettings | null>(null);
+  // Separate from CRDT settings sync: only track the previous native-filter
+  // preference after persisted settings have been loaded.
+  const lastNativeAdblockRef = useRef<boolean | null>(null);
   const closedTabsRef = useRef<{url: string; title: string; workspaceId: string}[]>([]);
   const tabThumbnails = useRef<Map<string, string>>(new Map());
   const zoomRef = useRef<Record<string, number>>({});
@@ -249,6 +280,8 @@ export default function App() {
   const layoutOffsetRef = useRef(layoutOffset);
   layoutOffsetRef.current = layoutOffset;
   const topOffset = 40;
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
   const pinnedTabs = useMemo(() => currentWsTabs.filter(t => t.pinned), [currentWsTabs]);
   const regularTabs = useMemo(() => currentWsTabs.filter(t => !t.pinned), [currentWsTabs]);
 
@@ -281,8 +314,12 @@ export default function App() {
       else panes = [{ tabId: w.activeTabId, ...rect }];
     }
 
-    invoke("layout_webviews", { panes, focusedTabId: w.activeTabId, sidebarW: layoutOffset, topOffset });
+    layoutNative({ panes, focusedTabId: w.activeTabId, sidebarW: layoutOffset, topOffset });
   }, [activeWs, tabs, layoutOffset, topOffset]);
+  // The long-lived native event listener must restore the *current* layout,
+  // not the initial render's stale workspace or tab array.
+  const syncLayoutRef = useRef(syncLayout);
+  syncLayoutRef.current = syncLayout;
 
   // restore session or create first tab
   useEffect(() => {
@@ -363,8 +400,7 @@ export default function App() {
         // new workspace format
         const session = parsed as SessionData;
         const restoredWs: Workspace[] = session.workspaces.map(w => {
-          const num = parseInt(w.id.replace("ws-", ""), 10);
-          if (num >= wsCounter) wsCounter = num;
+          // Preserve existing persisted workspace IDs without recycling them.
           return { id: w.id, name: w.name, color: w.color, icon: w.icon, activeTabId: w.activeTabId, paneLayout: w.paneLayout };
         });
 
@@ -418,7 +454,7 @@ export default function App() {
         restoredTabs.forEach(t => {
           if (t.url.startsWith("bushido://") || t.suspended) return;
           if (activePaneIds.has(t.id)) {
-            invoke("create_tab", { id: t.id, url: t.url, sidebarW: restoredSidebarW, topOffset: restoredTopOffset, profileName: t.workspaceId, ...tabArgs });
+            invoke("create_tab", { id: t.id, url: t.url, sidebarW: restoredSidebarW, topOffset: restoredTopOffset, profileName: t.workspaceId, pinned: !!t.pinned, ...tabArgs });
             clearLoading(t.id);
           } else {
             t.memoryState = "destroyed";
@@ -429,7 +465,7 @@ export default function App() {
         if (firstActiveWs?.activeTabId) {
           const activeRestoredTab = restoredTabs.find(t => t.id === firstActiveWs.activeTabId);
           if (activeRestoredTab?.url?.startsWith("bushido://")) {
-            invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: restoredSidebarW, topOffset: restoredTopOffset });
+            layoutNative({ panes: [], focusedTabId: "__none__", sidebarW: restoredSidebarW, topOffset: restoredTopOffset });
           } else {
             // compute pane rects from restored layout
             const cw = window.innerWidth - restoredSidebarW;
@@ -438,7 +474,7 @@ export default function App() {
             const panes = firstActiveWs.paneLayout
               ? computeRects(firstActiveWs.paneLayout, rect)
               : [{ tabId: firstActiveWs.activeTabId, x: 0, y: 0, w: cw, h: ch }];
-            invoke("layout_webviews", { panes, focusedTabId: firstActiveWs.activeTabId, sidebarW: restoredSidebarW, topOffset: restoredTopOffset });
+            layoutNative({ panes, focusedTabId: firstActiveWs.activeTabId, sidebarW: restoredSidebarW, topOffset: restoredTopOffset });
           }
         }
 
@@ -473,10 +509,10 @@ export default function App() {
           setActiveWorkspaceId(wsId);
 
           restored.forEach(t => {
-            invoke("create_tab", { id: t.id, url: t.url, sidebarW: 300, topOffset: 40, profileName: t.workspaceId, ...tabArgs });
+            invoke("create_tab", { id: t.id, url: t.url, sidebarW: 300, topOffset: 40, profileName: t.workspaceId, pinned: !!t.pinned, ...tabArgs });
             clearLoading(t.id);
           });
-          invoke("layout_webviews", { panes: [{ tabId: restored[0].id, x: 0, y: 0, w: window.innerWidth - 300, h: window.innerHeight - 40 }], focusedTabId: restored[0].id, sidebarW: 300, topOffset: 40 });
+          layoutNative({ panes: [{ tabId: restored[0].id, x: 0, y: 0, w: window.innerWidth - 300, h: window.innerHeight - 40 }], focusedTabId: restored[0].id, sidebarW: 300, topOffset: 40 });
         } else {
           openFreshNtp();
         }
@@ -516,6 +552,7 @@ export default function App() {
   useEffect(() => {
     const t = setTimeout(async () => {
       try {
+        if (!await invoke<boolean>("binary_updater_enabled")) return;
         const update = await checkUpdate();
         if (update) {
           setPendingUpdate({ version: update.version, downloading: false });
@@ -596,6 +633,36 @@ export default function App() {
     prevSettingsRef.current = { ...settings };
   }, [settings]);
 
+  // Apply global adblock preference changes to already-open WebKitGTK tabs.
+  // The backend returns true only when native filters were actually applied;
+  // other platforms / non-opted-in debug sessions return false, not success.
+  useEffect(() => {
+    if (!settingsLoaded.current) return;
+    const previous = lastNativeAdblockRef.current;
+    lastNativeAdblockRef.current = settings.adBlocker;
+    if (previous === null || previous === settings.adBlocker) return;
+
+    const openIds = tabs.filter(t =>
+      !t.url.startsWith("bushido://") && !t.suspended && t.memoryState !== "destroyed"
+    ).map(t => t.id);
+    // Glance is a separate WebView, not a member of the tabs array.
+    // It must not retain the old global preference while visible.
+    if (glanceRef.current) openIds.push(glanceRef.current.id);
+    for (const id of new Set(openIds)) {
+      invoke<boolean>("set_tab_native_filter", {
+        id, adBlocker: settings.adBlocker,
+      }).then(() => {
+        // Even when no experimental native rule source is configured, the
+        // adblock preference change must rebuild this page's conditional
+        // cosmetic scripts. Only reject the reload on a real backend error.
+        return invoke("reload_tab", { id });
+      }).catch(error => {
+        console.warn("[bushido] global native filter change failed", id, error);
+        useUiStore.getState().showError("Unable to update native content filter");
+      });
+    }
+  }, [settings.adBlocker]);
+
   // fetch paired devices for sidebar send-tab feature
   useEffect(() => {
     if (!settings.syncEnabled) { setSyncPairedDevices([]); return; }
@@ -645,8 +712,13 @@ export default function App() {
 
   // listen for webview events from rust
   useEffect(() => {
+    // Keep startup snapshots from restoring ids superseded by live events.
+    const downloadStartupTouched = new Set<string>();
+    let downloadSnapshotPending = true;
     const promises = [
       listen<{ id: string; url: string }>("tab-url-changed", (e) => {
+        videoByTab.current.delete(e.payload.id);
+        setVideoSnapshotVersion(v => v + 1);
         let favicon: string | undefined;
         let domain = "";
         try {
@@ -665,6 +737,11 @@ export default function App() {
         if (domain) {
           invoke<boolean>("is_whitelisted", { domain }).then(wl => {
             setTabs(prev => prev.map(t => t.id === e.payload.id ? { ...t, whitelisted: wl } : t));
+            // This is post-navigation and cannot protect the initial request;
+            // a pre-network WebKit policy hook is still required.
+            invoke<boolean>("set_tab_native_filter", {
+              id: e.payload.id, adBlocker: settingsRef.current.adBlocker,
+            }).catch(error => console.warn("[bushido] navigation filter update", error));
           });
           const savedZoom = settingsRef.current.zoomHistory?.[domain];
           if (savedZoom && savedZoom !== 1) {
@@ -672,6 +749,13 @@ export default function App() {
             setZoomDisplay(p => ({ ...p, [e.payload.id]: savedZoom }));
             invoke("zoom_tab", { id: e.payload.id, factor: savedZoom });
           }
+        }
+        // WebKitGTK can reallocate a child during navigation after the normal
+        // React resize effect has run. Reassert the current native geometry
+        // after the event and once more after the child has settled.
+        if (e.payload.id === activeTabRef.current) {
+          syncLayoutRef.current();
+          window.setTimeout(() => syncLayoutRef.current(), 250);
         }
       }),
       listen<{ id: string; title: string }>("tab-title-changed", (e) => {
@@ -698,8 +782,14 @@ export default function App() {
           t.id === e.payload.id ? { ...t, blockedCount: e.payload.count } : t
         ));
       }),
-      listen<{ id: string; hasVideo: boolean }>("tab-has-video", (e) => {
-        setHasVideo(e.payload.hasVideo);
+      listen<{ id: string; hasVideo: boolean; pipSupported?: boolean; pipActive?: boolean }>("tab-has-video", (e) => {
+        const previous = videoByTab.current.get(e.payload.id);
+        if (previous && previous.hasVideo === e.payload.hasVideo &&
+            previous.pipSupported === e.payload.pipSupported &&
+            previous.pipActive === e.payload.pipActive) return;
+        videoByTab.current.set(e.payload.id, e.payload);
+        // Unchanged polling snapshots do not trigger a React render.
+        setVideoSnapshotVersion(v => v + 1);
       }),
       listen<{ id: string; state: string; title: string; artist?: string; currentTime?: number; duration?: number; playbackRate?: number; metaTitle?: string }>("tab-media-state", (e) => {
         setTabs(prev => prev.map(t =>
@@ -729,6 +819,8 @@ export default function App() {
         setDownloadsOpen(true);
       }),
       listen<DownloadItem>("download-started", (e) => {
+        if (downloadSnapshotPending) downloadStartupTouched.add(e.payload.id);
+        if (e.payload.native) setDownloadsOpen(true);
         setDownloads(prev => {
           if (prev.find(d => d.id === e.payload.id)) return prev;
           return [e.payload, ...prev];
@@ -746,40 +838,26 @@ export default function App() {
         }
       }),
       listen<DownloadItem>("download-progress", (e) => {
-        setDownloads(prev => prev.map(d => d.id === e.payload.id ? e.payload : d));
+        if (downloadSnapshotPending) downloadStartupTouched.add(e.payload.id);
+        setDownloads(prev => prev.some(d => d.id === e.payload.id)
+          ? prev.map(d => d.id === e.payload.id ? e.payload : d) : [e.payload, ...prev]);
       }),
       listen<DownloadItem>("download-complete", (e) => {
-        setDownloads(prev => prev.map(d => d.id === e.payload.id ? e.payload : d));
+        if (downloadSnapshotPending) downloadStartupTouched.add(e.payload.id);
+        setDownloads(prev => prev.some(d => d.id === e.payload.id)
+          ? prev.map(d => d.id === e.payload.id ? e.payload : d) : [e.payload, ...prev]);
       }),
       listen<DownloadItem>("download-failed", (e) => {
-        setDownloads(prev => prev.map(d => d.id === e.payload.id ? e.payload : d));
+        if (downloadSnapshotPending) downloadStartupTouched.add(e.payload.id);
+        setDownloads(prev => prev.some(d => d.id === e.payload.id)
+          ? prev.map(d => d.id === e.payload.id ? e.payload : d) : [e.payload, ...prev]);
       }),
       listen<{ id: string }>("download-cancelled", (e) => {
+        if (downloadSnapshotPending) downloadStartupTouched.add(e.payload.id);
         setDownloads(prev => prev.filter(d => d.id !== e.payload.id));
       }),
       listen<{ id: string; reason: string }>("download-resume-failed", (e) => {
         showError(e.payload.reason);
-      }),
-      // speculative preload promotion
-      listen<{ preloadId: string; url: string; sourceTabId: string }>("preload-promoted", (e) => {
-        const { preloadId, url, sourceTabId } = e.payload;
-        setTabs(prev => {
-          // find the source tab to inherit its workspace
-          const sourceTab = prev.find(t => t.id === sourceTabId);
-          const wsId = sourceTab?.workspaceId || activeWorkspaceId;
-          const newTab: Tab = {
-            id: preloadId,
-            url,
-            title: url,
-            loading: true,
-            pinned: false,
-            workspaceId: wsId,
-            parentId: sourceTabId,
-          };
-          return [...prev, newTab];
-        });
-        // set the preloaded tab as active
-        setWorkspaces(prev => prev.map(ws => ws.id === activeWorkspaceId ? { ...ws, activeTabId: preloadId } : ws));
       }),
       // network inspector
       listen<{ tabId: string; entries: NetworkEntry[] }>("network-request", (e) => {
@@ -856,25 +934,62 @@ export default function App() {
       }),
       // vault save prompt from autofill script
       // glance: ephemeral link preview
-      listen<{ url: string; sourceTabId: string }>("glance-request", (e) => {
-        if (glanceRef.current) return; // already showing a glance
-        const glanceId = `glance-${Date.now()}`;
-        const g = { id: glanceId, url: e.payload.url, title: e.payload.url, sourceTabId: e.payload.sourceTabId };
+      listen<{ url: string; sourceTabId: string; sourceUrl?: string; sourceGeneration?: string }>("glance-request", (e) => {
+        if (glanceRef.current) return;
+        const state = useTabStore.getState();
+        const src = state.tabs.find(t => t.id === e.payload.sourceTabId);
+        // Never default to another workspace for a stale source.
+        if (!src?.workspaceId || src.suspended || src.workspaceId !== state.activeWorkspaceId) return;
+        if (e.payload.sourceUrl) {
+          try {
+            if (new URL(src.url).href !== new URL(e.payload.sourceUrl).href) return;
+          } catch { return; }
+        }
+        const glanceId = `glance-${crypto.randomUUID()}`;
+        const g = { id: glanceId, url: e.payload.url, title: e.payload.url, sourceTabId: src.id, workspaceId: src.workspaceId };
+        glanceReadyRef.current = null;
         glanceRef.current = g;
         setGlance(g);
-        setTabs(prev => {
-          const src = prev.find(t => t.id === e.payload.sourceTabId);
-          invoke("open_glance", { url: e.payload.url, glanceId, sidebarW: layoutOffsetRef.current, topOffset, profileName: src?.workspaceId });
-          return prev;
+        invoke("open_glance", {
+          url: e.payload.url, glanceId, sidebarW: layoutOffsetRef.current,
+          topOffset, profileName: src.workspaceId,
+          sourceTabId: src.id, sourceUrl: e.payload.sourceUrl ?? src.url,
+          sourceGeneration: e.payload.sourceGeneration ?? null,
+          adBlocker: settingsRef.current.adBlocker,
+          httpsOnly: settingsRef.current.httpsOnly,
+          cookieAutoReject: settingsRef.current.cookieAutoReject,
+          blockServiceWorkers: settingsRef.current.blockServiceWorkers,
+          blockFontEnum: settingsRef.current.blockFontEnumeration,
+          disableAutofill: settingsRef.current.disableAutofill,
+          disablePasswordSave: settingsRef.current.disablePasswordSave,
+        }).then(() => {
+          if (glanceRef.current?.id === glanceId) {
+            glanceReadyRef.current = glanceId;
+          } else if (!useTabStore.getState().tabs.some(t => t.id === glanceId)) {
+            invoke("close_glance", { glanceId }).catch(e => console.warn("[bushido]", e));
+          }
+        }).catch(error => {
+          console.warn("[bushido] Glance creation failed", error);
+          if (glanceRef.current?.id !== glanceId) return;
+          useUiStore.getState().showError("Unable to open Glance");
+          glanceReadyRef.current = null;
+          glanceRef.current = null;
+          setGlance(null);
+          syncLayoutRef.current();
         });
         // hide tab webviews so overlay is visible
-        invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffsetRef.current, topOffset });
+        layoutNative({ panes: [], focusedTabId: "__none__", sidebarW: layoutOffsetRef.current, topOffset });
+      }),
+      listen<string>("linux-vault-status", (e) => {
+        // Native status is text only; no credentials or URLs are transported.
+        useUiStore.getState().showError(e.payload);
       }),
       listen<{ domain: string; username: string; password: string }>("vault-save-prompt", (e) => {
         setVaultSavePrompt(e.payload);
         if (vaultSaveTimer.current) clearTimeout(vaultSaveTimer.current);
         vaultSaveTimer.current = setTimeout(() => setVaultSavePrompt(null), 30000);
       }),
+      listen<{ epoch: number; unlocked: boolean }>("vault-state-changed", e => applyVaultState(e.payload)),
       // vault unlock needed — page has login form but vault is locked
       listen<{ domain: string; tabId: string }>("vault-unlock-needed", () => {
         if (!vaultUnlockedRef.current) {
@@ -891,7 +1006,8 @@ export default function App() {
         const id = genId();
         setTabs(prev => {
           const sourceTab = prev.find(t => t.id === e.payload.sourceTabId);
-          const wsId = sourceTab?.workspaceId || "ws-1";
+          const wsId = sourceTab?.workspaceId;
+          if (!wsId) return prev;
           const tab: Tab = { id, url: e.payload.url, title: "Loading...", loading: true, workspaceId: wsId, lastActiveAt: Date.now() };
           const sr = settingsRef.current;
           invoke("create_tab", { id, url: e.payload.url, sidebarW: layoutOffsetRef.current, topOffset, httpsOnly: sr.httpsOnly, adBlocker: sr.adBlocker, cookieAutoReject: sr.cookieAutoReject, isPanel: false, profileName: wsId, ...secArgs(sr) });
@@ -902,12 +1018,16 @@ export default function App() {
     ];
 
     // load existing downloads on init
-    invoke<DownloadItem[]>("get_downloads").then(items => {
-      if (items.length > 0) setDownloads(items);
-    }).catch(e => console.warn("[bushido]", e));
+    Promise.all(promises).then(() => invoke<DownloadItem[]>("get_downloads")).then(items => {
+      const untouched = items.filter(item => !downloadStartupTouched.has(item.id));
+      setDownloads(prev => [...prev, ...untouched.filter(item => !prev.some(d => d.id === item.id))]);
+    }).catch(e => console.warn("[bushido] download history", e)).finally(() => {
+      downloadSnapshotPending = false;
+      downloadStartupTouched.clear();
+    });
 
     // check vault lock state
-    invoke<boolean>("vault_is_unlocked").then(setVaultUnlocked).catch(e => console.warn("[bushido]", e));
+    invoke<{ epoch: number; unlocked: boolean }>("vault_state_snapshot").then(applyVaultState).catch(() => {});
 
     return () => { promises.forEach(p => p.then(u => u())); };
   }, []);
@@ -952,7 +1072,7 @@ export default function App() {
   // push webviews down when save banner is showing
   useEffect(() => {
     if (vaultMasterModal) {
-      invoke("layout_webviews", { panes: [], focusedTabId: activeTab || "__none__", sidebarW: 0, topOffset: 0 });
+      layoutNative({ panes: [], focusedTabId: activeTab || "__none__", sidebarW: 0, topOffset: 0 });
     } else if (vaultSavePrompt) {
       // push webview down 30px to reveal save banner below titlebar
       const ws = workspaces.find(w => w.id === activeWorkspaceId);
@@ -963,7 +1083,7 @@ export default function App() {
       const cw = window.innerWidth - layoutOffset;
       const ch = window.innerHeight - topOffset - bannerH;
       const panes = [{ tabId: ws.activeTabId, x: 0, y: bannerH, w: cw, h: ch }];
-      invoke("layout_webviews", { panes, focusedTabId: ws.activeTabId, sidebarW: layoutOffset, topOffset });
+      layoutNative({ panes, focusedTabId: ws.activeTabId, sidebarW: layoutOffset, topOffset });
     } else {
       syncLayout();
     }
@@ -974,12 +1094,12 @@ export default function App() {
     if (!settings.vaultAutoLock || !settings.vaultLockTimeout || !vaultUnlocked) return;
     const timeoutMs = settings.vaultLockTimeout * 60_000;
     let timer = setTimeout(() => {
-      invoke("vault_lock").then(() => setVaultUnlocked(false)).catch(e => console.warn("[bushido]", e));
+      invoke("vault_lock").catch(e => console.warn("[bushido] vault lock", e));
     }, timeoutMs);
     const reset = () => {
       clearTimeout(timer);
       timer = setTimeout(() => {
-        invoke("vault_lock").then(() => setVaultUnlocked(false)).catch(e => console.warn("[bushido]", e));
+        invoke("vault_lock").catch(e => console.warn("[bushido] vault lock", e));
       }, timeoutMs);
     };
     // reset timer on user activity signals
@@ -1051,6 +1171,13 @@ export default function App() {
   // --- workspace operations ---
 
   const switchWorkspace = useCallback((wsId: string) => {
+    const g = glanceRef.current;
+    if (g && g.workspaceId !== wsId) {
+      glanceRef.current = null;
+      glanceReadyRef.current = null;
+      setGlance(null);
+      invoke("close_glance", { glanceId: g.id }).catch(e => console.warn("[bushido]", e));
+    }
     setActiveWorkspaceId(wsId);
     setWorkspaces(prev => {
       const ws = prev.find(w => w.id === wsId);
@@ -1210,7 +1337,7 @@ export default function App() {
       const cw = window.innerWidth - layoutOffset;
       const ch = window.innerHeight - topOffset;
       invoke("create_tab", { id, url, sidebarW: layoutOffset, topOffset, httpsOnly: sr.httpsOnly, adBlocker: sr.adBlocker, cookieAutoReject: sr.cookieAutoReject, isPanel: false, profileName: activeWorkspaceId, ...secArgs(sr) }).then(() => {
-        invoke("layout_webviews", { panes: [{ tabId: id, x: 0, y: 0, w: cw, h: ch }], focusedTabId: id, sidebarW: layoutOffset, topOffset });
+        layoutNative({ panes: [{ tabId: id, x: 0, y: 0, w: cw, h: ch }], focusedTabId: id, sidebarW: layoutOffset, topOffset });
       }).catch(() => {
         useUiStore.getState().showError("Failed to create tab");
         setTabs(prev => prev.filter(t => t.id !== id));
@@ -1218,14 +1345,61 @@ export default function App() {
       clearLoading(id);
     } else {
       // hide all webviews since internal pages are React-rendered
-      invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
+      layoutNative({ panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
     }
   }, [activeWorkspaceId, clearLoading, layoutOffset, topOffset]);
+
+  // External activations are intent, not authority to choose a workspace.
+  // A single poll survives ordinary same-workspace tab/list updates.
+  const externalActivationBusy = useRef(false);
+  const externalAddTabRef = useRef(addTab);
+  externalAddTabRef.current = addTab;
+  const externalActivationReady = settings.onboardingComplete && !showOnboarding && !!activeWs;
+  useEffect(() => {
+    if (!externalActivationReady) return;
+    let disposed = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      if (disposed || externalActivationBusy.current || glanceRef.current) return;
+      const current = useTabStore.getState();
+      if (current.activeWorkspaceId !== activeWorkspaceId) return;
+      const workspace = current.workspaces.find(w => w.id === activeWorkspaceId);
+      if (!workspace) return;
+      externalActivationBusy.current = true;
+      try {
+        const activation = await invoke<{ url: string | null } | null>("take_external_activation");
+        if (!activation?.url) return;
+        // Never reroute to a workspace that became active during the IPC.
+        if (disposed || useTabStore.getState().activeWorkspaceId !== workspace.id || glanceRef.current) {
+          showError("External link cancelled because browser context changed. Open it again.");
+          return;
+        }
+        const accepted = window.confirm(`Open this external link in workspace "${workspace.name}"?\n\n${activation.url}`);
+        if (!accepted) return;
+        if (disposed || useTabStore.getState().activeWorkspaceId !== workspace.id || glanceRef.current) {
+          showError("External link cancelled because workspace changed. Open it again.");
+          return;
+        }
+        externalAddTabRef.current(activation.url);
+      } catch {
+        // Do not print activation URLs or request contents.
+      } finally {
+        externalActivationBusy.current = false;
+      }
+    };
+    void invoke<boolean>("external_activation_enabled").then(enabled => {
+      if (!enabled || disposed) return;
+      timer = window.setInterval(() => { void poll(); }, 1000);
+      void poll();
+    }).catch(() => {});
+    return () => { disposed = true; if (timer !== undefined) window.clearInterval(timer); };
+  }, [externalActivationReady, activeWorkspaceId, showError]);
 
   const closeTab = useCallback((id: string) => {
     // if source tab of glance is being closed, close glance too
     if (glanceRef.current?.sourceTabId === id) {
       invoke("close_glance", { glanceId: glanceRef.current.id }).catch(e => console.warn("[bushido]", e));
+      glanceReadyRef.current = null;
       glanceRef.current = null;
       setGlance(null);
     }
@@ -1246,7 +1420,7 @@ export default function App() {
       if (wsTabs.length <= 1) {
         const newId = genId();
         const newTab: Tab = { id: newId, url: NTP_URL, title: "New Tab", loading: false, workspaceId: wsId, lastActiveAt: Date.now() };
-        invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
+        layoutNative({ panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
         setWorkspaces(ws => ws.map(w => w.id === wsId ? { ...w, activeTabId: newId, paneLayout: undefined } : w));
         return [...next, newTab];
       }
@@ -1326,7 +1500,7 @@ export default function App() {
       // recreate crashed webview
       const sr = settingsRef.current;
       invoke("close_tab", { id }).then(() =>
-        invoke("create_tab", { id, url: targetTab.url, sidebarW: layoutOffset, topOffset, httpsOnly: sr.httpsOnly, adBlocker: sr.adBlocker, cookieAutoReject: sr.cookieAutoReject, isPanel: false, profileName: targetTab.workspaceId, ...secArgs(sr) })
+        invoke("create_tab", { id, url: targetTab.url, sidebarW: layoutOffset, topOffset, httpsOnly: sr.httpsOnly, adBlocker: sr.adBlocker, cookieAutoReject: sr.cookieAutoReject, isPanel: false, profileName: targetTab.workspaceId, pinned: !!targetTab.pinned, ...secArgs(sr) })
       ).then(() => syncLayout(updated));
       clearLoading(id);
       setTabs(prev => prev.map(t => t.id === id ? { ...t, crashed: false, loading: true, lastActiveAt: Date.now() } : t));
@@ -1340,63 +1514,94 @@ export default function App() {
       const thumb = tabThumbnails.current.get(id);
       if (thumb) setTabPreview(thumb);
       const sr = settingsRef.current;
-      invoke("create_tab", { id, url: targetTab.url, sidebarW: layoutOffset, topOffset, httpsOnly: sr.httpsOnly, adBlocker: sr.adBlocker, cookieAutoReject: sr.cookieAutoReject, isPanel: false, profileName: targetTab.workspaceId, ...secArgs(sr) }).then(() => {
+      invoke("create_tab", { id, url: targetTab.url, sidebarW: layoutOffset, topOffset, httpsOnly: sr.httpsOnly, adBlocker: sr.adBlocker, cookieAutoReject: sr.cookieAutoReject, isPanel: false, profileName: targetTab.workspaceId, pinned: !!targetTab.pinned, ...secArgs(sr) }).then(() => {
         syncLayout(updated);
         setTimeout(() => setTabPreview(null), 300);
       });
       clearLoading(id);
       setTabs(prev => prev.map(t => t.id === id ? { ...t, suspended: false, memoryState: "active" as const, loading: true, lastActiveAt: Date.now() } : t));
     } else if (isInternal) {
-      invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
+      layoutNative({ panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
     } else {
       syncLayout(updated);
     }
   }, [activeWorkspaceId, tabs, workspaces, layoutOffset, topOffset, clearLoading, syncLayout]);
 
   const pinTab = useCallback((id: string) => {
-    setTabs(prev => {
-      const tab = prev.find(t => t.id === id);
-      const willPin = tab ? !tab.pinned : true;
-      invoke("set_tab_pinned", { id, pinned: willPin }).catch(e => console.warn("[bushido]", e));
-      return prev.map(t => t.id === id ? { ...t, pinned: willPin } : t);
+    const tab = useTabStore.getState().tabs.find(t => t.id === id);
+    if (!tab) return;
+    const willPin = !tab.pinned;
+    setTabs(prev => prev.map(t => t.id === id ? { ...t, pinned: willPin } : t));
+    invoke("set_tab_pinned", { id, pinned: willPin }).catch(e => {
+      console.warn("[bushido] Native pin update failed", e);
+      useUiStore.getState().showError("Unable to update native pin state");
     });
   }, []);
 
   const closeGlance = useCallback(() => {
     const g = glanceRef.current;
     if (!g) return;
-    invoke("close_glance", { glanceId: g.id });
+    invoke("close_glance", { glanceId: g.id }).catch(e => console.warn("[bushido]", e));
+    glanceReadyRef.current = null;
     glanceRef.current = null;
     setGlance(null);
     syncLayout();
   }, [syncLayout]);
 
-  const expandGlance = useCallback(() => {
+  const expandGlance = useCallback(async () => {
     const g = glanceRef.current;
-    if (!g) return;
-    invoke("promote_glance", { glanceId: g.id });
-    // add as a real tab in React state — use glance_id as tab id (matches webview label)
-    const newTab: Tab = {
-      id: g.id, url: g.url, title: g.title,
-      loading: false, workspaceId: activeWorkspaceId, lastActiveAt: Date.now()
-    };
-    setTabs(prev => [...prev, newTab]);
-    setWorkspaces(prev => prev.map(w => w.id === activeWorkspaceId ? { ...w, activeTabId: g.id, paneLayout: undefined } : w));
-    glanceRef.current = null;
-    setGlance(null);
-    // syncLayout will be called by the workspace/tab update effects
-    setTimeout(() => syncLayout(), 50);
-  }, [activeWorkspaceId, syncLayout]);
+    if (!g || glancePromotingRef.current === g.id) return;
+    if (glanceReadyRef.current !== g.id) {
+      showError("Glance is still opening");
+      return;
+    }
+    const initial = useTabStore.getState();
+    if (initial.activeWorkspaceId !== g.workspaceId || !initial.tabs.some(t => t.id === g.sourceTabId && t.workspaceId === g.workspaceId)) {
+      closeGlance();
+      return;
+    }
+    glancePromotingRef.current = g.id;
+    try {
+      await invoke("promote_glance", { glanceId: g.id, workspaceId: g.workspaceId });
+      const current = glanceRef.current;
+      const state = useTabStore.getState();
+      if (current?.id !== g.id || state.activeWorkspaceId !== g.workspaceId ||
+          !state.tabs.some(t => t.id === g.sourceTabId && t.workspaceId === g.workspaceId)) {
+        // A close or workspace change won while native promotion was pending.
+        // Since promotion succeeded, only close_tab may dispose this view.
+        await invoke("close_tab", { id: g.id });
+        if (glanceRef.current?.id === g.id) {
+          glanceRef.current = null;
+          glanceReadyRef.current = null;
+          setGlance(null);
+        }
+        return;
+      }
+      const newTab: Tab = {
+        id: current.id, url: current.url, title: current.title,
+        loading: false, workspaceId: g.workspaceId, lastActiveAt: Date.now()
+      };
+      setTabs(prev => prev.some(t => t.id === newTab.id) ? prev : [...prev, newTab]);
+      setWorkspaces(prev => prev.map(w => w.id === g.workspaceId ? { ...w, activeTabId: g.id, paneLayout: undefined } : w));
+      glanceReadyRef.current = null;
+      glanceRef.current = null;
+      setGlance(null);
+    } catch (error) {
+      console.warn("[bushido] Glance promotion failed", error);
+      if (glanceRef.current?.id === g.id) showError("Unable to promote Glance");
+    } finally {
+      if (glancePromotingRef.current === g.id) glancePromotingRef.current = null;
+    }
+  }, [closeGlance, showError]);
 
   const splitGlance = useCallback(() => {
     const g = glanceRef.current;
-    if (!g) return;
-    invoke("close_glance", { glanceId: g.id });
-    glanceRef.current = null;
-    setGlance(null);
-    // open URL as a new tab (addTab will handle layout)
+    if (!g || glancePromotingRef.current === g.id) return;
+    if (useTabStore.getState().activeWorkspaceId !== g.workspaceId) { closeGlance(); return; }
+    closeGlance();
+    // Existing split action recreates a tab only in the source workspace.
     addTab(g.url);
-  }, [addTab]);
+  }, [addTab, closeGlance]);
 
   const toggleCollapse = useCallback((id: string) => {
     setTabs(prev => prev.map(t => t.id === id ? { ...t, collapsed: !t.collapsed } : t));
@@ -1441,11 +1646,11 @@ export default function App() {
     setTabs(prev => prev.map(t => t.id === activeTab ? { ...t, url: finalUrl, loading: true, blockedCount: 0 } : t));
     if (currentTab?.url?.startsWith("bushido://") || currentTab?.suspended || currentTab?.memoryState === "destroyed" || currentTab?.memoryState === "suspended") {
       const sr = settingsRef.current;
-      invoke("create_tab", { id: activeTab, url: finalUrl, sidebarW: layoutOffset, topOffset, httpsOnly: sr.httpsOnly, adBlocker: sr.adBlocker, cookieAutoReject: sr.cookieAutoReject, isPanel: false, profileName: currentTab?.workspaceId, ...secArgs(sr) }).then(() => {
+      invoke("create_tab", { id: activeTab, url: finalUrl, sidebarW: layoutOffset, topOffset, httpsOnly: sr.httpsOnly, adBlocker: sr.adBlocker, cookieAutoReject: sr.cookieAutoReject, isPanel: false, profileName: currentTab?.workspaceId, pinned: !!currentTab?.pinned, ...secArgs(sr) }).then(() => {
         // directly position — syncLayout would read stale tab URL from state
         const cw = window.innerWidth - layoutOffset;
         const ch = window.innerHeight - topOffset;
-        invoke("layout_webviews", { panes: [{ tabId: activeTab, x: 0, y: 0, w: cw, h: ch }], focusedTabId: activeTab, sidebarW: layoutOffset, topOffset });
+        layoutNative({ panes: [{ tabId: activeTab, x: 0, y: 0, w: cw, h: ch }], focusedTabId: activeTab, sidebarW: layoutOffset, topOffset });
       });
       if (currentTab?.suspended || currentTab?.memoryState === "destroyed" || currentTab?.memoryState === "suspended") {
         setTabs(prev => prev.map(t => t.id === activeTab ? { ...t, suspended: false, memoryState: "active" as const } : t));
@@ -1522,7 +1727,7 @@ export default function App() {
     if (!currentLayout) return;
 
     // hide webviews so mousemove fires over the whole area (native webviews steal pointer)
-    invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
+    layoutNative({ panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
 
     const tick = () => {
       rafId = 0;
@@ -1551,7 +1756,7 @@ export default function App() {
         const ch = window.innerHeight - topOffset;
         const panes = computeRects(finalLayout, { x: 0, y: 0, w: cw, h: ch });
         const focusId = workspaces.find(w => w.id === activeWorkspaceId)?.activeTabId || "";
-        invoke("layout_webviews", { panes, focusedTabId: focusId, sidebarW: layoutOffset, topOffset });
+        layoutNative({ panes, focusedTabId: focusId, sidebarW: layoutOffset, topOffset });
       }
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
@@ -1565,7 +1770,7 @@ export default function App() {
   // Sidebar already applies 5px threshold before calling this.
   const onTabSplitDrag = useCallback((tabId: string) => {
     // immediately hide webviews and show overlay
-    invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
+    layoutNative({ panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
     setDragOverContent(true);
 
     const onMove = (e: MouseEvent) => {
@@ -1657,9 +1862,24 @@ export default function App() {
     let domain = "";
     try { domain = new URL(tab.url).hostname; } catch {}
     if (!domain) return;
-    invoke<boolean>("toggle_whitelist", { domain }).then(whitelisted => {
+    invoke<boolean>("toggle_whitelist", { domain }).then(async whitelisted => {
+      // Update the existing native Linux WebView before reloading. The Rust
+      // command only acknowledges after WebKit's content manager is updated.
+      try {
+        await invoke<boolean>("set_tab_native_filter", {
+          id: activeTab, adBlocker: settingsRef.current.adBlocker,
+        });
+      } catch (error) {
+        // The whitelist is saved, but a native filter change may have failed.
+        // Surface that limitation instead of silently claiming it applied.
+        console.warn("[bushido] native filter update failed", error);
+        useUiStore.getState().showError("Native content filter update failed");
+      }
       setTabs(prev => prev.map(t => t.id === activeTab ? { ...t, whitelisted } : t));
-      invoke("reload_tab", { id: activeTab });
+      await invoke("reload_tab", { id: activeTab });
+    }).catch(error => {
+      console.warn("[bushido] whitelist toggle failed", error);
+      useUiStore.getState().showError("Unable to update whitelist");
     });
   }, [activeTab, tabs]);
 
@@ -1977,8 +2197,31 @@ export default function App() {
   // --- picture in picture ---
   const togglePip = useCallback(() => {
     if (!activeTab) return;
-    invoke("toggle_pip", { id: activeTab });
-  }, [activeTab]);
+    if (pipSupported === false && !pipActive) {
+      useUiStore.getState().showError("Picture-in-picture is not available for this video");
+      return;
+    }
+    invoke("toggle_pip", { id: activeTab }).catch(error =>
+      useUiStore.getState().showError(typeof error === "string" ? error : "Unable to request picture-in-picture"));
+  }, [activeTab, pipSupported, pipActive]);
+
+  useEffect(() => {
+    const tab = tabs.find(t => t.id === activeTab);
+    const eligible = tab && !tab.url.startsWith("bushido://") &&
+      !tab.suspended && tab.memoryState !== "suspended" && tab.memoryState !== "destroyed";
+    const snapshot = eligible ? videoByTab.current.get(activeTab) : undefined;
+    setHasVideo(snapshot?.hasVideo ?? false);
+    setPipActive(snapshot?.pipActive === true);
+    setPipSupported(snapshot?.pipSupported ?? undefined);
+  }, [activeTab, tabs, videoSnapshotVersion]);
+
+  useEffect(() => {
+    const live = new Set(tabs.filter(t => !t.suspended &&
+      t.memoryState !== "suspended" && t.memoryState !== "destroyed").map(t => t.id));
+    for (const id of videoByTab.current.keys()) {
+      if (!live.has(id)) videoByTab.current.delete(id);
+    }
+  }, [tabs]);
 
   // detect videos on current page
   useEffect(() => {
@@ -1992,6 +2235,7 @@ export default function App() {
     const detectVideo = () => {
       invoke("detect_video", { id: activeTab });
     };
+    detectVideo();
     // poll every 3s for up to 30s — YouTube/video sites load lazily
     const interval = setInterval(detectVideo, 3000);
     const stop = setTimeout(() => clearInterval(interval), 30000);
@@ -2008,19 +2252,47 @@ export default function App() {
   }, [tabs, selectTab, addTab]);
 
   // Screenshot: capture viewport while webview is on-screen, then hide + open overlay
+  const screenshotPending = useRef(false);
+  const screenshotContext = useRef<{ workspace: string; tab: string; url: string } | null>(null);
+  useEffect(() => {
+    const captured = screenshotContext.current;
+    if (screenshotPreview === null && annotationData === null) { screenshotContext.current = null; return; }
+    if (captured && (captured.workspace !== activeWorkspaceId || captured.tab !== activeTab
+        || !tabs.some(t => t.id === captured.tab && t.workspaceId === captured.workspace && t.url === captured.url))) {
+      screenshotContext.current = null;
+      setScreenshotPreview(null);
+      setAnnotationData(null);
+      syncLayoutRef.current();
+    }
+  }, [activeWorkspaceId, activeTab, tabs, screenshotPreview, annotationData]);
   const openScreenshot = useCallback(async () => {
-    if (!activeTab) return;
+    if (!activeTab || screenshotPending.current || useFeatureStore.getState().screenshotPreview !== null) return;
+    const workspace = activeWorkspaceId;
+    const source = tabs.find(t => t.id === activeTab);
+    if (!source || source.url.startsWith("bushido://")) return;
+    const stillCurrent = () => {
+      const state = useTabStore.getState();
+      const w = state.workspaces.find(w => w.id === workspace);
+      return state.activeWorkspaceId === workspace && w?.activeTabId === activeTab
+        && state.tabs.some(t => t.id === activeTab && t.workspaceId === workspace && t.url === source.url);
+    };
+    screenshotPending.current = true;
+    let hidden = false;
     try {
       const b64: string = await invoke("capture_visible", { id: activeTab });
-      // Hide webviews so React overlay is visible
-      invoke("layout_webviews", { panes: [], focusedTabId: activeTab, sidebarW: 0, topOffset: 0 });
+      if (!stillCurrent()) return;
+      hidden = true;
+      await layoutNative({ panes: [], focusedTabId: activeTab, sidebarW: 0, topOffset: 0 });
+      if (!stillCurrent()) { syncLayoutRef.current(); return; }
+      screenshotContext.current = { workspace, tab: activeTab, url: source.url };
       setScreenshotPreview(b64);
-    } catch (e: any) {
-      // If capture fails, still open overlay with empty preview
-      invoke("layout_webviews", { panes: [], focusedTabId: activeTab || "__none__", sidebarW: 0, topOffset: 0 });
-      setScreenshotPreview("");
+    } catch (e) {
+      if (hidden) syncLayoutRef.current();
+      if (stillCurrent()) window.alert("Screenshot failed: " + String(e));
+    } finally {
+      screenshotPending.current = false;
     }
-  }, [activeTab]);
+  }, [activeTab, activeWorkspaceId, tabs]);
 
   const executeAction = useCallback((action: string) => {
     switch (action) {
@@ -2053,8 +2325,8 @@ export default function App() {
       case "zoomOut": { const z = Math.max((zoomRef.current[activeTab] || 1) - 0.1, 0.3); setZoom(activeTab, z); break; }
       case "zoomReset": setZoom(activeTab, 1); break;
       case "findInPage": setFindOpen(true); break;
-      case "printPage": invoke("print_tab", { id: activeTab }); break;
-      case "toggleDevtools": invoke("toggle_devtools", { id: activeTab }); break;
+      case "printPage": invokeDesktopAction("print_tab", activeTab); break;
+      case "toggleDevtools": invokeDesktopAction("toggle_devtools", activeTab); break;
       case "toggleFullscreen": invoke("toggle_fullscreen"); break;
       case "clearHistory": clearHistory("all"); break;
       case "newWorkspace": addWorkspace(); break;
@@ -2075,11 +2347,11 @@ export default function App() {
       if (ctrl && e.key === "k") { e.preventDefault(); setCmdOpen(p => !p); }
       if (ctrl && e.shiftKey && e.key === "R") { e.preventDefault(); toggleReader(); }
       if (ctrl && e.shiftKey && e.key === "T") { e.preventDefault(); const c = closedTabsRef.current.pop(); if (c) addTab(c.url); }
-      if (ctrl && e.shiftKey && e.key === "I") { e.preventDefault(); invoke("toggle_devtools", { id: activeTab }); }
+      if (ctrl && e.shiftKey && e.key === "I") { e.preventDefault(); invokeDesktopAction("toggle_devtools", activeTab); }
       if (ctrl && e.key === "d" && !e.shiftKey) { e.preventDefault(); toggleBookmark(); }
       if (ctrl && e.key === "h" && !e.shiftKey) { e.preventDefault(); setHistoryOpen(p => !p); }
       if (ctrl && e.shiftKey && e.key === "P") { e.preventDefault(); setPerfOpen(p => !p); }
-      if (ctrl && e.key === "p" && !e.shiftKey) { e.preventDefault(); invoke("print_tab", { id: activeTab }); }
+      if (ctrl && e.key === "p" && !e.shiftKey) { e.preventDefault(); invokeDesktopAction("print_tab", activeTab); }
       if (ctrl && e.key === "j" && !e.shiftKey) { e.preventDefault(); setDownloadsOpen(p => !p); }
       if (ctrl && e.key === "r" && !e.shiftKey) { e.preventDefault(); invoke("reload_tab", { id: activeTab }); }
       if (ctrl && e.key === "=") { e.preventDefault(); const z = Math.min((zoomRef.current[activeTab] || 1) + 0.1, 3); setZoom(activeTab, z); }
@@ -2126,11 +2398,11 @@ export default function App() {
         case "screenshot": openScreenshot(); break;
         case "reader-mode": toggleReader(); break;
         case "split-view": toggleSplit(); break;
-        case "print": invoke("print_tab", { id: activeTab }); break;
+        case "print": invokeDesktopAction("print_tab", activeTab); break;
         case "reload": invoke("reload_tab", { id: activeTab }); break;
         case "fullscreen": invoke("toggle_fullscreen"); break;
         case "downloads": setDownloadsOpen(p => !p); break;
-        case "devtools": invoke("toggle_devtools", { id: activeTab }); break;
+        case "devtools": invokeDesktopAction("toggle_devtools", activeTab); break;
         case "reopen-tab": { const c = closedTabsRef.current.pop(); if (c) addTab(c.url); break; }
         case "zoom-in": { const z = Math.min((zoomRef.current[activeTab] || 1) + 0.1, 3); setZoom(activeTab, z); break; }
         case "zoom-out": { const z = Math.max((zoomRef.current[activeTab] || 1) - 0.1, 0.3); setZoom(activeTab, z); break; }
@@ -2160,19 +2432,19 @@ export default function App() {
   // download callbacks
   const pauseDownload = useCallback((id: string) => invoke("pause_download", { id }), []);
   const resumeDownload = useCallback((id: string) => invoke("resume_download", { id }), []);
-  const cancelDownload = useCallback((id: string) => invoke("cancel_download", { id }), []);
+  const cancelDownload = useCallback((id: string) => invoke("cancel_download", { id }).catch(e => showError(String(e))), [showError]);
   const openDownload = useCallback((id: string) => invoke("open_download", { id }), []);
   const openDownloadFolder = useCallback((id: string) => invoke("open_download_folder", { id }), []);
   const retryDownload = useCallback((id: string) => {
     const dl = downloads.find(d => d.id === id);
-    if (!dl) return;
+    if (!dl || dl.native) return;
     cancelDownload(id);
     const dir = settingsRef.current.downloadLocation || "";
     invoke("start_download", { url: dl.url, filename: dl.fileName, downloadDir: dir, cookies: null });
   }, [downloads, cancelDownload]);
   const clearCompletedDownloads = useCallback(() => {
-    setDownloads(prev => prev.filter(d => d.state !== "completed"));
-  }, []);
+    invoke("clear_completed_downloads").catch(e => showError(String(e)));
+  }, [showError]);
   const toggleDownloads = useCallback(() => setDownloadsOpen(p => !p), []);
   const activeDownloadCount = useMemo(() => downloads.filter(d => d.state === "downloading").length, [downloads]);
 
@@ -2294,7 +2566,7 @@ export default function App() {
     tabs.forEach(t => {
       if (t.url.startsWith("bushido://") || t.suspended || t.memoryState === "destroyed") return;
       invoke("close_tab", { id: t.id }).then(() => {
-        invoke("create_tab", { id: t.id, url: t.url, sidebarW: layoutOffset, topOffset, isPanel: false, profileName: t.workspaceId, ...base });
+        invoke("create_tab", { id: t.id, url: t.url, sidebarW: layoutOffset, topOffset, isPanel: false, profileName: t.workspaceId, pinned: !!t.pinned, ...base });
       });
     });
     panels.forEach(p => {
@@ -2352,6 +2624,7 @@ export default function App() {
           onClose={() => { setScreenshotPreview(null); syncLayout(); }}
           onAnnotate={(data) => { setScreenshotPreview(null); setAnnotationData(data); }}
           onRestoreWebview={() => syncLayout()}
+          onHideWebview={() => { void layoutNative({ panes: [], focusedTabId: activeTab, sidebarW: 0, topOffset: 0 }); }}
         />
       )}
       <PerfOverlay visible={perfOpen} />
@@ -2544,6 +2817,9 @@ export default function App() {
             />
           ) : showSettings ? (
             <SettingsPage
+              key={activeWorkspaceId}
+              workspaceId={activeWorkspaceId}
+              workspaceName={activeWs?.name ?? activeWorkspaceId}
               settings={settings}
               onUpdate={updateSettings}
               onReloadAllTabs={reloadAllTabs}
@@ -2643,6 +2919,10 @@ export default function App() {
         if (pendingUpdate.downloading) return;
         setPendingUpdate({ ...pendingUpdate, downloading: true });
         try {
+          if (!await invoke<boolean>("binary_updater_enabled")) {
+            setPendingUpdate(null);
+            return;
+          }
           const update = await checkUpdate();
           if (update) {
             await update.downloadAndInstall();
@@ -2711,14 +2991,25 @@ export default function App() {
             e.preventDefault();
             const form = e.target as HTMLFormElement;
             const pw = (form.elements.namedItem("vaultpw") as HTMLInputElement).value;
-            if (vaultMasterModal === "setup") {
-              const confirm = (form.elements.namedItem("vaultpw2") as HTMLInputElement).value;
-              if (pw !== confirm) { showError("Passwords don't match"); return; }
-              await invoke("vault_setup", { masterPassword: pw }).catch((err: any) => { showError(String(err)); return; });
-            } else {
-              await invoke("vault_unlock", { masterPassword: pw }).catch((err: any) => { showError(String(err)); return; });
+            try {
+              if (vaultMasterModal === "setup") {
+                const confirm = (form.elements.namedItem("vaultpw2") as HTMLInputElement).value;
+                if (pw !== confirm) { showError("Passwords don't match"); return; }
+                await invoke("vault_setup", { masterPassword: pw });
+              } else {
+                await invoke("vault_unlock", { masterPassword: pw });
+              }
+              const status = await invoke<{ epoch: number; unlocked: boolean }>("vault_state_snapshot");
+              applyVaultState(status);
+              if (!status.unlocked || status.epoch < vaultStateEpoch.current) {
+                showError("Vault state changed; unlock again"); return;
+              }
+            } catch (error) {
+              showError(typeof error === "string" ? error : "Vault unlock failed");
+              return;
+            } finally {
+              form.reset();
             }
-            setVaultUnlocked(true);
             setVaultMasterModal(null);
             // retry autofill on all tabs now that vault is unlocked
             invoke("vault_retry_autofill").catch(e => console.warn("[bushido]", e));
@@ -2857,7 +3148,7 @@ export default function App() {
           }}>
             Copy page URL
           </div>
-          <div className="ctx-item" tabIndex={0} onClick={() => { invoke("print_tab", { id: pageCtx.tabId }); setPageCtx(null); }}>
+          <div className="ctx-item" tabIndex={0} onClick={() => { invokeDesktopAction("print_tab", pageCtx.tabId); setPageCtx(null); }}>
             Print page
           </div>
           <div className="ctx-item" tabIndex={0} onClick={() => {
@@ -2868,7 +3159,7 @@ export default function App() {
             View page source
           </div>
           <div className="ctx-divider" />
-          <div className="ctx-item" tabIndex={0} onClick={() => { invoke("toggle_devtools", { id: pageCtx.tabId }); setPageCtx(null); }}>
+          <div className="ctx-item" tabIndex={0} onClick={() => { invokeDesktopAction("toggle_devtools", pageCtx.tabId); setPageCtx(null); }}>
             Inspect
           </div>
         </div>

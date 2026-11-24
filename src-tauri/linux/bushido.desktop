@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Bushido (Linux preview)
+Comment=Workspace browser using WebKitGTK
+Exec=bushido-browser
+Icon={{icon}}
+Terminal=false
+Categories=Network;WebBrowser;
+StartupNotify=true
