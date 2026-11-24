@@ -3348,6 +3348,13 @@ async fn layout_webviews(
     app: tauri::AppHandle, panes: Vec<PaneRectArg>, focused_tab_id: String,
     sidebar_w: f64, top_offset: f64, sequence: Option<u64>,
 ) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("BUSHIDO_GEOMETRY_TRACE").is_some() {
+        eprintln!("BUSHIDO_LAYOUT sequence={:?} focus={} sidebar={} top={} panes={}", sequence, focused_tab_id, sidebar_w, top_offset, panes.len());
+        for p in &panes {
+            eprintln!("BUSHIDO_LAYOUT pane={} rect=({},{},{},{})", p.tab_id, p.x, p.y, p.w, p.h);
+        }
+    }
     // Serialize sequence admission AND dispatch of geometry messages.
     #[cfg(target_os = "linux")]
     let _serial = NATIVE_LAYOUT_SERIAL.lock().await;
@@ -3384,6 +3391,9 @@ async fn layout_webviews(
                     if let Some((x, y, w, h)) = bounded_linux_pane(
                         pane, sidebar_w, top_offset, window_width, window_height,
                     ) {
+                        if std::env::var_os("BUSHIDO_GEOMETRY_TRACE").is_some() {
+                            eprintln!("BUSHIDO_LAYOUT dispatch tab={} rect=({},{},{},{}) window=({},{})", tab_id, x,y,w,h,window_width,window_height);
+                        }
                         wv.set_bounds(tauri::Rect {
                             position: tauri::LogicalPosition::new(x, y).into(),
                             size: tauri::LogicalSize::new(w, h).into(),
