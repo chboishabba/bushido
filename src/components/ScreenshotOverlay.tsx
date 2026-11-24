@@ -10,9 +10,10 @@ interface Props {
   onClose: () => void;
   onAnnotate: (data: string) => void;
   onRestoreWebview: () => void;
+  onHideWebview: () => void;
 }
 
-export default function ScreenshotOverlay({ tabId, tabUrl, preview, onClose, onAnnotate, onRestoreWebview }: Props) {
+export default function ScreenshotOverlay({ tabId, tabUrl, preview, onClose, onAnnotate, onRestoreWebview, onHideWebview }: Props) {
   const [phase, setPhase] = useState<Phase>("pick");
   const [resultData, setResultData] = useState("");
   const [error, setError] = useState("");
@@ -187,15 +188,15 @@ export default function ScreenshotOverlay({ tabId, tabUrl, preview, onClose, onA
       onRestoreWebview();
       await new Promise(r => setTimeout(r, 200));
       const b64: string = await invoke("capture_fullpage", { id: tabId });
-      invoke("layout_webviews", { panes: [], focusedTabId: tabId, sidebarW: 0, topOffset: 0 });
+      onHideWebview();
       setResultData(b64);
       setPhase("result");
     } catch (e: any) {
-      invoke("layout_webviews", { panes: [], focusedTabId: tabId, sidebarW: 0, topOffset: 0 });
+      onHideWebview();
       setError(e?.toString() || "Full page capture failed");
       setPhase("pick");
     }
-  }, [tabId, onRestoreWebview, fullPageAvailable]);
+  }, [tabId, onRestoreWebview, onHideWebview, fullPageAvailable]);
 
   const copyToClipboard = useCallback(async () => {
     if (!resultData) return;

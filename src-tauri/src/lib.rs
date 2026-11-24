@@ -1503,6 +1503,15 @@ async fn create_tab(app: tauri::AppHandle, id: String, url: String, sidebar_w: f
         }
     };
 
+    // Linux child WebViews are laid out by Bushido's sequenced native
+    // geometry path. Disable Tauri's proportional autoresize bookkeeping;
+    // otherwise a GTK window resize can replay stale full-window bounds over
+    // the React-owned sidebar and titlebar before the next layout arrives.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = webview.set_auto_resize(false) {
+        crash_log::log_error("linux-webview-autoresize", &e.to_string());
+    }
+
     let state = app.state::<WebviewState>();
     #[cfg(target_os = "linux")]
     state.register_linux_tab(tab_id_track, true, !is_panel && pinned.unwrap_or(false));

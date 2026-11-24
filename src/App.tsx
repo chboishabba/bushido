@@ -2615,6 +2615,7 @@ export default function App() {
           onClose={() => { setScreenshotPreview(null); syncLayout(); }}
           onAnnotate={(data) => { setScreenshotPreview(null); setAnnotationData(data); }}
           onRestoreWebview={() => syncLayout()}
+          onHideWebview={() => { void layoutNative({ panes: [], focusedTabId: activeTab, sidebarW: 0, topOffset: 0 }); }}
         />
       )}
       <PerfOverlay visible={perfOpen} />
