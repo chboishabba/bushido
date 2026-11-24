@@ -4200,6 +4200,15 @@ fn handle_event_loop<T: UserEvent>(
               let size = size.to_logical::<f32>(window.scale_factor());
               for webview in webviews {
                 if let Some(b) = &*webview.bounds.lock().unwrap() {
+                  // Child WebKit bounds have fixed chrome insets. Fractional
+                  // autoresize scales those insets over React controls.
+                  // Let React's resize handler issue the new SetBounds.
+                  // Preserve fullscreen shell autoresizing.
+                  #[cfg(target_os = "linux")]
+                  if b.x_rate != 0.0 || b.y_rate != 0.0 ||
+                     b.width_rate != 1.0 || b.height_rate != 1.0 {
+                    continue;
+                  }
                   if let Err(e) = webview.set_bounds(wry::Rect {
                     position: LogicalPosition::new(size.width * b.x_rate, size.height * b.y_rate)
                       .into(),

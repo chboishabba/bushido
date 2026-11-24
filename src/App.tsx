@@ -114,6 +114,11 @@ function invokeDesktopAction(command: "print_tab" | "toggle_devtools", id: strin
   invoke(command, { id }).catch(e => window.alert(String(e)));
 }
 
+// A single epoch for all React-issued native layouts, including modal hides.
+let nativeLayoutEpoch = 0;
+const layoutNative = (args: Record<string, unknown>) =>
+  invoke("layout_webviews", { ...args, sequence: ++nativeLayoutEpoch });
+
 export default function App() {
   // --- Zustand stores ---
   const tabs = useTabStore(s => s.tabs);
@@ -305,7 +310,7 @@ export default function App() {
       else panes = [{ tabId: w.activeTabId, ...rect }];
     }
 
-    invoke("layout_webviews", { panes, focusedTabId: w.activeTabId, sidebarW: layoutOffset, topOffset });
+    layoutNative( { panes, focusedTabId: w.activeTabId, sidebarW: layoutOffset, topOffset });
   }, [activeWs, tabs, layoutOffset, topOffset]);
   // The long-lived native event listener must restore the *current* layout,
   // not the initial render's stale workspace or tab array.
@@ -456,7 +461,7 @@ export default function App() {
         if (firstActiveWs?.activeTabId) {
           const activeRestoredTab = restoredTabs.find(t => t.id === firstActiveWs.activeTabId);
           if (activeRestoredTab?.url?.startsWith("bushido://")) {
-            invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: restoredSidebarW, topOffset: restoredTopOffset });
+            layoutNative( { panes: [], focusedTabId: "__none__", sidebarW: restoredSidebarW, topOffset: restoredTopOffset });
           } else {
             // compute pane rects from restored layout
             const cw = window.innerWidth - restoredSidebarW;
@@ -465,7 +470,7 @@ export default function App() {
             const panes = firstActiveWs.paneLayout
               ? computeRects(firstActiveWs.paneLayout, rect)
               : [{ tabId: firstActiveWs.activeTabId, x: 0, y: 0, w: cw, h: ch }];
-            invoke("layout_webviews", { panes, focusedTabId: firstActiveWs.activeTabId, sidebarW: restoredSidebarW, topOffset: restoredTopOffset });
+            layoutNative( { panes, focusedTabId: firstActiveWs.activeTabId, sidebarW: restoredSidebarW, topOffset: restoredTopOffset });
           }
         }
 
@@ -503,7 +508,7 @@ export default function App() {
             invoke("create_tab", { id: t.id, url: t.url, sidebarW: 300, topOffset: 40, profileName: t.workspaceId, pinned: !!t.pinned, ...tabArgs });
             clearLoading(t.id);
           });
-          invoke("layout_webviews", { panes: [{ tabId: restored[0].id, x: 0, y: 0, w: window.innerWidth - 300, h: window.innerHeight - 40 }], focusedTabId: restored[0].id, sidebarW: 300, topOffset: 40 });
+          layoutNative( { panes: [{ tabId: restored[0].id, x: 0, y: 0, w: window.innerWidth - 300, h: window.innerHeight - 40 }], focusedTabId: restored[0].id, sidebarW: 300, topOffset: 40 });
         } else {
           openFreshNtp();
         }
@@ -962,7 +967,7 @@ export default function App() {
           syncLayoutRef.current();
         });
         // hide tab webviews so overlay is visible
-        invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffsetRef.current, topOffset });
+        layoutNative( { panes: [], focusedTabId: "__none__", sidebarW: layoutOffsetRef.current, topOffset });
       }),
       listen<string>("linux-vault-status", (e) => {
         // Native status is text only; no credentials or URLs are transported.
@@ -1056,7 +1061,7 @@ export default function App() {
   // push webviews down when save banner is showing
   useEffect(() => {
     if (vaultMasterModal) {
-      invoke("layout_webviews", { panes: [], focusedTabId: activeTab || "__none__", sidebarW: 0, topOffset: 0 });
+      layoutNative( { panes: [], focusedTabId: activeTab || "__none__", sidebarW: 0, topOffset: 0 });
     } else if (vaultSavePrompt) {
       // push webview down 30px to reveal save banner below titlebar
       const ws = workspaces.find(w => w.id === activeWorkspaceId);
@@ -1067,7 +1072,7 @@ export default function App() {
       const cw = window.innerWidth - layoutOffset;
       const ch = window.innerHeight - topOffset - bannerH;
       const panes = [{ tabId: ws.activeTabId, x: 0, y: bannerH, w: cw, h: ch }];
-      invoke("layout_webviews", { panes, focusedTabId: ws.activeTabId, sidebarW: layoutOffset, topOffset });
+      layoutNative( { panes, focusedTabId: ws.activeTabId, sidebarW: layoutOffset, topOffset });
     } else {
       syncLayout();
     }
@@ -1321,7 +1326,7 @@ export default function App() {
       const cw = window.innerWidth - layoutOffset;
       const ch = window.innerHeight - topOffset;
       invoke("create_tab", { id, url, sidebarW: layoutOffset, topOffset, httpsOnly: sr.httpsOnly, adBlocker: sr.adBlocker, cookieAutoReject: sr.cookieAutoReject, isPanel: false, profileName: activeWorkspaceId, ...secArgs(sr) }).then(() => {
-        invoke("layout_webviews", { panes: [{ tabId: id, x: 0, y: 0, w: cw, h: ch }], focusedTabId: id, sidebarW: layoutOffset, topOffset });
+        layoutNative( { panes: [{ tabId: id, x: 0, y: 0, w: cw, h: ch }], focusedTabId: id, sidebarW: layoutOffset, topOffset });
       }).catch(() => {
         useUiStore.getState().showError("Failed to create tab");
         setTabs(prev => prev.filter(t => t.id !== id));
@@ -1329,7 +1334,7 @@ export default function App() {
       clearLoading(id);
     } else {
       // hide all webviews since internal pages are React-rendered
-      invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
+      layoutNative( { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
     }
   }, [activeWorkspaceId, clearLoading, layoutOffset, topOffset]);
 
@@ -1404,7 +1409,7 @@ export default function App() {
       if (wsTabs.length <= 1) {
         const newId = genId();
         const newTab: Tab = { id: newId, url: NTP_URL, title: "New Tab", loading: false, workspaceId: wsId, lastActiveAt: Date.now() };
-        invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
+        layoutNative( { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
         setWorkspaces(ws => ws.map(w => w.id === wsId ? { ...w, activeTabId: newId, paneLayout: undefined } : w));
         return [...next, newTab];
       }
@@ -1505,7 +1510,7 @@ export default function App() {
       clearLoading(id);
       setTabs(prev => prev.map(t => t.id === id ? { ...t, suspended: false, memoryState: "active" as const, loading: true, lastActiveAt: Date.now() } : t));
     } else if (isInternal) {
-      invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
+      layoutNative( { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
     } else {
       syncLayout(updated);
     }
@@ -1634,7 +1639,7 @@ export default function App() {
         // directly position — syncLayout would read stale tab URL from state
         const cw = window.innerWidth - layoutOffset;
         const ch = window.innerHeight - topOffset;
-        invoke("layout_webviews", { panes: [{ tabId: activeTab, x: 0, y: 0, w: cw, h: ch }], focusedTabId: activeTab, sidebarW: layoutOffset, topOffset });
+        layoutNative( { panes: [{ tabId: activeTab, x: 0, y: 0, w: cw, h: ch }], focusedTabId: activeTab, sidebarW: layoutOffset, topOffset });
       });
       if (currentTab?.suspended || currentTab?.memoryState === "destroyed" || currentTab?.memoryState === "suspended") {
         setTabs(prev => prev.map(t => t.id === activeTab ? { ...t, suspended: false, memoryState: "active" as const } : t));
@@ -1711,7 +1716,7 @@ export default function App() {
     if (!currentLayout) return;
 
     // hide webviews so mousemove fires over the whole area (native webviews steal pointer)
-    invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
+    layoutNative( { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
 
     const tick = () => {
       rafId = 0;
@@ -1740,7 +1745,7 @@ export default function App() {
         const ch = window.innerHeight - topOffset;
         const panes = computeRects(finalLayout, { x: 0, y: 0, w: cw, h: ch });
         const focusId = workspaces.find(w => w.id === activeWorkspaceId)?.activeTabId || "";
-        invoke("layout_webviews", { panes, focusedTabId: focusId, sidebarW: layoutOffset, topOffset });
+        layoutNative( { panes, focusedTabId: focusId, sidebarW: layoutOffset, topOffset });
       }
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
@@ -1754,7 +1759,7 @@ export default function App() {
   // Sidebar already applies 5px threshold before calling this.
   const onTabSplitDrag = useCallback((tabId: string) => {
     // immediately hide webviews and show overlay
-    invoke("layout_webviews", { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
+    layoutNative( { panes: [], focusedTabId: "__none__", sidebarW: layoutOffset, topOffset });
     setDragOverContent(true);
 
     const onMove = (e: MouseEvent) => {
@@ -2266,7 +2271,7 @@ export default function App() {
       const b64: string = await invoke("capture_visible", { id: activeTab });
       if (!stillCurrent()) return;
       hidden = true;
-      await invoke("layout_webviews", { panes: [], focusedTabId: activeTab, sidebarW: 0, topOffset: 0 });
+      await layoutNative( { panes: [], focusedTabId: activeTab, sidebarW: 0, topOffset: 0 });
       if (!stillCurrent()) { syncLayoutRef.current(); return; }
       screenshotContext.current = { workspace, tab: activeTab, url: source.url };
       setScreenshotPreview(b64);

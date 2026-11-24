@@ -3250,21 +3250,71 @@ async fn vault_retry_autofill(app: tauri::AppHandle) -> Result<(), String> {
     }
 }
 
+// Keep child WebKit content inside the React-owned content rectangle.
+#[cfg(target_os = "linux")]
+fn bounded_linux_pane(pane: &PaneRectArg, sidebar: f64, top: f64, width: f64, height: f64)
+    -> Option<(f64, f64, f64, f64)> {
+    if ![pane.x, pane.y, pane.w, pane.h, sidebar, top, width, height]
+        .iter().all(|v| v.is_finite()) { return None; }
+    if sidebar < 0.0 || top < 0.0 || width <= sidebar || height <= top || pane.w <= 0.0 || pane.h <= 0.0 {
+        return None;
+    }
+    let left = (sidebar + pane.x).max(sidebar).min(width);
+    let upper = (top + pane.y).max(top).min(height);
+    let right = (sidebar + pane.x + pane.w).max(left).min(width);
+    let lower = (top + pane.y + pane.h).max(upper).min(height);
+    if right <= left || lower <= upper { return None; }
+    Some((left, upper, right - left, lower - upper))
+}
+
+#[cfg(target_os = "linux")]
+static NATIVE_LAYOUT_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[tauri::command]
-async fn layout_webviews(app: tauri::AppHandle, panes: Vec<PaneRectArg>, focused_tab_id: String, sidebar_w: f64, top_offset: f64) -> Result<(), String> {
+async fn layout_webviews(
+    app: tauri::AppHandle, panes: Vec<PaneRectArg>, focused_tab_id: String,
+    sidebar_w: f64, top_offset: f64, sequence: Option<u64>,
+) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if let Some(sequence) = sequence {
+        if sequence == 0 { return Err("invalid layout sequence".into()); }
+        if NATIVE_LAYOUT_EPOCH.fetch_max(sequence, Ordering::SeqCst) >= sequence { return Ok(()); }
+    }
     let state = app.state::<WebviewState>();
     let panel_state = app.state::<PanelState>();
     let panel_ids = panel_state.ids.lock().clone();
     let tabs = state.tabs.lock().clone();
-
+    #[cfg(target_os = "linux")]
+    let (window_width, window_height) = {
+        let window = app.get_window("main").ok_or("no main window")?;
+        let size = window.inner_size().map_err(|e| e.to_string())?;
+        let scale = window.scale_factor().map_err(|e| e.to_string())?;
+        (size.width as f64 / scale, size.height as f64 / scale)
+    };
     for (tab_id, _) in &tabs {
         if panel_ids.contains(tab_id) { continue; }
         if let Some(wv) = app.get_webview(tab_id) {
             if let Some(pane) = panes.iter().find(|p| p.tab_id == *tab_id) {
-                let _ = wv.set_position(tauri::LogicalPosition::new(sidebar_w + pane.x, top_offset + pane.y));
-                let _ = wv.set_size(tauri::LogicalSize::new(pane.w, pane.h));
-                if *tab_id == focused_tab_id {
-                    let _ = wv.set_focus();
+                #[cfg(target_os = "linux")]
+                {
+                    if let Some((x, y, w, h)) = bounded_linux_pane(
+                        pane, sidebar_w, top_offset, window_width, window_height,
+                    ) {
+                        wv.set_bounds(tauri::Rect {
+                            position: tauri::LogicalPosition::new(x, y).into(),
+                            size: tauri::LogicalSize::new(w, h).into(),
+                        }).map_err(|e| e.to_string())?;
+                        if *tab_id == focused_tab_id { let _ = wv.set_focus(); }
+                    } else {
+                        let _ = wv.set_position(tauri::LogicalPosition::new(-9999.0, -9999.0));
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = wv.set_position(tauri::LogicalPosition::new(sidebar_w + pane.x, top_offset + pane.y));
+                    let _ = wv.set_size(tauri::LogicalSize::new(pane.w, pane.h));
+                    if *tab_id == focused_tab_id { let _ = wv.set_focus(); }
                 }
             } else {
                 let _ = wv.set_position(tauri::LogicalPosition::new(-9999.0, -9999.0));
@@ -3290,7 +3340,7 @@ async fn switch_tab(app: tauri::AppHandle, id: String, split_id: String, sidebar
         panes.push(PaneRectArg { tab_id: split_id, x: half_w, y: 0.0, w: half_w, h: content_h });
     }
 
-    layout_webviews(app, panes, id, sidebar_w, top_offset).await
+    layout_webviews(app, panes, id, sidebar_w, top_offset, None).await
 }
 
 #[tauri::command]
