@@ -8,11 +8,13 @@ import shutil
 import subprocess
 import tempfile
 import time
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
 mcp = FastMCP("bushido-local")
 ROOT = Path(__file__).resolve().parent
 CONFIG = None
+PINNED_PROCESS = None
+CAPTURES = {}
 
 def identity():
     p = Path("/proc") / str(CONFIG.pid)
@@ -20,7 +22,10 @@ def identity():
     if exe.name != "bushido-browser" or p.stat().st_uid != os.getuid():
         raise ValueError("Expected same-UID Bushido process")
     start = (p / "stat").read_text().rsplit(")", 1)[1].split()[19]
-    return {"pid": CONFIG.pid, "start_ticks": start, "exe": str(exe)}
+    result = {"pid": CONFIG.pid, "start_ticks": start, "exe": str(exe)}
+    if PINNED_PROCESS is not None and result != PINNED_PROCESS:
+        raise ValueError("Selected process identity changed; restart sidecar")
+    return result
 
 def run(argv, timeout=20):
     return subprocess.run(argv, check=True, timeout=timeout,
@@ -50,6 +55,7 @@ def capabilities() -> dict:
     return {"process": identity(), "session": os.environ.get("XDG_SESSION_TYPE", "unknown"),
             "geometry_trace": CONFIG.log.is_file(),
             "window_capture": bool(shutil.which("spectacle") and CONFIG.allow_capture),
+            "image_return": CONFIG.allow_image_return,
             "window_identity_verified": False,
             "x11_actions": bool(CONFIG.allow_actions and os.environ.get("XDG_SESSION_TYPE") == "x11" and shutil.which("xdotool")),
             "wayland_actions": False, "page_snapshot": False, "live_gtk_inspection": False}
@@ -90,9 +96,28 @@ def window_capture() -> dict:
     data = png.read_bytes()
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         raise ValueError("Not a PNG")
-    return {"path": str(png), "sha256": hashlib.sha256(data).hexdigest(),
+    digest = hashlib.sha256(data).hexdigest()
+    if len(CAPTURES) >= 16:
+        CAPTURES.pop(next(iter(CAPTURES)))
+    CAPTURES[digest] = png
+    return {"path": str(png), "sha256": digest,
             "process": before, "window_identity_verified": False,
             "capture_type": "compositor active window; operator verification required"}
+
+@mcp.tool()
+def view_capture(sha256: str) -> Image:
+    """Return actual PNG to MCP client after explicit operator opt-in; only this session's captures."""
+    if not CONFIG.allow_image_return:
+        raise ValueError("Image return requires separate explicit startup opt-in")
+    identity()
+    png = CAPTURES.get(sha256)
+    if png is None:
+        raise ValueError("Unknown capture")
+    with png.open("rb") as f:
+        data = f.read(8 * 1024 * 1024 + 1)
+    if len(data) > 8 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != sha256:
+        raise ValueError("Image exceeds transfer cap or changed")
+    return Image(data=data, format="png")
 
 @mcp.tool()
 def page_snapshot() -> dict:
@@ -127,15 +152,16 @@ def run_geometry_scenario(capture: bool = False) -> dict:
             "status": "observation only; not a verified replay"}
 
 def main():
-    global CONFIG
+    global CONFIG, PINNED_PROCESS
     p = argparse.ArgumentParser()
     p.add_argument("--pid", type=int, required=True)
     p.add_argument("--log", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--allow-capture", action="store_true")
     p.add_argument("--allow-actions", action="store_true")
+    p.add_argument("--allow-image-return", action="store_true")
     CONFIG = p.parse_args()
-    identity()
+    PINNED_PROCESS = identity()
     CONFIG.log = CONFIG.log.resolve(strict=True)
     if not CONFIG.log.is_file() or CONFIG.log.stat().st_uid != os.getuid():
         p.error("Expected same-UID regular log")
