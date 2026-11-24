@@ -94,6 +94,34 @@ use crate::{
 
 use self::web_context::WebContextExt;
 
+// Observation only: do not trigger layout or capture page content here.
+fn trace_geometry(view: &WebView, event: &str, requested: Option<&Rect>) {
+  static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  let a = view.allocation();
+  let parent = view.parent();
+  let fixed = parent.as_ref().and_then(|p| p.downcast_ref::<gtk::Fixed>());
+  let fixed_xy = fixed.map(|p| (
+    p.child_property::<i32>(view, "x"),
+    p.child_property::<i32>(view, "y"),
+  ));
+  let parent_rect = parent.as_ref().map(|p| {
+    let a = p.allocation();
+    (a.x(), a.y(), a.width(), a.height())
+  });
+  let requested = requested.map(|r| {
+    let scale = view.scale_factor() as f64;
+    let xy: (i32, i32) = r.position.to_logical::<i32>(scale).into();
+    let wh: (i32, i32) = r.size.to_logical::<i32>(scale).into();
+    (xy, wh)
+  });
+  eprintln!("BUSHIDO_GEOMETRY seq={} view={:p} event={} requested_logical={:?} allocation=({},{},{},{}) fixed_xy={:?} size_request=({},{}) parent={:?} scale={} mapped={}",
+    seq, view.as_ptr(), event, requested, a.x(), a.y(), a.width(), a.height(),
+    fixed_xy, view.width_request(), view.height_request(), parent_rect,
+    view.scale_factor(), view.is_mapped());
+}
+
+
 #[cfg(all(target_os = "linux", debug_assertions))]
 mod native_content_filter {
   use gtk::{gio, glib};
@@ -535,6 +563,13 @@ impl InnerWebView {
     web_context.register_automation(webview.clone());
 
     let is_in_fixed_parent = Self::add_to_container(&webview, container, &attributes);
+    if std::env::var_os("BUSHIDO_GEOMETRY_TRACE").is_some() {
+      trace_geometry(&webview, "created", None);
+      webview.connect_size_allocate(|view, _| trace_geometry(view, "gtk-size-allocate", None));
+      webview.connect_load_changed(|view, event| {
+        trace_geometry(view, &format!("load-{event:?}"), None);
+      });
+    }
 
     #[cfg(any(debug_assertions, feature = "devtools"))]
     let is_inspector_open = Self::attach_inspector_handlers(&webview);
@@ -1112,6 +1147,9 @@ impl InnerWebView {
   }
 
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
+    if std::env::var_os("BUSHIDO_GEOMETRY_TRACE").is_some() {
+      trace_geometry(&self.webview, "set-bounds-before", Some(&bounds));
+    }
     let scale_factor = self.webview.scale_factor() as f64;
     let (width, height) = bounds.size.to_logical::<i32>(scale_factor).into();
     let (x, y) = bounds.position.to_logical::<i32>(scale_factor).into();
@@ -1130,6 +1168,9 @@ impl InnerWebView {
       self
         .webview
         .size_allocate(&gtk::Allocation::new(x, y, width, height));
+    }
+    if std::env::var_os("BUSHIDO_GEOMETRY_TRACE").is_some() {
+      trace_geometry(&self.webview, "set-bounds-after", Some(&bounds));
     }
 
     Ok(())
