@@ -280,6 +280,8 @@ export default function App() {
   const layoutOffsetRef = useRef(layoutOffset);
   layoutOffsetRef.current = layoutOffset;
   const topOffset = 40;
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
   const pinnedTabs = useMemo(() => currentWsTabs.filter(t => t.pinned), [currentWsTabs]);
   const regularTabs = useMemo(() => currentWsTabs.filter(t => !t.pinned), [currentWsTabs]);
 
@@ -747,6 +749,13 @@ export default function App() {
             setZoomDisplay(p => ({ ...p, [e.payload.id]: savedZoom }));
             invoke("zoom_tab", { id: e.payload.id, factor: savedZoom });
           }
+        }
+        // WebKitGTK can reallocate a child during navigation after the normal
+        // React resize effect has run. Reassert the current native geometry
+        // after the event and once more after the child has settled.
+        if (e.payload.id === activeTabRef.current) {
+          syncLayoutRef.current();
+          window.setTimeout(() => syncLayoutRef.current(), 250);
         }
       }),
       listen<{ id: string; title: string }>("tab-title-changed", (e) => {
